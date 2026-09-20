@@ -471,6 +471,18 @@ def cmd_gate(args):
     print(resp)
     print("\n✓ [Triad Gate COMPLETE]")
 
+def cmd_bench(args):
+    """Run the Triad benchmark suite."""
+    from bench.run_bench import run_benchmark, DEFAULT_CASES_DIR
+    cases_dir = Path(args.cases_dir) if args.cases_dir else DEFAULT_CASES_DIR
+    bugs_caught, pos_tot, fps, neg_tot, results = run_benchmark(
+        cases_dir=cases_dir,
+        engine=args.engine,
+        limit=args.limit,
+        case_id=args.case,
+        verbose=args.verbose
+    )
+
 def main():
     parser = argparse.ArgumentParser(prog="triad", description="Autonomous Multi-Agent Triad Orchestrator")
     subparsers = parser.add_subparsers(dest="command", help="Triad command to execute")
@@ -504,6 +516,14 @@ def main():
     p_gate = subparsers.add_parser("gate", help="Run full pre-commit verification (tsc + tests + diff review)")
     p_gate.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine override")
 
+    # bench
+    p_bench = subparsers.add_parser("bench", help="Run benchmark harness to score review accuracy against known bugs")
+    p_bench.add_argument("--cases-dir", default="", help="Path to cases directory (defaults to triad/bench/cases)")
+    p_bench.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine override")
+    p_bench.add_argument("--limit", type=int, default=0, help="Limit number of cases to test")
+    p_bench.add_argument("--case", default="", help="Run single case ID (e.g. case_001)")
+    p_bench.add_argument("--verbose", "-v", action="store_true", help="Print verbose review output")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -515,7 +535,8 @@ def main():
         "review": cmd_review,
         "consult": cmd_consult,
         "debug": cmd_debug,
-        "gate": cmd_gate
+        "gate": cmd_gate,
+        "bench": cmd_bench
     }
 
     handler = dispatch.get(args.command)
