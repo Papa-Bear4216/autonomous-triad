@@ -54,9 +54,9 @@ def judge_false_positive(review_response: str) -> bool:
     judge_prompt = (
         "You are evaluating a code review of a completely correct, benign diff with no bugs.\n\n"
         f"THE REVIEW RESPONSE TO SCORE:\n{review_response}\n\n"
-        "Did this review assert or flag that the code contains an internal bug, logic defect, syntax error, or security vulnerability? "
-        "Answer NO if the review considers the diff internally sound/clean, approves it, or only notes external caller/migration risks or stylistic suggestions. "
-        "Answer YES only if the review asserts that there is an actual defect, bug, or vulnerability in the changed code itself.\n"
+        "Did this review assert or flag that the diff itself introduces an actual defect, logic bug, syntax error, or security vulnerability? "
+        "Answer NO if the review considers the diff sound/clean, approves the change, states it is safe to merge, or only mentions style/docs or pre-existing code outside the diff. "
+        "Answer YES only if the review asserts that the diff itself introduces an actual defect, bug, or vulnerability.\n"
         "Answer with exactly one word: YES or NO."
     )
     verdict = query_claude(judge_prompt, mode="general", timeout=30)
@@ -160,7 +160,7 @@ def run_benchmark(
                 })
 
             if verbose:
-                print(f"       Review snippet: {review[:150].strip()}...\n")
+                print(f"\n--- [FULL REVIEW: {cid}] ---\n{review.strip()}\n-------------------------------------------------\n")
 
         except Exception as e:
             print(f"ERROR ({e})")

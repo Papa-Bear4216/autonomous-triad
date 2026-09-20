@@ -31,8 +31,16 @@ CLAUDE_PATH = Path(r"C:\Users\micha\.local\bin\claude.exe")
 CODEX_PATH = Path(r"C:\Users\micha\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe")
 AGY_PATH = Path(r"C:\Users\micha\AppData\Local\agy\bin\agy.exe")
 HERMES_PATH = Path(r"C:\Users\micha\AppData\Local\hermes\bin\hermes.exe")
-HERMES_CONFIG = Path(r"C:\Users\micha\AppData\Local\hermes\config.yaml")
 CODEX_AUTH = Path(r"C:\Users\micha\.codex\auth.json")
+
+try:
+    from triad.advisor_manager import query_configured_advisor, get_advisors, get_active_advisor
+    from triad.worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees
+    from triad.competition import query_competition_council
+except ImportError:
+    from advisor_manager import query_configured_advisor, get_advisors, get_active_advisor
+    from worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees
+    from competition import query_competition_council
 
 def kill_process_tree(pid: int):
     """Force kill a process and all its descendants on Windows."""
@@ -78,161 +86,20 @@ def build_advisor_prompt(prompt: str, context: str = None, diff: str = None, mod
         return f"{system_preamble}\nQUERY:\n{prompt}\n\nCONTEXT:\n{context or ''}\n"
 
 def query_claude(prompt: str, context: str = None, diff: str = None, mode: str = "general", timeout: int = 120) -> str:
-    claude_bin = str(CLAUDE_PATH) if CLAUDE_PATH.exists() else "claude"
-    full_prompt = build_advisor_prompt(prompt, context=context, diff=diff, mode=mode)
-
-    cmd = [
-        claude_bin,
-        "-p",
-        "--tools=",
-        "--strict-mcp-config",
-        "--mcp-config", str(EMPTY_MCP)
-    ]
-
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env
-        )
-
-        stdout, stderr = proc.communicate(input=full_prompt, timeout=timeout)
-        output = stdout.strip()
-
-        if proc.returncode != 0:
-            if "session limit" in output.lower() or "rate limit" in output.lower():
-                return f"[Claude Advisor Session Limit]: {output}"
-            clean_err = stderr.strip()
-            return f"[Error from Claude Advisor (exit code {proc.returncode})]: {output or clean_err}"
-
-        clean_lines = []
-        for line in output.splitlines():
-            if "Permission allow rule" in line or "Warning: no stdin data received" in line:
-                continue
-            clean_lines.append(line)
-
-        return "\n".join(clean_lines).strip()
-
-    except subprocess.TimeoutExpired:
-        if proc:
-            kill_process_tree(proc.pid)
-        return "[Error: Claude Advisor timed out (process tree killed)]"
-    except Exception as e:
-        if proc:
-            kill_process_tree(proc.pid)
-        return f"[Error calling Claude Advisor: {e}]"
+    """Query Claude advisor via configured advisor manager."""
+    return query_configured_advisor("claude", prompt, context=context, diff=diff, mode=mode, timeout=timeout)
 
 def query_codex(prompt: str, context: str = None, diff: str = None, mode: str = "general", timeout: int = 120) -> str:
-    codex_bin = str(CODEX_PATH) if CODEX_PATH.exists() else "codex"
-    full_prompt = build_advisor_prompt(prompt, context=context, diff=diff, mode=mode)
-
-    # Create temporary file and close handle immediately so Windows doesn't lock it
-    temp_fd, temp_out_path = tempfile.mkstemp(suffix=".txt")
-    os.close(temp_fd)
-
-    cmd = [
-        codex_bin,
-        "exec",
-        "--ephemeral",
-        "--ignore-user-config",
-        "--skip-git-repo-check",
-        "-s", "read-only",
-        "-o", temp_out_path,
-        "-"
-    ]
-
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env
-        )
-
-        stdout, stderr = proc.communicate(input=full_prompt, timeout=timeout)
-
-        # Read pure model response from isolated output file
-        if os.path.exists(temp_out_path):
-            try:
-                with open(temp_out_path, "r", encoding="utf-8", errors="replace") as f:
-                    agent_output = f.read().strip()
-                if agent_output:
-                    return agent_output
-            except Exception:
-                pass
-
-        # Fallback to parsing stdout if file was empty
-        clean_lines = []
-        capture = False
-        for line in stdout.splitlines():
-            if line.strip() == "codex":
-                capture = True
-                continue
-            if "tokens used" in line:
-                capture = False
-                continue
-            if capture:
-                clean_lines.append(line)
-
-        parsed = "\n".join(clean_lines).strip()
-        if parsed:
-            return parsed
-
-        if proc.returncode != 0:
-            return f"[Error from Codex Advisor (exit code {proc.returncode})]: {stderr.strip() or stdout.strip()}"
-
-        return stdout.strip()
-
-    except subprocess.TimeoutExpired:
-        if proc:
-            kill_process_tree(proc.pid)
-        return "[Error: OpenAI Codex timed out (process tree killed)]"
-    except Exception as e:
-        if proc:
-            kill_process_tree(proc.pid)
-        return f"[Error calling OpenAI Codex: {e}]"
-    finally:
-        if os.path.exists(temp_out_path):
-            try:
-                os.remove(temp_out_path)
-            except Exception:
-                pass
+    """Query OpenAI Codex advisor via configured advisor manager."""
+    return query_configured_advisor("codex", prompt, context=context, diff=diff, mode=mode, timeout=timeout)
 
 def query_advisory_council(prompt: str, context: str = None, diff: str = None, mode: str = "general", engine: str = "auto") -> str:
     """
-    Autonomous Advisory Council with zero-downtime failover:
-    Tries Claude Pro first. If rate limited, instantly routes to OpenAI Codex.
+    Autonomous Advisory Council with zero-downtime failover and dynamic advisor routing:
+    Delegates to configured advisors via advisor_manager.
     """
-    if engine == "codex":
-        return query_codex(prompt, context=context, diff=diff, mode=mode)
-    elif engine == "claude":
-        return query_claude(prompt, context=context, diff=diff, mode=mode)
-
-    # Auto mode: Claude Pro -> OpenAI Codex failover
-    claude_resp = query_claude(prompt, context=context, diff=diff, mode=mode)
-    if "session limit" in claude_resp.lower() or "rate limit" in claude_resp.lower() or claude_resp.startswith("[Error"):
-        codex_resp = query_codex(prompt, context=context, diff=diff, mode=mode)
-        header = f"[Advisor Auto-Failover: Claude Pro unavailable ({claude_resp.strip()}). Active Advisor: OpenAI Codex (gpt-6-astra)]\n\n"
-        return header + codex_resp
-
-    return claude_resp
+    target = "claude" if engine == "bare_single" else engine
+    return query_configured_advisor(target, prompt, context=context, diff=diff, mode=mode)
 
 def get_git_diff(cached: bool = False, head: bool = False) -> str:
     """Retrieve git diff from current repository."""
@@ -367,6 +234,12 @@ def cmd_review(args):
         sys.exit(0)
 
     prompt = args.prompt or "Review this git diff for edge cases, subtle bugs, type soundness, and architectural regressions."
+    if getattr(args, "competition", False):
+        print(f"[Triad Competition Mode] Evaluating diff via concurrent advisors (Claude Code & OpenAI Codex)...")
+        session = query_competition_council(prompt, diff=diff_content, mode="review_diff")
+        print("\n" + session["synthesis"])
+        return
+
     print(f"[Triad] Reviewing {len(diff_content.splitlines())} diff lines via Advisory Council (engine={args.engine})...\n")
     resp = query_advisory_council(prompt, diff=diff_content, mode="review_diff", engine=args.engine)
     print(resp)
@@ -385,6 +258,12 @@ def cmd_consult(args):
     if args.context_file and os.path.exists(args.context_file):
         with open(args.context_file, "r", encoding="utf-8", errors="replace") as f:
             context = f.read()
+
+    if getattr(args, "competition", False):
+        print(f"[Triad Competition Mode] Consulting concurrent advisors (Claude Code & OpenAI Codex)...")
+        session = query_competition_council(prompt, context=context, mode="architect")
+        print("\n" + session["synthesis"])
+        return
 
     print(f"[Triad] Consulting Advisory Council (engine={args.engine})...\n")
     resp = query_advisory_council(prompt, context=context, mode="architect", engine=args.engine)
@@ -405,9 +284,61 @@ def cmd_debug(args):
         with open(args.context_file, "r", encoding="utf-8", errors="replace") as f:
             context = f.read()
 
+    if getattr(args, "competition", False):
+        print(f"[Triad Competition Mode] Diagnosing error via concurrent advisors (Claude Code & OpenAI Codex)...")
+        session = query_competition_council(error, context=context, mode="debug")
+        print("\n" + session["synthesis"])
+        return
+
     print(f"[Triad] Diagnosing with Advisory Council (engine={args.engine})...\n")
     resp = query_advisory_council(error, context=context, mode="debug", engine=args.engine)
     print(resp)
+
+def apply_patch_text(patch_text: str) -> bool:
+    """Extracts unified diff from model response, validates with git apply --check, and applies it."""
+    import re
+    # Extract fenced code blocks or raw diff
+    m = re.search(r"```(?:diff|patch)?\s*\n(.*?)```", patch_text, re.DOTALL)
+    raw_diff = m.group(1).strip() if m else patch_text.strip()
+
+    # Verify minimum diff headers
+    has_diff_headers = (
+        ("diff --git " in raw_diff or ("--- " in raw_diff and "+++" in raw_diff))
+        and "@@ " in raw_diff
+    )
+    if not has_diff_headers:
+        return False
+
+    # Create safe unique temp patch file
+    fd, temp_patch_path = tempfile.mkstemp(suffix=".patch", prefix="triad_heal_")
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(raw_diff + "\n")
+
+        # 1. Check dry-run
+        check_res = subprocess.run(
+            ["git", "apply", "--check", "--whitespace=fix", temp_patch_path],
+            capture_output=True,
+            text=True
+        )
+        if check_res.returncode != 0:
+            return False
+
+        # 2. Apply patch
+        apply_res = subprocess.run(
+            ["git", "apply", "--whitespace=fix", temp_patch_path],
+            capture_output=True,
+            text=True
+        )
+        return apply_res.returncode == 0
+    except Exception:
+        return False
+    finally:
+        if os.path.exists(temp_patch_path):
+            try:
+                os.remove(temp_patch_path)
+            except Exception:
+                pass
 
 def cmd_gate(args):
     """
@@ -415,44 +346,87 @@ def cmd_gate(args):
     1. Runs TypeScript compiler (tsc) if present
     2. Runs test suite if present
     3. If clean, pipes git diff to Advisory Council for signoff
+    Bounded self-healing retry budget restarts the full validation sequence.
     """
     cwd = Path.cwd()
     print(f"[Triad Gate] Running pre-commit verification in {cwd}...\n")
+    max_retries = max(0, getattr(args, "max_retries", 1))
 
-    # Step 1: TypeScript Check
     tsconfig = cwd / "tsconfig.json"
-    if tsconfig.exists():
-        print("[Step 1/3] Verifying TypeScript type safety (npx tsc --noEmit)...")
-        res = subprocess.run(["npx.cmd", "tsc", "--noEmit"], capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if res.returncode != 0:
-            print(f"\n❌ [Triad Gate FAILED] TypeScript errors detected:\n{res.stdout or res.stderr}")
-            print("\nFix compiler errors before submitting to the Advisory Council.")
-            sys.exit(1)
-        print("✓ TypeScript: 0 errors.")
-    else:
-        print("[Step 1/3] No tsconfig.json found. Skipping tsc check.")
-
-    # Step 2: Test Suite
     package_json = cwd / "package.json"
-    if package_json.exists():
-        try:
-            with open(package_json, "r", encoding="utf-8") as f:
-                pkg_data = json.load(f)
-            scripts = pkg_data.get("scripts", {})
-            if "test" in scripts:
-                print("[Step 2/3] Running local test suite (npm test)...")
-                test_cmd = ["npm.cmd", "test", "--", "--run"]
-                res = subprocess.run(test_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                if res.returncode != 0:
-                    print(f"\n❌ [Triad Gate FAILED] Test suite failed:\n{res.stdout or res.stderr}")
+
+    attempt = 0
+    while attempt <= max_retries:
+        # Step 1: TypeScript Check
+        if tsconfig.exists():
+            print("[Step 1/3] Verifying TypeScript type safety (npx tsc --noEmit)...")
+            res = subprocess.run(["npx.cmd", "tsc", "--noEmit"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if res.returncode != 0:
+                print(f"\n❌ [Triad Gate: Step 1 FAILED] TypeScript errors detected:\n{res.stdout or res.stderr}")
+                if attempt < max_retries:
+                    attempt += 1
+                    print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
+                    fix_prompt = (
+                        f"The TypeScript compiler failed with these errors:\n{res.stdout or res.stderr}\n\n"
+                        "Diagnose the failure and provide the minimal unified diff to fix it."
+                    )
+                    advisor_fix = query_advisory_council(fix_prompt, mode="debug", engine=args.engine)
+                    print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
+                    applied = apply_patch_text(advisor_fix)
+                    if applied:
+                        print("✓ Applied advisory patch to working tree. Restarting validation sequence...\n")
+                        continue
+                    else:
+                        print("! Could not automatically apply patch via git apply. Aborting gate.")
+                        sys.exit(1)
+                else:
+                    print("\n❌ [Triad Gate FAILED] TypeScript errors persist after retry budget exhausted.")
                     sys.exit(1)
-                print("✓ Tests passed successfully.")
-            else:
-                print("[Step 2/3] No test script in package.json. Skipping.")
-        except Exception as e:
-            print(f"[Step 2/3] Skipped test verification: {e}")
-    else:
-        print("[Step 2/3] No package.json found. Skipping tests.")
+            print("✓ TypeScript: 0 errors.")
+        else:
+            print("[Step 1/3] No tsconfig.json found. Skipping tsc check.")
+
+        # Step 2: Test Suite
+        if package_json.exists():
+            try:
+                with open(package_json, "r", encoding="utf-8") as f:
+                    pkg_data = json.load(f)
+                scripts = pkg_data.get("scripts", {})
+                if "test" in scripts:
+                    print("[Step 2/3] Running local test suite (npm test)...")
+                    test_cmd = ["npm.cmd", "test", "--", "--run"]
+                    res = subprocess.run(test_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    if res.returncode != 0:
+                        print(f"\n❌ [Triad Gate: Step 2 FAILED] Test suite failed:\n{res.stdout or res.stderr}")
+                        if attempt < max_retries:
+                            attempt += 1
+                            print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
+                            fix_prompt = (
+                                f"The test suite failed with this output:\n{res.stdout or res.stderr}\n\n"
+                                "Diagnose the failure and provide the minimal unified diff to fix it."
+                            )
+                            advisor_fix = query_advisory_council(fix_prompt, mode="debug", engine=args.engine)
+                            print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
+                            applied = apply_patch_text(advisor_fix)
+                            if applied:
+                                print("✓ Applied advisory patch to working tree. Restarting validation sequence (re-running tsc + tests)...\n")
+                                continue
+                            else:
+                                print("! Could not automatically apply patch via git apply. Aborting gate.")
+                                sys.exit(1)
+                        else:
+                            print("\n❌ [Triad Gate FAILED] Test suite still failing after retry budget exhausted.")
+                            sys.exit(1)
+                    print("✓ Tests passed successfully.")
+                else:
+                    print("[Step 2/3] No test script in package.json. Skipping.")
+            except Exception as e:
+                print(f"[Step 2/3] Skipped test verification: {e}")
+        else:
+            print("[Step 2/3] No package.json found. Skipping tests.")
+
+        # Both steps verified clean
+        break
 
     # Step 3: Advisory Council Diff Signoff
     print("\n[Step 3/3] Submitting diff to Advisory Council for pre-commit signoff...")
@@ -473,7 +447,27 @@ def cmd_gate(args):
 
 def cmd_bench(args):
     """Run the Triad benchmark suite."""
-    from bench.run_bench import run_benchmark, DEFAULT_CASES_DIR
+    suite = getattr(args, "suite", "cases")
+    if suite == "swebench":
+        try:
+            from bench.swebench_runner import run_swebench
+        except ImportError:
+            from triad.bench.swebench_runner import run_swebench
+
+        run_swebench(
+            engine=args.engine,
+            limit=args.limit or 5,
+            instance_id=args.case,
+            mode="debug",
+            verbose=args.verbose
+        )
+        return
+
+    try:
+        from bench.run_bench import run_benchmark, DEFAULT_CASES_DIR
+    except ImportError:
+        from triad.bench.run_bench import run_benchmark, DEFAULT_CASES_DIR
+
     cases_dir = Path(args.cases_dir) if args.cases_dir else DEFAULT_CASES_DIR
     bugs_caught, pos_tot, fps, neg_tot, results = run_benchmark(
         cases_dir=cases_dir,
@@ -482,6 +476,30 @@ def cmd_bench(args):
         case_id=args.case,
         verbose=args.verbose
     )
+
+def cmd_worktree(args):
+    """Manage ephemeral git worktrees."""
+    action = getattr(args, "wt_action", None)
+    if action == "list" or not action:
+        wts = list_worktrees()
+        print(f"Active Git Worktrees ({len(wts)}):")
+        for wt in wts:
+            det = " (detached)" if wt.get("detached") else ""
+            branch = f" [{wt.get('branch')}]" if wt.get("branch") else ""
+            print(f"  - {wt['worktree']} {wt.get('head', '')[:8]}{branch}{det}")
+    elif action == "create":
+        wt_path = create_worktree(".", branch_or_commit=args.ref, prefix=args.prefix)
+        print(f"Created isolated worktree at: {wt_path}")
+    elif action == "remove":
+        removed = remove_worktree(args.path, force=args.force)
+        if removed:
+            print(f"Removed worktree at: {args.path}")
+        else:
+            print(f"Failed to remove worktree at: {args.path}")
+    elif action == "prune":
+        prune_worktrees(".")
+        print("Pruned stale worktree metadata.")
+
 
 def main():
     parser = argparse.ArgumentParser(prog="triad", description="Autonomous Multi-Agent Triad Orchestrator")
@@ -496,33 +514,50 @@ def main():
     p_rev.add_argument("--diff-file", default="", help="Path to diff file or - for stdin")
     p_rev.add_argument("--cached", "--staged", action="store_true", help="Review staged changes")
     p_rev.add_argument("--head", action="store_true", help="Review latest commit (HEAD~1)")
-    p_rev.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine override")
+    p_rev.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, ollama, mock)")
+    p_rev.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
 
     # consult
     p_con = subparsers.add_parser("consult", help="Consult Advisory Council on architectural design")
     p_con.add_argument("prompt", nargs="?", default="", help="Architectural question or proposal")
     p_con.add_argument("--context", default="", help="Inline context or schema")
     p_con.add_argument("--context-file", default="", help="Path to context file")
-    p_con.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine override")
+    p_con.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, ollama, mock)")
+    p_con.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
 
     # debug
     p_dbg = subparsers.add_parser("debug", help="Diagnose a stubborn error or bug with Advisory Council")
     p_dbg.add_argument("error", nargs="?", default="", help="Error message or description")
     p_dbg.add_argument("--context", default="", help="Code snippet or context")
     p_dbg.add_argument("--context-file", default="", help="Path to context file")
-    p_dbg.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine override")
+    p_dbg.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, ollama, mock)")
+    p_dbg.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
 
     # gate
     p_gate = subparsers.add_parser("gate", help="Run full pre-commit verification (tsc + tests + diff review)")
-    p_gate.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine override")
+    p_gate.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, ollama, mock)")
+    p_gate.add_argument("--max-retries", type=int, default=1, help="Max self-healing retries for tsc/tests (default 1)")
 
     # bench
     p_bench = subparsers.add_parser("bench", help="Run benchmark harness to score review accuracy against known bugs")
+    p_bench.add_argument("--suite", choices=["cases", "swebench"], default="cases", help="Benchmark suite ('cases' or 'swebench')")
     p_bench.add_argument("--cases-dir", default="", help="Path to cases directory (defaults to triad/bench/cases)")
-    p_bench.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine override")
+    p_bench.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, bare_single, mock)")
     p_bench.add_argument("--limit", type=int, default=0, help="Limit number of cases to test")
-    p_bench.add_argument("--case", default="", help="Run single case ID (e.g. case_001)")
+    p_bench.add_argument("--case", default="", help="Run single case ID (e.g. case_001 or astropy__astropy-12907)")
     p_bench.add_argument("--verbose", "-v", action="store_true", help="Print verbose review output")
+
+    # worktree
+    p_wt = subparsers.add_parser("worktree", help="Manage ephemeral git worktrees (create, remove, list, prune)")
+    wt_sub = p_wt.add_subparsers(dest="wt_action", help="Worktree action")
+    wt_sub.add_parser("list", help="List all active worktrees")
+    p_wt_create = wt_sub.add_parser("create", help="Create a new isolated worktree")
+    p_wt_create.add_argument("--ref", default="HEAD", help="Commit, branch, or tag (default HEAD)")
+    p_wt_create.add_argument("--prefix", default="triad-work", help="Directory prefix")
+    p_wt_remove = wt_sub.add_parser("remove", help="Remove an isolated worktree")
+    p_wt_remove.add_argument("path", help="Path to worktree directory to remove")
+    p_wt_remove.add_argument("--force", "-f", action="store_true", default=False, help="Force removal, including uncommitted changes")
+    wt_sub.add_parser("prune", help="Prune orphaned worktree metadata")
 
     args = parser.parse_args()
 
@@ -536,7 +571,8 @@ def main():
         "consult": cmd_consult,
         "debug": cmd_debug,
         "gate": cmd_gate,
-        "bench": cmd_bench
+        "bench": cmd_bench,
+        "worktree": cmd_worktree
     }
 
     handler = dispatch.get(args.command)

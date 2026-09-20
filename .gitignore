@@ -6,6 +6,8 @@ __pycache__/
 # Output and temporary files
 *.log
 *.tmp
+*.jsonl
+triad/logs/
 codex_test_out.txt
 
 # Environment & credentials (Strict Invariant: No Secrets)
