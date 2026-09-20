@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output and temporary files
+*.log
+*.tmp
+codex_test_out.txt
+
+# Environment & credentials (Strict Invariant: No Secrets)
+.env
+.env.*
+*.keystore
+auth.json
+token.json
+credentials.json
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
