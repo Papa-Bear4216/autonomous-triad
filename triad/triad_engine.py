@@ -340,13 +340,38 @@ def apply_patch_text(patch_text: str) -> bool:
             except Exception:
                 pass
 
+def run_subprocess_tree_safe(cmd: List[str], cwd: Path, timeout: int = 90) -> Tuple[int, str, str]:
+    """Execute command, killing the entire process tree on timeout to prevent zombie workers."""
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace"
+        )
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc.returncode, stdout, stderr
+    except subprocess.TimeoutExpired:
+        if proc:
+            kill_process_tree(proc.pid)
+        return 1, "", f"Command timed out after {timeout}s (entire process tree killed)"
+    except Exception as e:
+        if proc:
+            kill_process_tree(proc.pid)
+        return 1, "", f"Execution error: {e}"
+
 def cmd_gate(args):
     """
-    The Pre-Commit Verification Gate:
-    1. Runs TypeScript compiler (tsc) if present
-    2. Runs test suite if present
-    3. If clean, pipes git diff to Advisory Council for signoff
-    Bounded self-healing retry budget restarts the full validation sequence.
+    Ground-Truth Verification Gate with self-healing retry loop:
+    1. TypeScript compilation (tsc --noEmit)
+    2. Test suites (npm test, Python unittests)
+    3. Advisory Council diff review & pre-commit signoff
+    If Step 1 or Step 2 fails, queries Advisory Council in debug mode for surgical fix,
+    applies patch via git apply, and retries up to --max-retries times.
     """
     cwd = Path.cwd()
     print(f"[Triad Gate] Running pre-commit verification in {cwd}...\n")
@@ -354,20 +379,22 @@ def cmd_gate(args):
 
     tsconfig = cwd / "tsconfig.json"
     package_json = cwd / "package.json"
+    test_timeout = 90
 
     attempt = 0
     while attempt <= max_retries:
         # Step 1: TypeScript Check
         if tsconfig.exists():
             print("[Step 1/3] Verifying TypeScript type safety (npx tsc --noEmit)...")
-            res = subprocess.run(["npx.cmd", "tsc", "--noEmit"], capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if res.returncode != 0:
-                print(f"\n❌ [Triad Gate: Step 1 FAILED] TypeScript errors detected:\n{res.stdout or res.stderr}")
+            ret, out, err = run_subprocess_tree_safe(["npx.cmd", "tsc", "--noEmit"], cwd=cwd, timeout=test_timeout)
+            if ret != 0:
+                diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
+                print(f"\n❌ [Triad Gate: Step 1 FAILED] TypeScript errors detected:\n{diag_output}")
                 if attempt < max_retries:
                     attempt += 1
                     print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
                     fix_prompt = (
-                        f"The TypeScript compiler failed with these errors:\n{res.stdout or res.stderr}\n\n"
+                        f"The TypeScript compiler failed with these errors:\n{diag_output}\n\n"
                         "Diagnose the failure and provide the minimal unified diff to fix it."
                     )
                     advisor_fix = query_advisory_council(fix_prompt, mode="debug", engine=args.engine)
@@ -386,30 +413,37 @@ def cmd_gate(args):
         else:
             print("[Step 1/3] No tsconfig.json found. Skipping tsc check.")
 
-        # Step 2: Test Suite
+        # Step 2: Test Suites (Supports polyglot projects: Node/Jest/Vitest AND Python/Unittest)
+        ran_any_tests = False
+        step2_failed = False
+
         if package_json.exists():
             try:
                 with open(package_json, "r", encoding="utf-8") as f:
                     pkg_data = json.load(f)
                 scripts = pkg_data.get("scripts", {})
                 if "test" in scripts:
+                    ran_any_tests = True
                     print("[Step 2/3] Running local test suite (npm test)...")
                     test_cmd = ["npm.cmd", "test", "--", "--run"]
-                    res = subprocess.run(test_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                    if res.returncode != 0:
-                        print(f"\n❌ [Triad Gate: Step 2 FAILED] Test suite failed:\n{res.stdout or res.stderr}")
+                    ret, out, err = run_subprocess_tree_safe(test_cmd, cwd=cwd, timeout=test_timeout)
+
+                    if ret != 0:
+                        step2_failed = True
+                        diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
+                        print(f"\n❌ [Triad Gate: Step 2 FAILED] Node test suite failed:\n{diag_output}")
                         if attempt < max_retries:
                             attempt += 1
                             print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
                             fix_prompt = (
-                                f"The test suite failed with this output:\n{res.stdout or res.stderr}\n\n"
+                                f"The Node test suite failed with this output:\n{diag_output}\n\n"
                                 "Diagnose the failure and provide the minimal unified diff to fix it."
                             )
                             advisor_fix = query_advisory_council(fix_prompt, mode="debug", engine=args.engine)
                             print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
                             applied = apply_patch_text(advisor_fix)
                             if applied:
-                                print("✓ Applied advisory patch to working tree. Restarting validation sequence (re-running tsc + tests)...\n")
+                                print("✓ Applied advisory patch to working tree. Restarting validation sequence...\n")
                                 continue
                             else:
                                 print("! Could not automatically apply patch via git apply. Aborting gate.")
@@ -417,15 +451,60 @@ def cmd_gate(args):
                         else:
                             print("\n❌ [Triad Gate FAILED] Test suite still failing after retry budget exhausted.")
                             sys.exit(1)
-                    print("✓ Tests passed successfully.")
-                else:
-                    print("[Step 2/3] No test script in package.json. Skipping.")
+                    else:
+                        print("✓ Node/npm tests passed successfully.")
             except Exception as e:
-                print(f"[Step 2/3] Skipped test verification: {e}")
-        else:
-            print("[Step 2/3] No package.json found. Skipping tests.")
+                print(f"\n❌ [Triad Gate: Step 2 FAILED] Error executing Node test runner: {e}")
+                sys.exit(1)
 
-        # Both steps verified clean
+        # Python test discovery: run all configured suites
+        py_test_targets = []
+        if (cwd / "triad" / "tests").exists():
+            py_test_targets.append("triad/tests")
+        if (cwd / "tests").exists():
+            py_test_targets.append("tests")
+
+        for py_test_target in py_test_targets:
+            ran_any_tests = True
+            print(f"[Step 2/3] Running Python unit test suite ({py_test_target})...")
+            test_cmd = [sys.executable, "-m", "unittest", "discover", "-s", py_test_target, "-p", "test_*.py"]
+            ret, out, err = run_subprocess_tree_safe(test_cmd, cwd=cwd, timeout=test_timeout)
+
+            diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
+            is_empty_suite = "Ran 0 tests" in diag_output
+            if ret != 0 or is_empty_suite:
+                step2_failed = True
+                reason = "discovering 0 tests" if is_empty_suite else "failures"
+                print(f"\n❌ [Triad Gate: Step 2 FAILED] Python test suite failed ({reason}):\n{diag_output}")
+                if attempt < max_retries:
+                    attempt += 1
+                    print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
+                    fix_prompt = (
+                        f"The Python unit test suite failed with this output:\n{diag_output}\n\n"
+                        "Diagnose the failure and provide the minimal unified diff to fix it."
+                    )
+                    advisor_fix = query_advisory_council(fix_prompt, mode="debug", engine=args.engine)
+                    print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
+                    applied = apply_patch_text(advisor_fix)
+                    if applied:
+                        print("✓ Applied advisory patch to working tree. Restarting validation sequence...\n")
+                        break  # breaks out of targets loop to restart validation
+                    else:
+                        print("! Could not automatically apply patch via git apply. Aborting gate.")
+                        sys.exit(1)
+                else:
+                    print("\n❌ [Triad Gate FAILED] Python test suite still failing after retry budget exhausted.")
+                    sys.exit(1)
+            else:
+                print(f"✓ Python tests ({py_test_target}) passed successfully.")
+
+        if step2_failed:
+            continue
+
+        if not ran_any_tests:
+            print("[Step 2/3] No test runner found (package.json / Python tests). Skipping.")
+
+        # All steps verified clean
         break
 
     # Step 3: Advisory Council Diff Signoff

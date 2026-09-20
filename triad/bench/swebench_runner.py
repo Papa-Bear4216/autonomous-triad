@@ -216,15 +216,26 @@ def simulate_test_run(
 
     try:
         # Route to advisory council judge
-        judge_verdict = query_claude(judge_prompt, mode="general", timeout=40)
-        if not judge_verdict or "[error" in judge_verdict.lower() or "limit" in judge_verdict.lower():
+        if engine == "codex":
             judge_verdict = query_codex(judge_prompt, mode="general", timeout=40)
+        else:
+            judge_verdict = query_claude(judge_prompt, mode="general", timeout=40)
+            if not judge_verdict or "[error" in judge_verdict.lower() or "limit" in judge_verdict.lower():
+                judge_verdict = query_codex(judge_prompt, mode="general", timeout=40)
 
-        lines = judge_verdict.strip().splitlines()
-        first_line = lines[0].strip().upper() if lines else ""
-        rationale = lines[1].strip() if len(lines) > 1 else (judge_verdict[:100] if judge_verdict else "No rationale provided")
 
-        if "RESOLVED" in first_line and "UNRESOLVED" not in first_line:
+        raw_verdict = (judge_verdict or "").strip()
+        if not raw_verdict or "[error" in raw_verdict.lower() or "timeout" in raw_verdict.lower():
+            return False, f"Simulation judge error: {raw_verdict or 'No response'}"
+
+        lines = raw_verdict.splitlines()
+        first_line = lines[0].strip() if lines else ""
+        rationale = lines[1].strip() if len(lines) > 1 else raw_verdict[:120]
+
+        is_resolved = bool(re.search(r"\bVERDICT:\s*RESOLVED\b", first_line, re.IGNORECASE))
+        is_unresolved = bool(re.search(r"\bVERDICT:\s*UNRESOLVED\b", first_line, re.IGNORECASE))
+
+        if is_resolved and not is_unresolved:
             return True, f"Simulation passed: {rationale}"
         else:
             return False, f"Simulation failed: {rationale}"
