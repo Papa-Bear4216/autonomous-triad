@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Hardened Benchmark Harness for Autonomous Multi-Agent Triad.
 Uses model-as-a-judge scoring (replacing keyword matching) and negative controls.
@@ -11,6 +12,19 @@ import argparse
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
+# Ensure UTF-8 output on Windows consoles and redirected streams
+os.environ["PYTHONIOENCODING"] = "utf-8"
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # Ensure parent triad directory is importable
 TRIAD_ROOT = Path(__file__).resolve().parent.parent
 if str(TRIAD_ROOT) not in sys.path:
@@ -18,33 +32,31 @@ if str(TRIAD_ROOT) not in sys.path:
 
 from triad_engine import query_advisory_council, query_claude, query_codex
 
-# Ensure UTF-8 output on Windows consoles
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8")
-
 DEFAULT_CASES_DIR = Path(__file__).resolve().parent / "cases"
 
 def judge_catch(bug_description: str, review_response: str) -> bool:
     """
     Ask a model whether the review response specifically and correctly identifies
-    the seeded bug, rather than relying on vocabulary overlap or boilerplate.
+    the seeded bug anywhere in its findings, rather than relying on presentation order.
     """
     judge_prompt = (
-        "You are scoring a code review for accuracy, not vocabulary overlap.\n\n"
+        "You are scoring a code review for accuracy, not presentation order.\n\n"
         f"THE ACTUAL BUG: {bug_description}\n\n"
         f"THE REVIEW RESPONSE TO SCORE:\n{review_response}\n\n"
-        "Does this review response specifically and correctly identify THIS bug "
-        "(not just mention adjacent-sounding concerns)? "
-        "A review that lists generic risks without pinpointing this exact issue does NOT count as a catch.\n"
+        "Does this review, ANYWHERE in its findings (not just the first/headline finding), "
+        "correctly and specifically identify this bug? A thorough review often finds multiple "
+        "issues and ranks them by severity — the planted bug may be item #2 or #3, or folded "
+        "into a broader finding, rather than the top-billed item. That still counts as a catch. "
+        "It does NOT count if the review only mentions adjacent-sounding concerns without "
+        "actually identifying this specific defect. "
+        "Score the reviewer's final verdict, not exploratory or retracted hypotheses.\n"
         "Answer with exactly one word: YES or NO."
     )
     verdict = query_claude(judge_prompt, mode="general", timeout=30)
     if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
         verdict = query_codex(judge_prompt, mode="general", timeout=30)
-    
-    first_word = verdict.strip().upper().split()[0] if verdict.strip() else ""
+
+    first_word = verdict.strip().upper().split()[0] if (verdict and verdict.strip()) else ""
     return first_word.startswith("YES")
 
 def judge_false_positive(review_response: str) -> bool:
@@ -55,8 +67,9 @@ def judge_false_positive(review_response: str) -> bool:
         "You are evaluating a code review of a completely correct, benign diff with no bugs.\n\n"
         f"THE REVIEW RESPONSE TO SCORE:\n{review_response}\n\n"
         "Did this review assert or flag that the diff itself introduces an actual defect, logic bug, syntax error, or security vulnerability? "
+        "Score the reviewer's final verdict, not exploratory or retracted hypotheses that the reviewer subsequently disproved or dismissed. "
         "Answer NO if the review considers the diff sound/clean, approves the change, states it is safe to merge, or only mentions style/docs or pre-existing code outside the diff. "
-        "Answer YES only if the review asserts that the diff itself introduces an actual defect, bug, or vulnerability.\n"
+        "Answer YES only if the review's final verdict asserts that the diff itself introduces an actual defect, bug, or vulnerability.\n"
         "Answer with exactly one word: YES or NO."
     )
     verdict = query_claude(judge_prompt, mode="general", timeout=30)

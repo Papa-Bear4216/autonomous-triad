@@ -28,8 +28,23 @@ DEFAULT_CONFIG_PATH = TRIAD_DIR / "advisors.json"
 DEFAULT_EMPTY_MCP = TRIAD_DIR / "empty-mcp.json"
 
 
+import psutil
+
 def kill_process_tree(pid: int) -> None:
     """Force-terminate a process and all child descendants on Windows."""
+    try:
+        parent = psutil.Process(pid)
+        for child in parent.children(recursive=True):
+            try:
+                child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        parent.kill()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    except Exception:
+        pass
+
     try:
         subprocess.run(
             ["taskkill", "/F", "/T", "/PID", str(pid)],
@@ -298,6 +313,11 @@ def _execute_single_advisor(
             kill_process_tree(proc.pid)
         return f"[Error calling {display_name}: {e}]"
     finally:
+        if proc:
+            try:
+                kill_process_tree(proc.pid)
+            except Exception:
+                pass
         if temp_out_path and os.path.exists(temp_out_path):
             try:
                 os.remove(temp_out_path)
