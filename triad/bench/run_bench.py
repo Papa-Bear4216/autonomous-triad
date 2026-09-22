@@ -25,14 +25,60 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
-# Ensure parent triad directory is importable
+# Ensure parent repo root and triad directory are importable
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TRIAD_ROOT = Path(__file__).resolve().parent.parent
-if str(TRIAD_ROOT) not in sys.path:
-    sys.path.insert(0, str(TRIAD_ROOT))
+for p in [str(REPO_ROOT), str(TRIAD_ROOT)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 from triad_engine import query_advisory_council, query_claude, query_codex
 
 DEFAULT_CASES_DIR = Path(__file__).resolve().parent / "cases"
+
+class JudgeUnavailableError(RuntimeError):
+    """Raised when judging instruments cannot provide an authoritative evaluation."""
+    pass
+
+def query_judge(prompt: str, timeout: int = 30) -> str:
+    """
+    Independent judging instrument with zero-downtime failover (Claude -> Codex).
+    Fixed across all reviewed engines to maintain measurement validity and score comparability.
+    """
+    verdict = query_claude(prompt, mode="general", timeout=timeout)
+    if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
+        verdict = query_codex(prompt, mode="general", timeout=timeout)
+    if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
+        clean_err = verdict.strip().replace("\n", " ") if verdict else "Empty response"
+        raise JudgeUnavailableError(f"Judge models unavailable (Claude and Codex rate-limited or offline): {clean_err[:120]}")
+    return verdict
+
+def _parse_judge_verdict(verdict: str) -> bool:
+    """
+    Strictly parse YES or NO from judge response.
+    Fails closed by raising JudgeUnavailableError on ambiguity, errors, or unexpected formatting.
+    """
+    if not verdict or not verdict.strip():
+        raise JudgeUnavailableError("Judge returned empty verdict")
+    
+    # Check first line/token
+    lines = [l.strip() for l in verdict.strip().splitlines() if l.strip()]
+    first_token = lines[0].split()[0]
+    clean_word = re.sub(r"[^\w]", "", first_token).upper()
+    
+    if clean_word == "YES":
+        return True
+    elif clean_word == "NO":
+        return False
+    
+    # If first token is markdown-wrapped or punctuation, check all tokens on first line
+    first_line_tokens = [re.sub(r"[^\w]", "", t).upper() for t in lines[0].split()]
+    if "YES" in first_line_tokens and "NO" not in first_line_tokens:
+        return True
+    elif "NO" in first_line_tokens and "YES" not in first_line_tokens:
+        return False
+        
+    raise JudgeUnavailableError(f"Judge returned non-boolean response: {verdict[:100]}")
 
 def judge_catch(bug_description: str, review_response: str) -> bool:
     """
@@ -52,12 +98,8 @@ def judge_catch(bug_description: str, review_response: str) -> bool:
         "Score the reviewer's final verdict, not exploratory or retracted hypotheses.\n"
         "Answer with exactly one word: YES or NO."
     )
-    verdict = query_claude(judge_prompt, mode="general", timeout=30)
-    if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
-        verdict = query_codex(judge_prompt, mode="general", timeout=30)
-
-    first_word = verdict.strip().upper().split()[0] if (verdict and verdict.strip()) else ""
-    return first_word.startswith("YES")
+    verdict = query_judge(judge_prompt, timeout=30)
+    return _parse_judge_verdict(verdict)
 
 def judge_false_positive(review_response: str) -> bool:
     """
@@ -72,12 +114,8 @@ def judge_false_positive(review_response: str) -> bool:
         "Answer YES only if the review's final verdict asserts that the diff itself introduces an actual defect, bug, or vulnerability.\n"
         "Answer with exactly one word: YES or NO."
     )
-    verdict = query_claude(judge_prompt, mode="general", timeout=30)
-    if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
-        verdict = query_codex(judge_prompt, mode="general", timeout=30)
-
-    first_word = verdict.strip().upper().split()[0] if verdict.strip() else ""
-    return first_word.startswith("YES")
+    verdict = query_judge(judge_prompt, timeout=30)
+    return _parse_judge_verdict(verdict)
 
 def run_benchmark(
     cases_dir: Path = DEFAULT_CASES_DIR,
@@ -175,6 +213,10 @@ def run_benchmark(
             if verbose:
                 print(f"\n--- [FULL REVIEW: {cid}] ---\n{review.strip()}\n-------------------------------------------------\n")
 
+        except JudgeUnavailableError as e:
+            print(f"✗ JUDGE UNAVAILABLE: {e}")
+            print("\n❌ [Benchmark ABORTED] Cannot compute valid score while judging instruments are unavailable.")
+            sys.exit(1)
         except Exception as e:
             print(f"ERROR ({e})")
             results.append({

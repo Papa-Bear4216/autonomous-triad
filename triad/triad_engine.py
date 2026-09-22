@@ -11,6 +11,7 @@ Unified Executive Orchestrator & Advisory Bridge:
 
 import sys
 import os
+import re
 import subprocess
 import argparse
 import json
@@ -93,13 +94,13 @@ def query_codex(prompt: str, context: str = None, diff: str = None, mode: str = 
     """Query OpenAI Codex advisor via configured advisor manager."""
     return query_configured_advisor("codex", prompt, context=context, diff=diff, mode=mode, timeout=timeout)
 
-def query_advisory_council(prompt: str, context: str = None, diff: str = None, mode: str = "general", engine: str = "auto") -> str:
+def query_advisory_council(prompt: str, context: str = None, diff: str = None, mode: str = "general", engine: str = "auto", timeout: int = 180) -> str:
     """
     Autonomous Advisory Council with zero-downtime failover and dynamic advisor routing:
     Delegates to configured advisors via advisor_manager.
     """
     target = "claude" if engine == "bare_single" else engine
-    return query_configured_advisor(target, prompt, context=context, diff=diff, mode=mode)
+    return query_configured_advisor(target, prompt, context=context, diff=diff, mode=mode, timeout=timeout)
 
 def get_git_diff(cached: bool = False, head: bool = False) -> str:
     """Retrieve git diff from current repository."""
@@ -515,14 +516,45 @@ def cmd_gate(args):
         return
 
     resp = query_advisory_council(
-        "Evaluate this diff as the final pre-commit gate. If safe and sound, approve with a brief confirmation. If edge cases or risks exist, flag them.",
+        "Evaluate this diff as the final pre-commit gate.\n"
+        "Start your response with exactly 'VERDICT: APPROVED' if the diff is safe and sound to commit, "
+        "or 'VERDICT: REJECTED' if there are correctness defects, regressions, or unresolved blockers, "
+        "followed by your structured rationale.",
         diff=diff,
         mode="review_diff",
-        engine=args.engine
+        engine=args.engine,
+        timeout=getattr(args, "timeout", 240)
     )
     print("\n[Advisory Council Signoff]:")
     print(resp)
-    print("\n✓ [Triad Gate COMPLETE]")
+
+    # Parse verdict fail-closed: distinguish outages from explicit verdicts
+    resp_clean = (resp or "").strip()
+    if not resp_clean or resp_clean.startswith("[Error") or resp_clean.startswith("[error"):
+        print("\n❌ [Triad Gate BLOCKED] Advisory Council execution error or service outage.")
+        if resp_clean:
+            print(f"Details: {resp_clean[:200]}")
+        sys.exit(1)
+
+    # Rejection anywhere in the response takes precedence and immediately blocks
+    is_rejected = bool(re.search(r"\bVERDICT:\s*REJECTED\b", resp_clean, re.IGNORECASE))
+    if is_rejected:
+        print("\n❌ [Triad Gate BLOCKED] Advisory Council explicitly rejected the diff.")
+        print("Address the advisory council findings above before committing.")
+        sys.exit(1)
+
+    # Approval must be explicitly declared on the opening non-empty line
+    non_empty_lines = [l.strip() for l in resp_clean.splitlines() if l.strip()]
+    first_line = non_empty_lines[0] if non_empty_lines else ""
+    first_line_clean = re.sub(r"[\*#_`]", "", first_line).strip()
+    is_approved_line1 = bool(re.match(r"^VERDICT:\s*APPROVED\b", first_line_clean, re.IGNORECASE))
+
+    if is_approved_line1:
+        print("\n✓ [Triad Gate COMPLETE] Advisory Council approved pre-commit signoff.")
+    else:
+        print("\n❌ [Triad Gate BLOCKED] Advisory Council did not provide an explicit 'VERDICT: APPROVED' on line 1.")
+        print("Address the advisory council findings above before committing.")
+        sys.exit(1)
 
 def cmd_bench(args):
     """Run the Triad benchmark suite."""
@@ -616,6 +648,7 @@ def main():
     p_gate = subparsers.add_parser("gate", help="Run full pre-commit verification (tsc + tests + diff review)")
     p_gate.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, ollama, mock)")
     p_gate.add_argument("--max-retries", type=int, default=1, help="Max self-healing retries for tsc/tests (default 1)")
+    p_gate.add_argument("--timeout", type=int, default=240, help="Advisor signoff timeout in seconds (default 240)")
 
     # bench
     p_bench = subparsers.add_parser("bench", help="Run benchmark harness to score review accuracy against known bugs")

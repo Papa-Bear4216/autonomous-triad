@@ -2,5 +2,5 @@
   "id": "case_neg_004",
   "bug_description": "",
   "expected_catch": false,
-  "diff": "--- a/src/components/AutoSaveIndicator.tsx\n+++ b/src/components/AutoSaveIndicator.tsx\n@@ -31,5 +31,5 @@\n     }, [status]); // timeoutRef is a stable RefObject and omitted per React lint rules\n \n     if (!visible) return null;\n-    return <div className=\"autosave-pill\">Changes saved</div>;\n+    return <div className=\"autosave-pill\" role=\"status\" aria-live=\"polite\">Changes saved</div>;\n }"
+  "diff": "--- a/src/components/AutoSaveIndicator.tsx\n+++ b/src/components/AutoSaveIndicator.tsx\n@@ -31,5 +31,5 @@\n     }, [status, timeoutRef]);\n \n     if (!visible) return null;\n-    return <div className=\"autosave-pill\">Changes saved</div>;\n+    return <div className=\"autosave-pill\" role=\"status\" aria-live=\"polite\">Changes saved</div>;\n }"
 }
