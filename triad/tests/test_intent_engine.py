@@ -75,6 +75,33 @@ class TestIntentEngine(unittest.TestCase):
         self.assertEqual(res.suggested_mode, "general")
         self.assertFalse(res.high_stakes)
 
+    def test_high_stakes_general_routes_to_competition(self):
+        # A general query with high-stakes keywords (jwt, auth) must route to competition
+        res = classify_intent("How should we design JWT auth tokens?")
+        self.assertEqual(res.intent, "GENERAL")
+        self.assertTrue(res.high_stakes)
+        self.assertEqual(res.suggested_engine, "competition")
+
+    def test_typo_guard_and_natural_language_dispatch(self):
+        from triad.triad_engine import is_plausible_natural_language
+        known = {"doctor", "review", "consult", "debug", "gate", "bench", "worktree", "auto"}
+        
+        # Near-miss typos must be rejected
+        self.assertFalse(is_plausible_natural_language("revew", 2, known))
+        self.assertFalse(is_plausible_natural_language("revew", 4, known))
+        self.assertFalse(is_plausible_natural_language("gaet", 3, known))
+        self.assertFalse(is_plausible_natural_language("docter", 2, known))
+
+        # Unknown single-word commands must be rejected
+        self.assertFalse(is_plausible_natural_language("foo", 2, known))
+        self.assertFalse(is_plausible_natural_language("bar", 2, known))
+
+        # Real natural language and queries must be accepted
+        self.assertTrue(is_plausible_natural_language("why is this failing", 5, known))
+        self.assertTrue(is_plausible_natural_language("Is this on line 42?", 2, known))
+        self.assertTrue(is_plausible_natural_language("path/to/file.py", 2, known))
+        self.assertTrue(is_plausible_natural_language("review this diff for bugs", 6, known))
+
     def test_high_stakes_detection(self):
         self.assertTrue(is_high_stakes("Need to execute database migration with row level security"))
         self.assertTrue(is_high_stakes("Fixing race condition and deadlock in pool"))

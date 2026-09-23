@@ -65,6 +65,29 @@ def query_competition_council(
     adv1_name, adv2_name = advisor_names
     results = {}
 
+    # Check quorum if not running in mock mode
+    if "mock" not in advisor_names:
+        try:
+            from triad.advisor_manager import get_advisors
+        except ImportError:
+            from advisor_manager import get_advisors
+
+        all_advisors = get_advisors()
+        enabled_non_mock = [a for a in all_advisors.values() if a.enabled and a.name != "mock"]
+        if len(enabled_non_mock) < 2:
+            print(f"[Triad Competition Mode Warning] Fewer than 2 non-mock advisors enabled in config ({len(enabled_non_mock)} enabled). Falling back to single advisor.")
+            single_name = enabled_non_mock[0].name if enabled_non_mock else "claude"
+            single_resp = query_configured_advisor(single_name, prompt, context=context, diff=diff, mode=mode, timeout=timeout)
+            return {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": mode,
+                "content_hash": hash_content((diff or "") + (prompt or "")),
+                "advisors": [single_name],
+                "responses": {single_name: single_resp},
+                "synthesis": single_resp,
+                "elapsed_seconds": round(time.time() - start_time, 2)
+            }
+
     # 1. Run advisors concurrently
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_adv1 = executor.submit(

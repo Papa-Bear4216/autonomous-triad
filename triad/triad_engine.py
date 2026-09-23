@@ -660,6 +660,8 @@ def cmd_worktree(args):
 def cmd_auto(args):
     """Auto-classify intent and autonomously route to the appropriate subsystem."""
     prompt = getattr(args, "prompt", "")
+    if isinstance(prompt, list):
+        prompt = " ".join(prompt).strip()
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
 
@@ -681,14 +683,34 @@ def cmd_auto(args):
     execute_intent(classification, prompt, args)
 
 
-def is_plausible_natural_language(first_arg: str, total_args: int) -> bool:
+def is_plausible_natural_language(first_arg: str, total_args: int, known_commands: set) -> bool:
     """Return True if argument looks like a natural language query or diff rather than a mistyped subcommand."""
-    if total_args > 2:  # multiple words passed without quotes: triad why is this failing
-        return True
-    # If single argument, check if it contains spaces or query/path punctuation
-    if any(c in first_arg for c in (" ", "?", "\n", "\t", "/", "\\", ":", ".")):
-        return True
-    return False
+    import difflib
+    stripped = first_arg.strip()
+    if not stripped:
+        return False
+
+    # If first_arg is a single word (no spaces inside):
+    if " " not in stripped:
+        lowered = stripped.lower()
+        if lowered not in known_commands:
+            near_matches = difflib.get_close_matches(lowered, [c for c in known_commands if not c.startswith("-")], n=1, cutoff=0.75)
+            if near_matches:
+                return False  # Near-miss typo of a known subcommand (e.g. 'revew', 'gaet', 'docter')
+
+        # If it has path or query punctuation (e.g. 'path/to/file.py' or 'hello?'), allow it
+        if any(c in stripped for c in ("?", "\n", "\t", "/", "\\", ":", ".")):
+            return True
+
+        # If multiple unquoted arguments were passed (e.g. 'triad why is this failing'), allow it
+        if total_args > 2:
+            return True
+
+        # Otherwise it's a single bare unknown token like 'foo' -> reject
+        return False
+
+    # If first_arg contains spaces (quoted natural language prompt), allow it
+    return True
 
 
 def main():
@@ -699,7 +721,7 @@ def main():
         "-h", "--help"
     }
     if len(sys.argv) > 1 and sys.argv[1] not in known_commands and not sys.argv[1].startswith("-"):
-        if is_plausible_natural_language(sys.argv[1], len(sys.argv)):
+        if is_plausible_natural_language(sys.argv[1], len(sys.argv), known_commands):
             sys.argv.insert(1, "auto")
 
     parser = argparse.ArgumentParser(prog="triad", description="Autonomous Multi-Agent Triad Orchestrator")
@@ -707,7 +729,7 @@ def main():
 
     # auto / intent / run
     p_auto = subparsers.add_parser("auto", aliases=["intent", "run"], help="Auto-classify intent and autonomously route across Triad subsystems")
-    p_auto.add_argument("prompt", nargs="?", default="", help="Natural language request, diff, or query")
+    p_auto.add_argument("prompt", nargs="*", default=[], help="Natural language request, diff, or query")
     p_auto.add_argument("--diff-file", default="", help="Path to diff file or - for stdin")
     p_auto.add_argument("--context", default="", help="Inline context or error snippet")
     p_auto.add_argument("--context-file", default="", help="Path to context file")

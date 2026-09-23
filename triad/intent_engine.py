@@ -294,23 +294,40 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
         if triad_engine.HERMES_PATH.exists():
             # Use -z (--oneshot) for script/pipeline single prompt execution
             cmd = [str(triad_engine.HERMES_PATH), "-z", raw_prompt]
-            subprocess.run(cmd)
+            res = subprocess.run(cmd)
+            return res.returncode
         else:
             print(f"Hermes binary not found at {triad_engine.HERMES_PATH}")
-        return
+            return 1
 
     if intent == "MEMORY":
         print(f"[Triad -> Local Memory Hub]: Recalling context for '{raw_prompt}'...")
         mem0_script = Path(r"C:\Users\micha\.agents\skills\mem0\mem0.js")
+        mem0_ran = False
+        mem0_success = False
         if mem0_script.exists():
             print("\n--- Mem0 Long-Term Memory Recall ---")
-            subprocess.run(["node", str(mem0_script), "search", raw_prompt])
-        print("\n--- PiecesOS Timeline Context ---")
+            res = subprocess.run(["node", str(mem0_script), "search", raw_prompt])
+            mem0_ran = True
+            mem0_success = (res.returncode == 0)
+
+        print("\n--- PiecesOS Status ---")
+        pieces_reachable = False
         try:
             import urllib.request
-            req = urllib.request.urlopen("http://127.0.0.1:39300/.well-known/health", timeout=0.5)
-            if req.status == 200:
-                print("✓ PiecesOS LTM database is online on port 39300.")
+            with urllib.request.urlopen("http://127.0.0.1:39300/.well-known/health", timeout=2.0) as resp:
+                if resp.status == 200:
+                    pieces_reachable = True
+                    print("✓ PiecesOS core daemon is reachable on port 39300.")
         except Exception:
-            print("Note: PiecesOS port 39300 is standby or busy. Memory recall completed via Mem0.")
+            pass
+
+        if not pieces_reachable:
+            print("Note: PiecesOS port 39300 is standby or busy.")
+        if mem0_success:
+            print("Memory recall completed via Mem0.")
+        elif mem0_ran:
+            print("Note: Mem0 query completed with no results or errors.")
+        else:
+            print("Note: Mem0 script not found at ~/.agents/skills/mem0/mem0.js.")
         return
