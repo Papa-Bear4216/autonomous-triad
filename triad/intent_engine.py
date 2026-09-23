@@ -79,8 +79,9 @@ MEMORY_KEYWORDS = [
 ]
 
 DOCTOR_KEYWORDS = [
-    "doctor", "health", "system audit", "subsystem status",
-    "check connections", "audit subscriptions", "verify platforms"
+    "triad doctor", "doctor", "system health", "platform health",
+    "system audit", "subsystem status", "check connections",
+    "audit subscriptions", "verify platforms"
 ]
 
 ARCHITECT_KEYWORDS = [
@@ -91,7 +92,8 @@ ARCHITECT_KEYWORDS = [
 
 REVIEW_KEYWORDS = [
     "review this", "review diff", "code review", "critique changes",
-    "spot bugs in", "audit diff", "check changes", "review my code"
+    "spot bugs in", "audit diff", "check changes", "review my code",
+    "review these", "review the", "review integration"
 ]
 
 DEBUG_KEYWORDS = [
@@ -184,19 +186,8 @@ def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[s
             high_stakes=False
         )
 
-    # 6. Triad Doctor / Platform Health Check
-    if any(kw in lowered_prompt for kw in DOCTOR_KEYWORDS):
-        return IntentClassification(
-            intent="DOCTOR",
-            confidence=0.94,
-            reason="System health, platform audit, or doctor keywords detected",
-            suggested_mode="doctor",
-            suggested_engine="auto",
-            high_stakes=False
-        )
-
-    # 7. Code Review without Embedded Diff (e.g. asking to review working tree)
-    if any(kw in lowered_prompt for kw in REVIEW_KEYWORDS):
+    # 6. Code Review without Embedded Diff (e.g. asking to review working tree or integration points)
+    if lowered_prompt.startswith("review") or any(kw in lowered_prompt for kw in REVIEW_KEYWORDS):
         return IntentClassification(
             intent="REVIEW",
             confidence=0.86,
@@ -205,6 +196,17 @@ def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[s
             suggested_engine="competition" if high_stakes else "auto",
             high_stakes=high_stakes,
             metadata={"needs_git_diff": True}
+        )
+
+    # 7. Triad Doctor / Platform Health Check
+    if any(kw in lowered_prompt for kw in DOCTOR_KEYWORDS):
+        return IntentClassification(
+            intent="DOCTOR",
+            confidence=0.94,
+            reason="System health, platform audit, or doctor keywords detected",
+            suggested_mode="doctor",
+            suggested_engine="auto",
+            high_stakes=False
         )
 
     # 8. Architecture / System Design / Consult Check
