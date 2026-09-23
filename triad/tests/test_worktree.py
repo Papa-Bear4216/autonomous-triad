@@ -146,6 +146,53 @@ class TestGitWorktreeIsolation(unittest.TestCase):
         self.assertTrue(removed)
         self.assertFalse(wt.exists())
 
+    def test_cmd_auto_with_worktree_flag(self):
+        """Verify cmd_auto --worktree executes inside ephemeral worktree and cleans up."""
+        import argparse
+        import io
+        from unittest.mock import patch
+        from triad.triad_engine import cmd_auto
+
+        args = argparse.Namespace(
+            prompt=["doctor"],
+            worktree=True,
+            ref="HEAD",
+            diff_file="",
+            context="",
+            competition=False,
+            engine="mock",
+            cached=False,
+            head=False
+        )
+
+        with patch("sys.stdout", new=io.StringIO()):
+            cmd_auto(args)
+
+        current_worktrees = list_worktrees(REPO_ROOT)
+        self.assertEqual(len(current_worktrees), self.initial_count)
+
+    def test_cmd_gate_with_worktree_flag(self):
+        """Verify cmd_gate --worktree executes pre-commit gate in ephemeral worktree and cleans up."""
+        import argparse
+        import io
+        from unittest.mock import patch
+        from triad.triad_engine import cmd_gate
+
+        args = argparse.Namespace(
+            worktree=True,
+            ref="HEAD",
+            engine="mock",
+            competition=False,
+            max_retries=0,
+            timeout=30
+        )
+
+        with patch("sys.stdout", new=io.StringIO()):
+            cmd_gate(args)
+
+        current_worktrees = list_worktrees(REPO_ROOT)
+        self.assertEqual(len(current_worktrees), self.initial_count)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

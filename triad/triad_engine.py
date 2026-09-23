@@ -37,12 +37,12 @@ CODEX_AUTH = Path(r"C:\Users\micha\.codex\auth.json")
 
 try:
     from triad.advisor_manager import query_configured_advisor, get_advisors, get_active_advisor
-    from triad.worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees
+    from triad.worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root
     from triad.competition import query_competition_council
     from triad.intent_engine import classify_intent, execute_intent
 except ImportError:
     from advisor_manager import query_configured_advisor, get_advisors, get_active_advisor
-    from worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees
+    from worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root
     from competition import query_competition_council
     from intent_engine import classify_intent, execute_intent
 
@@ -120,15 +120,19 @@ def get_git_diff(cached: bool = False, head: bool = False) -> str:
         return ""
 
 def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
-    """Quick TCP connect check."""
+    """Quick TCP connect check with guaranteed socket cleanup."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         s.connect((host, port))
-        s.close()
         return True
     except Exception:
         return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 def cmd_doctor(args):
     """Run full diagnostic audit across all 5 platform layers."""
@@ -340,21 +344,21 @@ def apply_patch_text(patch_text: str) -> bool:
         with open(fd, "w", encoding="utf-8") as f:
             f.write(raw_diff + "\n")
 
-        # 1. Check dry-run
-        check_res = subprocess.run(
-            ["git", "apply", "--check", "--whitespace=fix", temp_patch_path],
-            capture_output=True,
-            text=True
-        )
+        # 1. Check dry-run with whitespace tolerance for Windows
+        check_cmd = ["git", "apply", "--check", "--whitespace=fix", "--ignore-whitespace", temp_patch_path]
+        check_res = subprocess.run(check_cmd, capture_output=True, text=True)
         if check_res.returncode != 0:
-            return False
+            # Fallback retry with 3-way merge
+            check_cmd = ["git", "apply", "--check", "--3way", temp_patch_path]
+            check_res = subprocess.run(check_cmd, capture_output=True, text=True)
+            if check_res.returncode != 0:
+                return False
+            apply_cmd = ["git", "apply", "--3way", temp_patch_path]
+        else:
+            apply_cmd = ["git", "apply", "--whitespace=fix", "--ignore-whitespace", temp_patch_path]
 
         # 2. Apply patch
-        apply_res = subprocess.run(
-            ["git", "apply", "--whitespace=fix", temp_patch_path],
-            capture_output=True,
-            text=True
-        )
+        apply_res = subprocess.run(apply_cmd, capture_output=True, text=True)
         return apply_res.returncode == 0
     except Exception:
         return False
@@ -425,7 +429,35 @@ def cmd_gate(args):
     3. Advisory Council diff review & pre-commit signoff
     If Step 1 or Step 2 fails, queries Advisory Council in debug mode for surgical fix,
     applies patch via git apply, and retries up to --max-retries times.
+    Supports isolated worktree execution via --worktree (-w).
     """
+    if getattr(args, "worktree", False):
+        try:
+            repo_root = get_repo_root(".")
+        except Exception as e:
+            print(f"[Triad Worktree Error] Not inside a git repository: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        ref = getattr(args, "ref", "HEAD") or "HEAD"
+        print(f"[Triad Worktree] Spawning isolated ephemeral git worktree from {repo_root} (ref: {ref})...")
+        parent_diff = get_git_diff(cached=True) or get_git_diff()
+
+        with isolated_worktree(repo_root, branch_or_commit=ref, prefix="triad-gate", cd=True) as wt:
+            print(f"[Triad Worktree] Active in: {wt}")
+            if parent_diff:
+                print(f"[Triad Worktree] Transferring working tree changes ({len(parent_diff.splitlines())} lines) to isolated worktree...")
+                applied = apply_patch_text(parent_diff)
+                if not applied:
+                    print("[Triad Worktree Warning] Working tree diff could not be cleanly applied to worktree ref. Proceeding with clean ref.")
+            setattr(args, "worktree", False)
+            _run_gate(args)
+        print("[Triad Worktree] Ephemeral worktree cleanly removed and unlinked.")
+        return
+
+    _run_gate(args)
+
+
+def _run_gate(args):
     cwd = Path.cwd()
     print(f"[Triad Gate] Running pre-commit verification in {cwd}...\n")
     max_retries = max(0, getattr(args, "max_retries", 1))
@@ -673,7 +705,35 @@ def cmd_worktree(args):
         print("Pruned stale worktree metadata.")
 
 def cmd_auto(args):
-    """Auto-classify intent and autonomously route to the appropriate subsystem."""
+    """
+    Auto-classify intent and autonomously route to the appropriate subsystem.
+    Supports isolated worktree execution via --worktree (-w).
+    """
+    if getattr(args, "worktree", False):
+        try:
+            repo_root = get_repo_root(".")
+        except Exception as e:
+            print(f"[Triad Worktree Error] Not inside a git repository: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        ref = getattr(args, "ref", "HEAD") or "HEAD"
+        print(f"[Triad Worktree] Spawning isolated ephemeral git worktree from {repo_root} (ref: {ref})...")
+        parent_diff = get_git_diff(cached=True) or get_git_diff()
+
+        with isolated_worktree(repo_root, branch_or_commit=ref, prefix="triad-auto", cd=True) as wt:
+            print(f"[Triad Worktree] Active in: {wt}")
+            if parent_diff:
+                print(f"[Triad Worktree] Transferring working tree changes ({len(parent_diff.splitlines())} lines) to isolated worktree...")
+                apply_patch_text(parent_diff)
+            setattr(args, "worktree", False)
+            _run_auto(args)
+        print("[Triad Worktree] Ephemeral worktree cleanly removed and unlinked.")
+        return
+
+    _run_auto(args)
+
+
+def _run_auto(args):
     prompt = getattr(args, "prompt", "")
     if isinstance(prompt, list):
         prompt = " ".join(prompt).strip()
@@ -697,6 +757,18 @@ def cmd_auto(args):
         classification.suggested_engine = "competition"
 
     execute_intent(classification, prompt, args)
+
+
+def cmd_listen(args):
+    """Start the Triad Ambient HTTP server daemon."""
+    try:
+        from triad.server import start_server
+    except ImportError:
+        from server import start_server
+
+    port = getattr(args, "port", 8789)
+    host = getattr(args, "host", "127.0.0.1")
+    start_server(host=host, port=port)
 
 
 def is_plausible_natural_language(first_arg: str, total_args: int, known_commands: set) -> bool:
@@ -734,6 +806,7 @@ def main():
     known_commands = {
         "doctor", "review", "consult", "debug", "gate",
         "bench", "worktree", "auto", "intent", "run",
+        "listen", "serve",
         "-h", "--help"
     }
     if len(sys.argv) > 1 and sys.argv[1] not in known_commands and not sys.argv[1].startswith("-"):
@@ -753,6 +826,8 @@ def main():
     p_auto.add_argument("--engine", default="auto", help="Advisor engine override")
     p_auto.add_argument("--cached", "--staged", action="store_true", help="Review staged changes if routing to review")
     p_auto.add_argument("--head", action="store_true", help="Review latest commit (HEAD~1) if routing to review")
+    p_auto.add_argument("--worktree", "-w", action="store_true", help="Execute in an isolated ephemeral git worktree")
+    p_auto.add_argument("--ref", default="HEAD", help="Git ref/branch/commit to base ephemeral worktree on (default: HEAD)")
 
     # doctor
     p_doc = subparsers.add_parser("doctor", help="Run comprehensive health and billing audit across all platforms")
@@ -788,6 +863,8 @@ def main():
     p_gate.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
     p_gate.add_argument("--max-retries", type=int, default=1, help="Max self-healing retries for tsc/tests (default 1)")
     p_gate.add_argument("--timeout", type=int, default=240, help="Advisor signoff timeout in seconds (default 240)")
+    p_gate.add_argument("--worktree", "-w", action="store_true", help="Execute pre-commit gate in an isolated ephemeral git worktree")
+    p_gate.add_argument("--ref", default="HEAD", help="Git ref/branch/commit to base ephemeral worktree on (default: HEAD)")
 
     # bench
     p_bench = subparsers.add_parser("bench", help="Run benchmark harness to score review accuracy against known bugs")
@@ -810,6 +887,11 @@ def main():
     p_wt_remove.add_argument("--force", "-f", action="store_true", default=False, help="Force removal, including uncommitted changes")
     wt_sub.add_parser("prune", help="Prune orphaned worktree metadata")
 
+    # listen / serve
+    p_listen = subparsers.add_parser("listen", aliases=["serve"], help="Start Triad Ambient HTTP server daemon")
+    p_listen.add_argument("--port", type=int, default=8789, help="HTTP daemon port (default 8789)")
+    p_listen.add_argument("--host", default="127.0.0.1", help="HTTP daemon host (default 127.0.0.1)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -826,7 +908,9 @@ def main():
         "debug": cmd_debug,
         "gate": cmd_gate,
         "bench": cmd_bench,
-        "worktree": cmd_worktree
+        "worktree": cmd_worktree,
+        "listen": cmd_listen,
+        "serve": cmd_listen
     }
 
     handler = dispatch.get(args.command)
