@@ -188,7 +188,8 @@ class TestGitWorktreeIsolation(unittest.TestCase):
         )
 
         with patch("sys.stdout", new=io.StringIO()):
-            cmd_gate(args)
+            with patch("triad.triad_engine.run_subprocess_tree_safe", return_value=(0, "Ran 5 tests in 0.1s\nOK", "")):
+                cmd_gate(args)
 
         current_worktrees = list_worktrees(REPO_ROOT)
         self.assertEqual(len(current_worktrees), self.initial_count)

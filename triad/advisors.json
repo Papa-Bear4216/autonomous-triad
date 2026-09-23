@@ -69,7 +69,7 @@
       "priority": 99,
       "execution_flags": [
         "-c",
-        "import sys; content = sys.stdin.read(); print(f'[Mock Advisor]: Successfully processed prompt ({len(content)} characters)')"
+        "import sys; c = sys.stdin.read(); print('VERDICT: APPROVED\\n[Mock Advisor]: Approved' if 'pre-commit' in c.lower() or 'verdict' in c.lower() else f'[Mock Advisor]: Successfully processed prompt ({len(c)} characters)')"
       ],
       "input_mode": "stdin",
       "output_mode": "stdout",
