@@ -284,9 +284,17 @@ def cmd_consult(args):
 
 def cmd_debug(args):
     """Debug an error or stack trace with the Advisory Council."""
-    error = getattr(args, "error", "") or getattr(args, "prompt", "")
-    if isinstance(error, list):
-        error = " ".join(error).strip()
+    raw_error = getattr(args, "error", "")
+    if isinstance(raw_error, list):
+        raw_error = " ".join(raw_error).strip()
+    error = str(raw_error or "").strip()
+
+    if not error:
+        raw_prompt = getattr(args, "prompt", "")
+        if isinstance(raw_prompt, list):
+            raw_prompt = " ".join(raw_prompt).strip()
+        error = str(raw_prompt or "").strip()
+
     if not error and not sys.stdin.isatty():
         error = sys.stdin.read().strip()
 
