@@ -38,10 +38,12 @@ try:
     from triad.advisor_manager import query_configured_advisor, get_advisors, get_active_advisor
     from triad.worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees
     from triad.competition import query_competition_council
+    from triad.intent_engine import classify_intent, execute_intent
 except ImportError:
     from advisor_manager import query_configured_advisor, get_advisors, get_active_advisor
     from worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees
     from competition import query_competition_council
+    from intent_engine import classify_intent, execute_intent
 
 def kill_process_tree(pid: int):
     """Force kill a process and all its descendants on Windows."""
@@ -220,34 +222,36 @@ def cmd_doctor(args):
 
 def cmd_review(args):
     """Review git diff with the Advisory Council."""
+    diff_file = getattr(args, "diff_file", "")
     diff_content = ""
-    if args.diff_file:
-        if args.diff_file == "-":
+    if diff_file:
+        if diff_file == "-":
             diff_content = sys.stdin.read()
-        elif os.path.exists(args.diff_file):
-            with open(args.diff_file, "r", encoding="utf-8", errors="replace") as f:
+        elif os.path.exists(diff_file):
+            with open(diff_file, "r", encoding="utf-8", errors="replace") as f:
                 diff_content = f.read()
     else:
-        diff_content = get_git_diff(cached=args.cached, head=args.head)
+        diff_content = get_git_diff(cached=getattr(args, "cached", False), head=getattr(args, "head", False))
 
     if not diff_content:
         print("[Triad] No git diff found to review. Stage changes or specify --diff-file.")
         sys.exit(0)
 
-    prompt = args.prompt or "Review this git diff for edge cases, subtle bugs, type soundness, and architectural regressions."
+    prompt = getattr(args, "prompt", "") or "Review this git diff for edge cases, subtle bugs, type soundness, and architectural regressions."
+    engine = getattr(args, "engine", "auto")
     if getattr(args, "competition", False):
         print(f"[Triad Competition Mode] Evaluating diff via concurrent advisors (Claude Code & OpenAI Codex)...")
         session = query_competition_council(prompt, diff=diff_content, mode="review_diff")
         print("\n" + session["synthesis"])
         return
 
-    print(f"[Triad] Reviewing {len(diff_content.splitlines())} diff lines via Advisory Council (engine={args.engine})...\n")
-    resp = query_advisory_council(prompt, diff=diff_content, mode="review_diff", engine=args.engine)
+    print(f"[Triad] Reviewing {len(diff_content.splitlines())} diff lines via Advisory Council (engine={engine})...\n")
+    resp = query_advisory_council(prompt, diff=diff_content, mode="review_diff", engine=engine)
     print(resp)
 
 def cmd_consult(args):
     """Consult the Advisory Council for architectural / system design."""
-    prompt = args.prompt
+    prompt = getattr(args, "prompt", "")
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
 
@@ -255,24 +259,26 @@ def cmd_consult(args):
         print("Usage: triad consult '<prompt>' [--context '...']")
         sys.exit(1)
 
-    context = args.context or ""
-    if args.context_file and os.path.exists(args.context_file):
-        with open(args.context_file, "r", encoding="utf-8", errors="replace") as f:
+    context = getattr(args, "context", "") or ""
+    context_file = getattr(args, "context_file", "")
+    if context_file and os.path.exists(context_file):
+        with open(context_file, "r", encoding="utf-8", errors="replace") as f:
             context = f.read()
 
+    engine = getattr(args, "engine", "auto")
     if getattr(args, "competition", False):
         print(f"[Triad Competition Mode] Consulting concurrent advisors (Claude Code & OpenAI Codex)...")
         session = query_competition_council(prompt, context=context, mode="architect")
         print("\n" + session["synthesis"])
         return
 
-    print(f"[Triad] Consulting Advisory Council (engine={args.engine})...\n")
-    resp = query_advisory_council(prompt, context=context, mode="architect", engine=args.engine)
+    print(f"[Triad] Consulting Advisory Council (engine={engine})...\n")
+    resp = query_advisory_council(prompt, context=context, mode="architect", engine=engine)
     print(resp)
 
 def cmd_debug(args):
     """Debug an error or stack trace with the Advisory Council."""
-    error = args.error
+    error = getattr(args, "error", "") or getattr(args, "prompt", "")
     if not error and not sys.stdin.isatty():
         error = sys.stdin.read().strip()
 
@@ -280,19 +286,21 @@ def cmd_debug(args):
         print("Usage: triad debug '<error description or stacktrace>' [--context '...']")
         sys.exit(1)
 
-    context = args.context or ""
-    if args.context_file and os.path.exists(args.context_file):
-        with open(args.context_file, "r", encoding="utf-8", errors="replace") as f:
+    context = getattr(args, "context", "") or ""
+    context_file = getattr(args, "context_file", "")
+    if context_file and os.path.exists(context_file):
+        with open(context_file, "r", encoding="utf-8", errors="replace") as f:
             context = f.read()
 
+    engine = getattr(args, "engine", "auto")
     if getattr(args, "competition", False):
         print(f"[Triad Competition Mode] Diagnosing error via concurrent advisors (Claude Code & OpenAI Codex)...")
         session = query_competition_council(error, context=context, mode="debug")
         print("\n" + session["synthesis"])
         return
 
-    print(f"[Triad] Diagnosing with Advisory Council (engine={args.engine})...\n")
-    resp = query_advisory_council(error, context=context, mode="debug", engine=args.engine)
+    print(f"[Triad] Diagnosing with Advisory Council (engine={engine})...\n")
+    resp = query_advisory_council(error, context=context, mode="debug", engine=engine)
     print(resp)
 
 def apply_patch_text(patch_text: str) -> bool:
@@ -648,10 +656,53 @@ def cmd_worktree(args):
         prune_worktrees(".")
         print("Pruned stale worktree metadata.")
 
+def cmd_auto(args):
+    """Auto-classify intent and autonomously route to the appropriate subsystem."""
+    prompt = getattr(args, "prompt", "")
+    if not prompt and not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+
+    diff_content = ""
+    if getattr(args, "diff_file", None):
+        if args.diff_file == "-":
+            diff_content = sys.stdin.read()
+        elif os.path.exists(args.diff_file):
+            with open(args.diff_file, "r", encoding="utf-8", errors="replace") as f:
+                diff_content = f.read()
+
+    context = getattr(args, "context", None)
+    classification = classify_intent(prompt, context=context, diff=diff_content)
+
+    # Force competition if user passed flag
+    if getattr(args, "competition", False):
+        classification.suggested_engine = "competition"
+
+    execute_intent(classification, prompt, args)
+
 
 def main():
+    # Top-level intuitive auto-dispatch: if first arg is not a known command or flag, route through auto
+    known_commands = {
+        "doctor", "review", "consult", "debug", "gate",
+        "bench", "worktree", "auto", "intent", "run",
+        "-h", "--help"
+    }
+    if len(sys.argv) > 1 and sys.argv[1] not in known_commands and not sys.argv[1].startswith("-"):
+        sys.argv.insert(1, "auto")
+
     parser = argparse.ArgumentParser(prog="triad", description="Autonomous Multi-Agent Triad Orchestrator")
     subparsers = parser.add_subparsers(dest="command", help="Triad command to execute")
+
+    # auto / intent / run
+    p_auto = subparsers.add_parser("auto", aliases=["intent", "run"], help="Auto-classify intent and autonomously route across Triad subsystems")
+    p_auto.add_argument("prompt", nargs="?", default="", help="Natural language request, diff, or query")
+    p_auto.add_argument("--diff-file", default="", help="Path to diff file or - for stdin")
+    p_auto.add_argument("--context", default="", help="Inline context or error snippet")
+    p_auto.add_argument("--context-file", default="", help="Path to context file")
+    p_auto.add_argument("--competition", action="store_true", help="Force competition mode regardless of auto-stake assessment")
+    p_auto.add_argument("--engine", default="auto", help="Advisor engine override")
+    p_auto.add_argument("--cached", "--staged", action="store_true", help="Review staged changes if routing to review")
+    p_auto.add_argument("--head", action="store_true", help="Review latest commit (HEAD~1) if routing to review")
 
     # doctor
     p_doc = subparsers.add_parser("doctor", help="Run comprehensive health and billing audit across all platforms")
@@ -716,6 +767,9 @@ def main():
         sys.exit(0)
 
     dispatch = {
+        "auto": cmd_auto,
+        "intent": cmd_auto,
+        "run": cmd_auto,
         "doctor": cmd_doctor,
         "review": cmd_review,
         "consult": cmd_consult,

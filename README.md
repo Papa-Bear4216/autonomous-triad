@@ -60,6 +60,19 @@ When Antigravity or the CLI queries the Advisory Council, the query is routed th
 The framework exposes a unified CLI on your system `PATH`:
 
 ```powershell
+# 0. Unified Intent Engine (Transparent Auto-Dispatch)
+# You can pass ANY natural language prompt, error, diff, or query directly to triad:
+triad "How do I optimize this multi-tenant database schema?"    # Auto-routes to consult
+triad "TypeError: Cannot read properties of undefined"          # Auto-routes to debug
+triad "Check status of all platform layers"                     # Auto-routes to doctor
+triad "Send SMS to test number via Android bridge"              # Auto-routes to Hermes Agent (:8766)
+triad "What did I work on with Pieces yesterday?"               # Auto-routes to PiecesOS + Mem0
+triad "Design JWT auth and RLS migration"                       # Auto-detects HIGH-STAKES -> triggers competition
+
+# Explicit auto syntax with custom flags:
+triad auto "<request>" --context "details"                      # Auto-classify and route
+triad auto --competition "<request>"                            # Force dual-advisor competition
+
 # 1. Comprehensive health and $0-billing audit across all platform layers
 triad doctor
 
@@ -105,6 +118,7 @@ autonomous-triad/
 ├── triad/
 │   ├── __init__.py
 │   ├── triad_engine.py        # Core multi-agent orchestrator & health checker
+│   ├── intent_engine.py       # Deterministic zero-latency request classifier & router
 │   ├── advisor_manager.py     # Dynamic config-driven advisor loader & router
 │   ├── advisors.json          # Declarative advisor definitions & execution flags
 │   ├── competition.py         # Concurrent dual-advisor council & synthesis adjudicator
@@ -116,7 +130,7 @@ autonomous-triad/
 │   │   ├── swebench_instances.json # Curated SWE-bench Verified slice
 │   │   └── cases/             # 16 test cases (8 planted bugs, 8 negative controls)
 │   ├── logs/                  # Council session telemetry (.gitignore)
-│   └── tests/                 # Unit test suite (advisors, worktree, competition)
+│   └── tests/                 # Unit test suite (intent, advisors, worktree, competition)
 ├── skills/
 │   └── claude-advisor/        # Antigravity skill definition
 │       ├── SKILL.md           # Autonomous agent consultation trigger rules

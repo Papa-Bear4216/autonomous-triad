@@ -11,6 +11,8 @@ triad/logs/
 triad/bench/.cache/
 swebench_raw_output.txt
 swebench_full_output.txt
+swebench_full_run.txt
+swebench_*.txt
 codex_test_out.txt
 
 # Environment & credentials (Strict Invariant: No Secrets)
