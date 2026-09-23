@@ -681,15 +681,26 @@ def cmd_auto(args):
     execute_intent(classification, prompt, args)
 
 
+def is_plausible_natural_language(first_arg: str, total_args: int) -> bool:
+    """Return True if argument looks like a natural language query or diff rather than a mistyped subcommand."""
+    if total_args > 2:  # multiple words passed without quotes: triad why is this failing
+        return True
+    # If single argument, check if it contains spaces or query/path punctuation
+    if any(c in first_arg for c in (" ", "?", "\n", "\t", "/", "\\", ":", ".")):
+        return True
+    return False
+
+
 def main():
-    # Top-level intuitive auto-dispatch: if first arg is not a known command or flag, route through auto
+    # Top-level intuitive auto-dispatch: if first arg is not a known command or flag and looks like natural language, route through auto
     known_commands = {
         "doctor", "review", "consult", "debug", "gate",
         "bench", "worktree", "auto", "intent", "run",
         "-h", "--help"
     }
     if len(sys.argv) > 1 and sys.argv[1] not in known_commands and not sys.argv[1].startswith("-"):
-        sys.argv.insert(1, "auto")
+        if is_plausible_natural_language(sys.argv[1], len(sys.argv)):
+            sys.argv.insert(1, "auto")
 
     parser = argparse.ArgumentParser(prog="triad", description="Autonomous Multi-Agent Triad Orchestrator")
     subparsers = parser.add_subparsers(dest="command", help="Triad command to execute")

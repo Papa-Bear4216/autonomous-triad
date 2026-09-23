@@ -59,7 +59,7 @@
       "env": {
         "PYTHONIOENCODING": "utf-8"
       },
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "mock",

@@ -69,6 +69,12 @@ class TestIntentEngine(unittest.TestCase):
         self.assertEqual(res.intent, "ARCHITECT")
         self.assertEqual(res.suggested_mode, "architect")
 
+    def test_bare_question_is_general(self):
+        res = classify_intent("Is this on line 42?")
+        self.assertEqual(res.intent, "GENERAL")
+        self.assertEqual(res.suggested_mode, "general")
+        self.assertFalse(res.high_stakes)
+
     def test_high_stakes_detection(self):
         self.assertTrue(is_high_stakes("Need to execute database migration with row level security"))
         self.assertTrue(is_high_stakes("Fixing race condition and deadlock in pool"))

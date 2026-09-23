@@ -208,7 +208,7 @@ def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[s
         )
 
     # 8. Architecture / System Design / Consult Check
-    if any(kw in lowered_prompt for kw in ARCHITECT_KEYWORDS) or "?" in lowered_prompt:
+    if any(kw in lowered_prompt for kw in ARCHITECT_KEYWORDS):
         return IntentClassification(
             intent="ARCHITECT",
             confidence=0.88,
@@ -224,7 +224,7 @@ def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[s
         confidence=0.70,
         reason="General development query routed to primary advisory council",
         suggested_mode="general",
-        suggested_engine="auto",
+        suggested_engine="competition" if high_stakes else "auto",
         high_stakes=high_stakes
     )
 
@@ -292,7 +292,8 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
             print("✓ Android Relay port 8766 is ONLINE.")
         print(f"Forwarding device task to Hermes: {raw_prompt}")
         if triad_engine.HERMES_PATH.exists():
-            cmd = [str(triad_engine.HERMES_PATH), "-p", raw_prompt]
+            # Use -z (--oneshot) for script/pipeline single prompt execution
+            cmd = [str(triad_engine.HERMES_PATH), "-z", raw_prompt]
             subprocess.run(cmd)
         else:
             print(f"Hermes binary not found at {triad_engine.HERMES_PATH}")
@@ -305,13 +306,11 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
             print("\n--- Mem0 Long-Term Memory Recall ---")
             subprocess.run(["node", str(mem0_script), "search", raw_prompt])
         print("\n--- PiecesOS Timeline Context ---")
-        print(f"Querying PiecesOS on port 39300 for relevant events...")
         try:
             import urllib.request
-            req = urllib.request.urlopen("http://127.0.0.1:39300/workstream_events", timeout=3)
-            data = json.loads(req.read().decode("utf-8"))
-            events = data.get("iterable", [])
-            print(f"Found {len(events)} workstream events recorded in PiecesOS.")
-        except Exception as e:
-            print(f"PiecesOS query note: {e}")
+            req = urllib.request.urlopen("http://127.0.0.1:39300/.well-known/health", timeout=0.5)
+            if req.status == 200:
+                print("✓ PiecesOS LTM database is online on port 39300.")
+        except Exception:
+            print("Note: PiecesOS port 39300 is standby or busy. Memory recall completed via Mem0.")
         return
