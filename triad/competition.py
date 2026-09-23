@@ -62,6 +62,13 @@ def query_competition_council(
     Returns structured session dictionary containing raw outputs and synthesis.
     """
     start_time = time.time()
+    if isinstance(prompt, list):
+        prompt = " ".join(prompt).strip()
+    if isinstance(diff, list):
+        diff = "\n".join(diff)
+    prompt = str(prompt or "")
+    diff = str(diff or "")
+
     adv1_name, adv2_name = advisor_names
     results = {}
 

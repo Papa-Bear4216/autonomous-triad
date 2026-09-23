@@ -238,7 +238,10 @@ def cmd_review(args):
         print("[Triad] No git diff found to review. Stage changes or specify --diff-file.")
         sys.exit(0)
 
-    prompt = getattr(args, "prompt", "") or "Review this git diff for edge cases, subtle bugs, type soundness, and architectural regressions."
+    prompt = getattr(args, "prompt", "")
+    if isinstance(prompt, list):
+        prompt = " ".join(prompt).strip()
+    prompt = prompt or "Review this git diff for edge cases, subtle bugs, type soundness, and architectural regressions."
     engine = getattr(args, "engine", "auto")
     if getattr(args, "competition", False):
         print(f"[Triad Competition Mode] Evaluating diff via concurrent advisors (Claude Code & OpenAI Codex)...")
@@ -253,6 +256,8 @@ def cmd_review(args):
 def cmd_consult(args):
     """Consult the Advisory Council for architectural / system design."""
     prompt = getattr(args, "prompt", "")
+    if isinstance(prompt, list):
+        prompt = " ".join(prompt).strip()
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
 
@@ -280,6 +285,8 @@ def cmd_consult(args):
 def cmd_debug(args):
     """Debug an error or stack trace with the Advisory Council."""
     error = getattr(args, "error", "") or getattr(args, "prompt", "")
+    if isinstance(error, list):
+        error = " ".join(error).strip()
     if not error and not sys.stdin.isatty():
         error = sys.stdin.read().strip()
 
@@ -664,6 +671,7 @@ def cmd_auto(args):
         prompt = " ".join(prompt).strip()
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
+    setattr(args, "prompt", prompt)
 
     diff_content = ""
     if getattr(args, "diff_file", None):
