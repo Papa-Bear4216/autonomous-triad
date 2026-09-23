@@ -42,7 +42,13 @@ python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "Should we use op
 python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "TypeError: Type 'string | undefined' is not assignable to type 'string'" --mode debug --context "Function definition and caller"
 ```
 
-### 4. Engine Override (Optional)
+### 4. Competition Mode (Dual-Advisor Concurrent Adjudication)
+```powershell
+python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "Reviewing changes for [feature name]" --mode review_diff --diff-file - --competition
+python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "Should we migrate to WebSocket or Server-Sent Events?" --mode architect --competition
+```
+
+### 5. Engine Override (Optional)
 ```powershell
 python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "..." --engine codex   # Force OpenAI Codex
 python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "..." --engine claude  # Force Claude Code

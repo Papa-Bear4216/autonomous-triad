@@ -365,6 +365,34 @@ def run_subprocess_tree_safe(cmd: List[str], cwd: Path, timeout: int = 90) -> Tu
             kill_process_tree(proc.pid)
         return 1, "", f"Execution error: {e}"
 
+def query_gate_fix(diag_output: str, args) -> str:
+    """
+    Query Advisory Council or Competition Council for a surgical fix to a test/build failure.
+    """
+    fix_prompt = (
+        f"The test/build suite failed with this output:\n{diag_output}\n\n"
+        "Diagnose the failure and provide the minimal unified diff to fix it."
+    )
+    competition = getattr(args, "competition", False)
+    timeout = getattr(args, "timeout", 240)
+    engine = getattr(args, "engine", "auto")
+
+    if competition:
+        try:
+            from triad.competition import query_competition_council
+        except ImportError:
+            from competition import query_competition_council
+        adv_pair = ("mock", "mock") if engine == "mock" else ("claude", "codex")
+        session = query_competition_council(
+            fix_prompt,
+            mode="debug",
+            timeout=timeout,
+            advisor_names=adv_pair
+        )
+        return session.get("synthesis", "")
+
+    return query_advisory_council(fix_prompt, mode="debug", engine=engine, timeout=timeout)
+
 def cmd_gate(args):
     """
     Ground-Truth Verification Gate with self-healing retry loop:
@@ -394,11 +422,7 @@ def cmd_gate(args):
                 if attempt < max_retries:
                     attempt += 1
                     print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
-                    fix_prompt = (
-                        f"The TypeScript compiler failed with these errors:\n{diag_output}\n\n"
-                        "Diagnose the failure and provide the minimal unified diff to fix it."
-                    )
-                    advisor_fix = query_advisory_council(fix_prompt, mode="debug", engine=args.engine)
+                    advisor_fix = query_gate_fix(diag_output, args)
                     print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
                     applied = apply_patch_text(advisor_fix)
                     if applied:
@@ -436,11 +460,7 @@ def cmd_gate(args):
                         if attempt < max_retries:
                             attempt += 1
                             print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
-                            fix_prompt = (
-                                f"The Node test suite failed with this output:\n{diag_output}\n\n"
-                                "Diagnose the failure and provide the minimal unified diff to fix it."
-                            )
-                            advisor_fix = query_advisory_council(fix_prompt, mode="debug", engine=args.engine)
+                            advisor_fix = query_gate_fix(diag_output, args)
                             print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
                             applied = apply_patch_text(advisor_fix)
                             if applied:
@@ -480,11 +500,7 @@ def cmd_gate(args):
                 if attempt < max_retries:
                     attempt += 1
                     print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
-                    fix_prompt = (
-                        f"The Python unit test suite failed with this output:\n{diag_output}\n\n"
-                        "Diagnose the failure and provide the minimal unified diff to fix it."
-                    )
-                    advisor_fix = query_advisory_council(fix_prompt, mode="debug", engine=args.engine)
+                    advisor_fix = query_gate_fix(diag_output, args)
                     print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
                     applied = apply_patch_text(advisor_fix)
                     if applied:
@@ -515,16 +531,33 @@ def cmd_gate(args):
         print("✓ No changes detected in git working tree. Gate passed.")
         return
 
-    resp = query_advisory_council(
-        "Evaluate this diff as the final pre-commit gate.\n"
-        "Start your response with exactly 'VERDICT: APPROVED' if the diff is safe and sound to commit, "
-        "or 'VERDICT: REJECTED' if there are correctness defects, regressions, or unresolved blockers, "
-        "followed by your structured rationale.",
-        diff=diff,
-        mode="review_diff",
-        engine=args.engine,
-        timeout=getattr(args, "timeout", 240)
-    )
+    competition = getattr(args, "competition", False)
+    if competition:
+        try:
+            from triad.competition import query_competition_council
+        except ImportError:
+            from competition import query_competition_council
+        adv_pair = ("mock", "mock") if getattr(args, "engine", "auto") == "mock" else ("claude", "codex")
+        session = query_competition_council(
+            "Evaluate this diff as the final pre-commit gate.\n"
+            "Under Section 4 (Final Adjudicated Verdict & Action Plan), explicitly state either 'VERDICT: APPROVED' or 'VERDICT: REJECTED'.",
+            diff=diff,
+            mode="review_diff",
+            timeout=getattr(args, "timeout", 240),
+            advisor_names=adv_pair
+        )
+        resp = session.get("synthesis", "")
+    else:
+        resp = query_advisory_council(
+            "Evaluate this diff as the final pre-commit gate.\n"
+            "Start your response with exactly 'VERDICT: APPROVED' if the diff is safe and sound to commit, "
+            "or 'VERDICT: REJECTED' if there are correctness defects, regressions, or unresolved blockers, "
+            "followed by your structured rationale.",
+            diff=diff,
+            mode="review_diff",
+            engine=args.engine,
+            timeout=getattr(args, "timeout", 240)
+        )
     print("\n[Advisory Council Signoff]:")
     print(resp)
 
@@ -543,16 +576,20 @@ def cmd_gate(args):
         print("Address the advisory council findings above before committing.")
         sys.exit(1)
 
-    # Approval must be explicitly declared on the opening non-empty line
-    non_empty_lines = [l.strip() for l in resp_clean.splitlines() if l.strip()]
-    first_line = non_empty_lines[0] if non_empty_lines else ""
-    first_line_clean = re.sub(r"[\*#_`]", "", first_line).strip()
-    is_approved_line1 = bool(re.match(r"^VERDICT:\s*APPROVED\b", first_line_clean, re.IGNORECASE))
+    if competition:
+        is_approved = bool(re.search(r"\bVERDICT:\s*APPROVED\b", resp_clean, re.IGNORECASE))
+    else:
+        # Approval must be explicitly declared on the opening non-empty line
+        non_empty_lines = [l.strip() for l in resp_clean.splitlines() if l.strip()]
+        first_line = non_empty_lines[0] if non_empty_lines else ""
+        first_line_clean = re.sub(r"[\*#_`]", "", first_line).strip()
+        is_approved = bool(re.match(r"^VERDICT:\s*APPROVED\b", first_line_clean, re.IGNORECASE))
 
-    if is_approved_line1:
+    if is_approved:
         print("\n✓ [Triad Gate COMPLETE] Advisory Council approved pre-commit signoff.")
     else:
-        print("\n❌ [Triad Gate BLOCKED] Advisory Council did not provide an explicit 'VERDICT: APPROVED' on line 1.")
+        reason = "contain 'VERDICT: APPROVED'" if competition else "provide an explicit 'VERDICT: APPROVED' on line 1"
+        print(f"\n❌ [Triad Gate BLOCKED] Advisory Council did not {reason}.")
         print("Address the advisory council findings above before committing.")
         sys.exit(1)
 
@@ -647,6 +684,7 @@ def main():
     # gate
     p_gate = subparsers.add_parser("gate", help="Run full pre-commit verification (tsc + tests + diff review)")
     p_gate.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, ollama, mock)")
+    p_gate.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
     p_gate.add_argument("--max-retries", type=int, default=1, help="Max self-healing retries for tsc/tests (default 1)")
     p_gate.add_argument("--timeout", type=int, default=240, help="Advisor signoff timeout in seconds (default 240)")
 

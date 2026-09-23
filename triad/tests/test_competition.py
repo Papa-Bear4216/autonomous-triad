@@ -39,5 +39,55 @@ class TestCompetitionMode(unittest.TestCase):
         self.assertEqual(res["advisors"], ["mock", "mock"])
         self.assertTrue(COUNCIL_SESSIONS_LOG.exists())
 
+    def test_query_gate_fix_competition(self):
+        from triad.triad_engine import query_gate_fix
+        class Args:
+            competition = True
+            engine = "mock"
+            timeout = 30
+        
+        fix = query_gate_fix("SyntaxError on line 5", Args())
+        self.assertIsInstance(fix, str)
+        self.assertTrue(len(fix) > 0)
+
+    def test_advisor_skill_competition(self):
+        import importlib.util
+        advisor_path = REPO_ROOT / "skills" / "claude-advisor" / "advisor.py"
+        spec = importlib.util.spec_from_file_location("advisor", str(advisor_path))
+        advisor_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(advisor_mod)
+
+        res = advisor_mod.query_advisor(
+            "Evaluate architectural approach",
+            mode="architect",
+            engine="mock",
+            competition=True,
+            timeout=30
+        )
+        self.assertIsInstance(res, str)
+        self.assertIn("Mock Advisor", res)
+
+    def test_competition_gate_verdict_parsing(self):
+        import re
+        # Synthetic approval response under section 4
+        approved_resp = (
+            "### 1. Points of Unanimous Agreement\nBoth approved.\n\n"
+            "### 4. Final Adjudicated Verdict & Action Plan\n"
+            "VERDICT: APPROVED. The diff is sound and ready for commit."
+        )
+        is_rejected = bool(re.search(r"\bVERDICT:\s*REJECTED\b", approved_resp, re.IGNORECASE))
+        is_approved = bool(re.search(r"\bVERDICT:\s*APPROVED\b", approved_resp, re.IGNORECASE))
+        self.assertFalse(is_rejected)
+        self.assertTrue(is_approved)
+
+        # Synthetic rejection response taking precedence
+        rejected_resp = (
+            "### 1. Points of Unanimous Agreement\nFound bug.\n\n"
+            "### 4. Final Adjudicated Verdict & Action Plan\n"
+            "VERDICT: REJECTED. Found fatal race condition."
+        )
+        is_rejected = bool(re.search(r"\bVERDICT:\s*REJECTED\b", rejected_resp, re.IGNORECASE))
+        self.assertTrue(is_rejected)
+
 if __name__ == "__main__":
     unittest.main()

@@ -206,7 +206,62 @@ def query_codex(prompt: str, context: str = None, diff: str = None, mode: str = 
             except Exception:
                 pass
 
-def query_advisor(prompt: str, context: str = None, diff: str = None, mode: str = "general", engine: str = "auto") -> str:
+def query_competition(
+    prompt: str,
+    context: str = None,
+    diff: str = None,
+    mode: str = "general",
+    timeout: int = 180,
+    advisor_names: tuple = ("claude", "codex")
+) -> str:
+    """Executes concurrent dual-advisor review & structured synthesis via Triad Competition Council."""
+    try:
+        from triad.competition import query_competition_council
+    except ImportError:
+        candidate_paths = [
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
+            r"C:\Users\micha\projects\autonomous-triad",
+            r"C:\Users\micha\.agents\triad",
+            r"C:\Users\micha\.agents",
+        ]
+        for p in candidate_paths:
+            if os.path.exists(p) and p not in sys.path:
+                sys.path.insert(0, p)
+        try:
+            from triad.competition import query_competition_council
+        except ImportError:
+            try:
+                from competition import query_competition_council
+            except ImportError:
+                query_competition_council = None
+
+    if query_competition_council:
+        session = query_competition_council(
+            prompt,
+            context=context,
+            diff=diff,
+            mode=mode,
+            timeout=timeout,
+            advisor_names=advisor_names
+        )
+        return session.get("synthesis", "")
+    else:
+        # Fallback to auto mode if triad engine is not found
+        return query_advisor(prompt, context=context, diff=diff, mode=mode, engine="auto")
+
+def query_advisor(
+    prompt: str,
+    context: str = None,
+    diff: str = None,
+    mode: str = "general",
+    engine: str = "auto",
+    competition: bool = False,
+    timeout: int = 180
+) -> str:
+    if competition or engine == "competition":
+        advisors = ("mock", "mock") if engine == "mock" else ("claude", "codex")
+        return query_competition(prompt, context=context, diff=diff, mode=mode, timeout=timeout, advisor_names=advisors)
+
     if engine == "codex":
         return query_codex(prompt, context=context, diff=diff, mode=mode)
     elif engine == "claude":
@@ -225,9 +280,11 @@ def main():
     parser = argparse.ArgumentParser(description="Query Claude or OpenAI Codex as an autonomous advisor.")
     parser.add_argument("prompt", nargs="?", default="", help="The question or task prompt")
     parser.add_argument("--mode", choices=["general", "review_diff", "architect", "debug"], default="general")
-    parser.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine (default: auto with failover)")
+    parser.add_argument("--engine", choices=["auto", "claude", "codex", "competition", "mock"], default="auto", help="Advisor engine (default: auto with failover)")
+    parser.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
     parser.add_argument("--context", default="", help="Relevant code or context")
     parser.add_argument("--diff-file", default="", help="Path to a diff file or - for stdin")
+    parser.add_argument("--timeout", type=int, default=180, help="Advisor query timeout in seconds (default 180)")
 
     args = parser.parse_args()
 
@@ -244,10 +301,18 @@ def main():
         prompt = sys.stdin.read().strip()
 
     if not prompt and not diff_content:
-        print("Usage: python advisor.py '<prompt>' [--mode architect|review_diff|debug] [--engine auto|claude|codex] [--context '...']")
+        print("Usage: python advisor.py '<prompt>' [--mode architect|review_diff|debug] [--engine auto|claude|codex|competition] [--competition] [--context '...']")
         sys.exit(1)
 
-    response = query_advisor(prompt, context=args.context, diff=diff_content, mode=args.mode, engine=args.engine)
+    response = query_advisor(
+        prompt,
+        context=args.context,
+        diff=diff_content,
+        mode=args.mode,
+        engine=args.engine,
+        competition=args.competition,
+        timeout=args.timeout
+    )
     print(response)
 
 if __name__ == "__main__":
