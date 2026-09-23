@@ -681,9 +681,9 @@ def run_swebench(
         try:
             # Query advisory council or single baseline model
             if engine == "bare_single":
-                raw_response = query_claude(advisor_prompt, mode=mode, timeout=120)
+                raw_response = query_claude(advisor_prompt, mode=mode, timeout=300)
             else:
-                raw_response = query_advisory_council(advisor_prompt, mode=mode, engine=engine)
+                raw_response = query_advisory_council(advisor_prompt, mode=mode, engine=engine, timeout=300)
 
             # Check for error or empty responses
             if not raw_response or raw_response.startswith("[Error"):
@@ -720,9 +720,9 @@ def run_swebench(
                 retried = True
                 retry_prompt = build_retry_prompt(inst, mode=mode, prior_error=syntax_err)
                 if engine == "bare_single":
-                    retry_response = query_claude(retry_prompt, mode=mode, timeout=120)
+                    retry_response = query_claude(retry_prompt, mode=mode, timeout=300)
                 else:
-                    retry_response = query_advisory_council(retry_prompt, mode=mode, engine=engine)
+                    retry_response = query_advisory_council(retry_prompt, mode=mode, engine=engine, timeout=300)
 
                 if retry_response and not retry_response.startswith("[Error"):
                     retry_extracted = extract_proposed_patch(retry_response, expected_files=gold_files)
