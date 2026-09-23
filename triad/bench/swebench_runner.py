@@ -593,13 +593,39 @@ def build_swebench_prompt(instance: Dict[str, Any], mode: str = "debug") -> str:
             "so that the target failing tests pass and existing behavior is preserved."
         )
 
+    diff_format_rules = (
+        "UNIFIED DIFF FORMAT (required, strictly enforced):\n"
+        "- Each hunk header MUST be exactly '@@ -<start>,<count> +<start>,<count> @@' "
+        "(real line numbers from the original file, not '@@ def foo(...):').\n"
+        "- Every hunk line must start with '+', '-', or a single space for unchanged context — "
+        "never omit the leading space on context lines.\n"
+        "- Include '--- a/<path>' and '+++ b/<path>' headers before each hunk.\n"
+        "- Do not truncate, abbreviate, or elide any part of the diff (no '...' placeholders).\n"
+        "- Output nothing after the closing ``` — no explanation, no trailing commentary.\n"
+    )
+
     return (
         f"SWE-bench Verified Issue: {inst_id}\n"
         f"Repository: {repo}\n\n"
         f"PROBLEM STATEMENT:\n{problem}\n\n"
         f"{failing_tests_str}"
         f"{task_instructions}\n\n"
-        "Output the unified diff patch clearly within a ```diff ... ``` code block."
+        f"{diff_format_rules}\n"
+        "Output the complete unified diff patch within a single ```diff ... ``` code block."
+    )
+
+
+def build_retry_prompt(instance: Dict[str, Any], mode: str, prior_error: str) -> str:
+    """Builds a corrective retry prompt after a malformed/unparseable diff."""
+    base_prompt = build_swebench_prompt(instance, mode=mode)
+    return (
+        f"{base_prompt}\n\n"
+        "---\n"
+        "NOTE: Your previous attempt produced a patch that failed to apply with git.\n"
+        f"Error: {prior_error}\n"
+        "Common causes: fabricated/approximate hunk headers instead of real line numbers, "
+        "missing context lines, or omitted/abbreviated code. "
+        "Re-read the problem statement and produce a corrected, complete, exact unified diff."
     )
 
 
@@ -685,6 +711,26 @@ def run_swebench(
             # Extract patch / solution
             extracted = extract_proposed_patch(raw_response, expected_files=gold_files)
 
+            # If the extracted patch fails basic syntax validation, retry once with a
+            # corrective prompt before giving up — model diff generation is non-deterministic
+            # and a single malformed attempt shouldn't sink an otherwise-solvable instance.
+            retried = False
+            syntax_ok, syntax_err = verify_git_patch_syntax(extracted.get("patch_text", ""))
+            if not syntax_ok:
+                retried = True
+                retry_prompt = build_retry_prompt(inst, mode=mode, prior_error=syntax_err)
+                if engine == "bare_single":
+                    retry_response = query_claude(retry_prompt, mode=mode, timeout=120)
+                else:
+                    retry_response = query_advisory_council(retry_prompt, mode=mode, engine=engine)
+
+                if retry_response and not retry_response.startswith("[Error"):
+                    retry_extracted = extract_proposed_patch(retry_response, expected_files=gold_files)
+                    retry_ok, _ = verify_git_patch_syntax(retry_extracted.get("patch_text", ""))
+                    if retry_ok:
+                        raw_response = retry_response
+                        extracted = retry_extracted
+
             # Evaluate inside isolated git worktree
             eval_result = evaluate_in_worktree(
                 instance=inst,
@@ -702,6 +748,8 @@ def run_swebench(
                 status_str = "✗ UNRESOLVED"
 
             details = []
+            if retried:
+                details.append("retried: yes")
             if eval_result.get("worktree_isolated"):
                 details.append("worktree: isolated")
             if eval_result.get("patch_applied"):
