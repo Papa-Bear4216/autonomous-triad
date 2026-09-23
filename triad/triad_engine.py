@@ -18,6 +18,7 @@ import json
 import tempfile
 import socket
 from pathlib import Path
+from typing import List, Tuple, Optional, Dict, Any
 
 # Ensure UTF-8 output on Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
