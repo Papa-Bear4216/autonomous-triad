@@ -73,10 +73,10 @@ def query_competition_council(
             from advisor_manager import get_advisors
 
         all_advisors = get_advisors()
-        enabled_non_mock = [a for a in all_advisors.values() if a.enabled and a.name != "mock"]
+        enabled_non_mock = [a for a in all_advisors if a.get("enabled", True) and a.get("name") != "mock"]
         if len(enabled_non_mock) < 2:
             print(f"[Triad Competition Mode Warning] Fewer than 2 non-mock advisors enabled in config ({len(enabled_non_mock)} enabled). Falling back to single advisor.")
-            single_name = enabled_non_mock[0].name if enabled_non_mock else "claude"
+            single_name = enabled_non_mock[0].get("name") if enabled_non_mock else "claude"
             single_resp = query_configured_advisor(single_name, prompt, context=context, diff=diff, mode=mode, timeout=timeout)
             return {
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
