@@ -1,0 +1,28 @@
+#!/usr/bin/env sh
+# Portable Triad CLI wrapper
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+else
+    echo "Error: Python 3 not found on PATH." >&2
+    exit 1
+fi
+
+if [ -z "$TRIAD_ISOLATED_WORKTREE" ]; then
+    PATHSEP=$("$PYTHON_BIN" -c 'import os; print(os.pathsep)' 2>/dev/null || echo ":")
+    if [ "$PATHSEP" = ";" ]; then
+        WIN_DIR=$(cygpath -w "$SCRIPT_DIR" 2>/dev/null || (cd "$SCRIPT_DIR" && pwd -W 2>/dev/null) || echo "$SCRIPT_DIR")
+        if [ -n "$PYTHONPATH" ]; then
+            export PYTHONPATH="$WIN_DIR;$PYTHONPATH"
+        else
+            export PYTHONPATH="$WIN_DIR"
+        fi
+    else
+        export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+fi
+
+exec "$PYTHON_BIN" -m triad "$@"

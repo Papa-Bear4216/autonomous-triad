@@ -230,7 +230,7 @@ def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[s
         high_stakes=high_stakes
     )
 
-def execute_intent(classification: IntentClassification, raw_prompt: str, args: Any = None) -> None:
+def execute_intent(classification: IntentClassification, raw_prompt: str, args: Any = None, env: Any = None) -> None:
     """
     Executes the action corresponding to the classified intent by delegating
     directly to the appropriate subsystem or command handler.
@@ -255,7 +255,7 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
         # Pass competition flag if suggested or explicitly set
         if classification.suggested_engine == "competition" and hasattr(args, "competition"):
             args.competition = True
-        triad_engine.cmd_gate(args)
+        triad_engine.cmd_gate(args, env=env)
         return
 
     if intent == "REVIEW":
@@ -263,7 +263,7 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
             setattr(args, "prompt", raw_prompt)
         if classification.suggested_engine == "competition":
             setattr(args, "competition", True)
-        triad_engine.cmd_review(args)
+        triad_engine.cmd_review(args, env=env)
         return
 
     if intent == "DEBUG":

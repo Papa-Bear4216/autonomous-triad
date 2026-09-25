@@ -10,6 +10,7 @@ Config-driven management and dynamic query routing for advisory models:
 
 import sys
 import os
+import re
 import subprocess
 import json
 import tempfile
@@ -273,7 +274,8 @@ def _execute_single_advisor(
         # Handle process exit codes
         if proc.returncode != 0:
             err_msg = stderr.strip() or output
-            if "session limit" in output.lower() or "rate limit" in output.lower():
+            out_lower = output.lower()
+            if "session limit" in out_lower or "rate limit" in out_lower or "usage limit" in out_lower:
                 return f"[{display_name} Session Limit]: {output}"
             return f"[Error from {display_name} (exit code {proc.returncode})]: {err_msg}"
 
@@ -347,7 +349,7 @@ def query_configured_advisor(
         for adv in advisors:
             adv_name = adv.get("name")
             res = _execute_single_advisor(adv, prompt, context=context, diff=diff, mode=mode, timeout=timeout)
-            is_limit = "session limit" in res.lower() or "rate limit" in res.lower()
+            is_limit = bool(re.match(r"^\[[^\]]*(?:session limit|rate limit|usage limit)[^\]]*\]", res.strip(), re.IGNORECASE))
             is_err = res.startswith("[Error") or is_limit
             if not is_err:
                 if fail_notes:

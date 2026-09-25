@@ -92,14 +92,16 @@ class TestTriadServer(unittest.TestCase):
         self.assertIn("advisors", body["result"])
 
     def test_auto_debug_intent(self):
-        status, _, body = self._post("/auto", {
-            "prompt": "why is this failing? Traceback: TypeError: undefined is not a function",
-            "context": "const x = null; x();"
-        })
-        self.assertEqual(status, 200)
-        self.assertEqual(body.get("status"), "success")
-        self.assertEqual(body.get("intent"), "DEBUG")
-        self.assertIn("result", body)
+        from unittest.mock import patch
+        with patch("triad.server.query_configured_advisor", return_value="Mock debug fix"):
+            status, _, body = self._post("/auto", {
+                "prompt": "why is this failing? Traceback: TypeError: undefined is not a function",
+                "context": "const x = null; x();"
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(body.get("status"), "success")
+            self.assertEqual(body.get("intent"), "DEBUG")
+            self.assertIn("result", body)
 
     def test_auto_device_intent(self):
         status, _, body = self._post("/auto", {"prompt": "check android phone notification"})
