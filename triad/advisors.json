@@ -45,6 +45,22 @@
       "enabled": true
     },
     {
+      "name": "nous",
+      "display_name": "Nous Research (Hermes Portal)",
+      "binary_path": "python",
+      "fallback_binary": "python3",
+      "priority": 3,
+      "execution_flags": [
+        "{triad_dir}/nous_bridge.py"
+      ],
+      "input_mode": "stdin",
+      "output_mode": "stdout",
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "enabled": true
+    },
+    {
       "name": "ollama",
       "display_name": "Ollama Local Advisor (qwen2.5-coder)",
       "binary_path": "C:\\Users\\micha\\AppData\\Local\\Programs\\Ollama\\ollama.exe",

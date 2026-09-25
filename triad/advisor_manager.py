@@ -228,8 +228,10 @@ def _execute_single_advisor(
     # Parameter interpolation for flags
     resolved_flags = []
     empty_mcp_str = str(DEFAULT_EMPTY_MCP)
+    triad_dir_str = str(TRIAD_DIR)
     for flag in flags:
         flag = flag.replace("{empty_mcp}", empty_mcp_str)
+        flag = flag.replace("{triad_dir}", triad_dir_str)
         if temp_out_path:
             flag = flag.replace("{output_file}", temp_out_path)
         if input_mode == "arg":

@@ -230,11 +230,42 @@ def cmd_doctor(args):
     else:
         print(f"    - Status:       Auth config not found at {CODEX_AUTH}")
 
-    # 4. Hermes Agent
-    print("\n[4] Hermes Agent (Device Specialist & Mobile Bridge)")
+    # 4. Hermes Agent & Nous Research Portal
+    print("\n[4] Hermes Agent & Nous Research (Device Specialist & Advisory Member)")
     if HERMES_PATH.exists():
         print(f"    - Binary:       {HERMES_PATH} (OK)")
     print(f"    - Model:        stepfun/step-3.7-flash:free (Nous Portal, $0 cost)")
+
+    try:
+        from triad.nous_bridge import get_nous_token, TASK_MODEL_CASCADES
+    except ImportError:
+        try:
+            from nous_bridge import get_nous_token, TASK_MODEL_CASCADES
+        except ImportError as e:
+            get_nous_token = None
+            TASK_MODEL_CASCADES = {}
+            print(f"    - Nous Auth:    ERROR (nous_bridge import failed: {e})")
+
+    if get_nous_token is not None:
+        try:
+            nous_authed = bool(get_nous_token())
+            general_cascade = TASK_MODEL_CASCADES.get("general", [])
+        except Exception as e:
+            print(f"    - Nous Auth:    ERROR (get_nous_token failed: {e})")
+            nous_authed = False
+            general_cascade = []
+        else:
+            print(f"    - Nous Auth:    {'OK (token found)' if nous_authed else 'MISSING (no NOUS_API_KEY / Hermes auth.json entry)'}")
+    else:
+        nous_authed = False
+        general_cascade = []
+
+    if general_cascade:
+        print(f"    - Advisory Lead: {general_cascade[0]} (general task default in advisory-council cascade, $0 cost)")
+    nous_adv = next((a for a in get_advisors() if a.get("name") == "nous"), None)
+    nous_enabled = bool(nous_adv and nous_adv.get("enabled"))
+    advisory_status = "ONLINE" if (nous_enabled and nous_authed) else "OFFLINE"
+    print(f"    - Advisory:     {advisory_status} (advisors.json enabled={nous_enabled}, priority {nous_adv.get('priority') if nous_adv else 'n/a'})")
     print(f"    - Timezone:     America/Chicago")
     # Check bridge port 8766
     bridge_open = is_port_open("127.0.0.1", 8766)
