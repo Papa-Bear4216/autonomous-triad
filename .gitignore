@@ -23,6 +23,11 @@ auth.json
 token.json
 credentials.json
 
+# Packaging build artifacts
+*.egg-info/
+build/
+dist/
+
 # IDE & OS
 .vscode/
 .idea/

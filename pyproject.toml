@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-triad"
+version = "0.1.0"
+description = "Autonomous multi-agent triad CLI (Antigravity / Claude Code / Codex / Hermes orchestration)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+triad = "triad.triad_engine:main"
+
+[tool.setuptools]
+packages = ["triad", "triad.bench"]
