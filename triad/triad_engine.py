@@ -521,7 +521,10 @@ def acquire_repo_mutation_lock(repo_root: Union[str, Path]):
 
     lock_file.parent.mkdir(parents=True, exist_ok=True)
 
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    # O_NOFOLLOW: this path can fall back to a name derived from a hash of the
+    # repo path inside the shared system temp directory, so it must never
+    # follow a pre-planted symlink there.
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     try:
         fd = os.open(str(lock_file), flags, 0o600)
     except OSError as e:

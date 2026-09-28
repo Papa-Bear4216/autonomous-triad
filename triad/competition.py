@@ -24,8 +24,8 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 COUNCIL_SESSIONS_LOG = LOGS_DIR / "council_sessions.jsonl"
 
 def hash_content(text: str) -> str:
-    """Generate MD5 hash of diff or prompt for session correlation."""
-    return hashlib.md5((text or "").encode("utf-8")).hexdigest()[:12]
+    """Generate a hash of diff or prompt for session correlation (non-security use)."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
 
 def build_synthesis_prompt(prompt: str, claude_resp: str, codex_resp: str, context: str = None, diff: str = None) -> str:
     """Constructs rigorous 4-part synthesis prompt."""

@@ -252,6 +252,26 @@ def _get_worktree_admin_dir(worktree_path: Union[str, Path]) -> Optional[Path]:
     return None
 
 
+def _write_text_no_follow(path: Path, content: str, encoding: str = "utf-8") -> None:
+    """
+    Write text to `path` without ever following an existing symlink.
+    `path` may live in a shared, world-writable directory (e.g. the system temp
+    dir) under a name derived from a hash of the worktree path, so it is not
+    safe to assume nothing else can have pre-created it as a symlink pointing
+    somewhere sensitive. Refuses (raises OSError) rather than writing through
+    a symlink.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        f = os.fdopen(fd, "w", encoding=encoding)
+    except BaseException:
+        os.close(fd)
+        raise
+    with f:
+        f.write(content)
+
+
 def _get_provisioned_manifest_path(worktree_path: Union[str, Path]) -> Path:
     """Resolve the location of the provisioned dependency manifest OUTSIDE the worktree checkout."""
     wt = Path(worktree_path).resolve()
@@ -751,7 +771,7 @@ def provision_worktree_dependencies(repo_root: Union[str, Path], worktree_path: 
                 "worktree": str(_clean_path(wt)),
                 "entries": manifest
             }
-            manifest_file.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+            _write_text_no_follow(manifest_file, json.dumps(manifest_payload, indent=2))
         except Exception:
             pass
 
