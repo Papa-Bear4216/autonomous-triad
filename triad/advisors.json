@@ -62,20 +62,20 @@
     },
     {
       "name": "ollama",
-      "display_name": "Ollama Local Advisor (qwen2.5-coder)",
+      "display_name": "Ollama Local Advisor (qwen2.5-coder:14b)",
       "binary_path": "C:\\Users\\micha\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
       "fallback_binary": "ollama",
-      "priority": 3,
+      "priority": 4,
       "execution_flags": [
         "run",
-        "qwen2.5-coder:latest"
+        "qwen2.5-coder:14b"
       ],
       "input_mode": "stdin",
       "output_mode": "stdout",
       "env": {
         "PYTHONIOENCODING": "utf-8"
       },
-      "enabled": false
+      "enabled": true
     },
     {
       "name": "mock",
