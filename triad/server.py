@@ -335,4 +335,5 @@ def start_server(host: str = "127.0.0.1", port: int = 8789) -> None:
 
 if __name__ == "__main__":
     port = int(os.environ.get("TRIAD_PORT", 8789))
-    start_server(port=port)
+    host = os.environ.get("TRIAD_HOST", "127.0.0.1")
+    start_server(host=host, port=port)

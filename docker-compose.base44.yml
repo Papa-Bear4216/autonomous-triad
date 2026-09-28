@@ -1,0 +1,20 @@
+services:
+  triad:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./:/app
+    ports:
+      - "3000:3000"
+    environment:
+      - TRIAD_PORT=3000
+      - TRIAD_HOST=0.0.0.0
+      - PYTHONUNBUFFERED=1
+    command: bash -c "pip install --no-cache-dir --quiet psutil watchdog && watchmedo auto-restart -d ./triad -p '*.py' -R -- python -m triad.server"
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
