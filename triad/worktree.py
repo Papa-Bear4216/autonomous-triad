@@ -261,9 +261,19 @@ def _write_text_no_follow(path: Path, content: str, encoding: str = "utf-8") -> 
     somewhere sensitive. Refuses (raises OSError) rather than writing through
     a symlink.
     """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     fd = os.open(str(path), flags, 0o600)
     try:
+        # O_NOFOLLOW only blocks a symlink; it doesn't stop something else
+        # from having pre-created a real file at this path in the shared
+        # temp directory. On POSIX, refuse to write (and O_TRUNC away the
+        # contents of) a file this process doesn't own before truncating it.
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"Refusing to write to non-regular file: {path}")
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            raise OSError(f"Refusing to write to a file owned by another user: {path}")
+        os.ftruncate(fd, 0)
         f = os.fdopen(fd, "w", encoding=encoding)
     except BaseException:
         os.close(fd)
