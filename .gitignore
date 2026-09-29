@@ -28,6 +28,10 @@ credentials.json
 build/
 dist/
 
+# Virtual environments
+.venv/
+venv/
+
 # IDE & OS
 .vscode/
 .idea/
