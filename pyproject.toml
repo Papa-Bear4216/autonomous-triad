@@ -15,7 +15,26 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "bandit>=1.7",
 ]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 200
+
+[tool.ruff.lint]
+# Start conservative: catch real bugs (undefined names, unused imports,
+# broken f-strings) without relitigating this codebase's existing style.
+select = ["E9", "F"]
+
+[tool.bandit]
+# triad_engine.py's hook installer intentionally builds shell scripts as
+# Python string templates (never executed by Python, never shell=True);
+# bandit's subprocess/hardcoded-tmp rules are still useful elsewhere so
+# they stay enabled, just scoped past the known string-template blocks.
+exclude_dirs = ["triad/tests"]
 
 [project.scripts]
 triad = "triad.triad_engine:main"

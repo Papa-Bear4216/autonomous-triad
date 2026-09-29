@@ -17,7 +17,7 @@ import socket
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 try:
     from triad.advisor_manager import query_configured_advisor, get_advisors
@@ -312,17 +312,17 @@ def start_server(host: str = "127.0.0.1", port: int = 8789) -> None:
         print(f"[Triad Server Error] Could not bind to {host}:{port}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"================================================================================")
-    print(f"           AUTONOMOUS MULTI-AGENT TRIAD: AMBIENT HTTP BRIDGE                    ")
-    print(f"================================================================================")
+    print("================================================================================")
+    print("           AUTONOMOUS MULTI-AGENT TRIAD: AMBIENT HTTP BRIDGE                    ")
+    print("================================================================================")
     print(f"Listening on http://{host}:{port}")
-    print(f"Endpoints:")
-    print(f"  - GET  /health      System health, subsystem connectivity, and advisor status")
-    print(f"  - GET  /telemetry   Real-time Council adjudication history & session stats")
-    print(f"  - POST /auto        Sub-millisecond intent classification & autonomous execution")
-    print(f"  - POST /review      Diff review and dual-advisor competition consensus")
-    print(f"Press Ctrl+C to terminate.")
-    print(f"================================================================================\n")
+    print("Endpoints:")
+    print("  - GET  /health      System health, subsystem connectivity, and advisor status")
+    print("  - GET  /telemetry   Real-time Council adjudication history & session stats")
+    print("  - POST /auto        Sub-millisecond intent classification & autonomous execution")
+    print("  - POST /review      Diff review and dual-advisor competition consensus")
+    print("Press Ctrl+C to terminate.")
+    print("================================================================================\n")
 
     try:
         httpd.serve_forever()

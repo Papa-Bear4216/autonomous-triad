@@ -10,13 +10,11 @@ Zero-cost, ultra-fast intent classification and autonomous routing across:
 """
 
 import sys
-import os
 import re
-import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 
 # Ensure UTF-8 console output
 if hasattr(sys.stdout, "reconfigure"):
@@ -317,7 +315,8 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
         pieces_reachable = False
         try:
             import urllib.request
-            with urllib.request.urlopen("http://127.0.0.1:39300/.well-known/health", timeout=2.0) as resp:
+            # B310 suppressed below: hardcoded literal http:// URL, no injection surface
+            with urllib.request.urlopen("http://127.0.0.1:39300/.well-known/health", timeout=2.0) as resp:  # nosec B310
                 if resp.status == 200:
                     pieces_reachable = True
                     print("✓ PiecesOS core daemon is reachable on port 39300.")

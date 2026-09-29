@@ -9,8 +9,6 @@ Verifies:
 - Auto-failover logic across configured advisor priorities
 """
 
-import sys
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,7 +19,6 @@ from triad.advisor_manager import (
     query_configured_advisor,
     add_advisor,
     save_config,
-    DEFAULT_CONFIG_PATH,
 )
 
 

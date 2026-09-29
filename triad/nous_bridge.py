@@ -169,7 +169,8 @@ def query_nous(
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=attempt_timeout) as response:
+            # B310 suppressed below: INFERENCE_URL is a hardcoded https:// constant, no injection surface
+            with urllib.request.urlopen(req, timeout=attempt_timeout) as response:  # nosec B310
                 res_data = json.loads(response.read().decode("utf-8"))
                 choices = res_data.get("choices", [])
                 if choices:

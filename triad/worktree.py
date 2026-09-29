@@ -556,7 +556,7 @@ def _check_dependency_graph_compatibility(parent_root: Path, wt_root: Path) -> T
                     p_deps = {k: p_data.get(k) for k in dep_keys}
                     w_deps = {k: w_data.get(k) for k in dep_keys}
                     if p_deps != w_deps:
-                        return False, f"Candidate package.json dependencies differ from parent installation"
+                        return False, "Candidate package.json dependencies differ from parent installation"
                 except Exception:
                     if p_file.read_bytes() != w_file.read_bytes():
                         return False, f"Candidate {name} differs from parent"

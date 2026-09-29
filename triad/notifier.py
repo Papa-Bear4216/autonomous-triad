@@ -7,7 +7,6 @@ Connects autonomous Triad event completions to Bear House Classic push alerts
 
 import json
 import os
-import sys
 import threading
 import urllib.request
 import urllib.error
@@ -74,7 +73,10 @@ def _send_network_payload(
                 primary_timeout = rem
             try:
                 req = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=primary_timeout) as resp:
+                if req.type not in ("http", "https"):
+                    raise ValueError(f"Refusing non-HTTP(S) URL scheme: {req.type}")
+                # B310 suppressed below: scheme validated above
+                with urllib.request.urlopen(req, timeout=primary_timeout) as resp:  # nosec B310
                     if 200 <= resp.status < 300:
                         if outcome is not None:
                             outcome[0] = True
@@ -99,7 +101,8 @@ def _send_network_payload(
                         headers={"Content-Type": "application/json"},
                         method="POST"
                     )
-                    with urllib.request.urlopen(req, timeout=rem) as resp:
+                    # B310 suppressed below: hardcoded literal https:// URL, no injection surface
+                    with urllib.request.urlopen(req, timeout=rem) as resp:  # nosec B310
                         if 200 <= resp.status < 300:
                             if outcome is not None:
                                 outcome[0] = True

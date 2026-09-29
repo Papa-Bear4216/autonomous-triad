@@ -7,6 +7,7 @@ Uses model-as-a-judge scoring (replacing keyword matching) and negative controls
 
 import sys
 import os
+import re
 import json
 import argparse
 from pathlib import Path

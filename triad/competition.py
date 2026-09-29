@@ -5,12 +5,11 @@ isolated points, and contradictions, and logs full telemetry.
 """
 
 import sys
-import os
 import json
 import time
 import hashlib
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Tuple
 
 try:
