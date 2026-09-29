@@ -182,11 +182,12 @@ class TestTriadHook(unittest.TestCase):
 
 
 class TestClosedLoopApplicator(unittest.TestCase):
-    # get_recovery_patch_path() does a real Path.mkdir() on the resolved
-    # git-path; with a fake "/mock/repo" root that resolves to a top-level
-    # directory, which only root can create. Mock it out so this stays a
-    # pure unit test regardless of the fake path or the user running it.
-    @patch("pathlib.Path.mkdir")
+    # get_recovery_patch_path() does a real Path.mkdir() and later writes a
+    # real temp file under it; with a fake "/mock/repo" root that resolves
+    # to a top-level directory, mkdir requires root and the later write
+    # fails regardless. Point it at a real, writable temp directory instead
+    # of faking away the filesystem calls, so both the mkdir and the write
+    # succeed for real, matching what the code path actually does.
     @patch("triad.triad_engine.apply_verified_patch_to_workspace", return_value=True)
     @patch("triad.triad_engine.run_subprocess_tree_safe_bytes")
     @patch("triad.triad_engine.run_subprocess_tree_safe")
@@ -195,8 +196,17 @@ class TestClosedLoopApplicator(unittest.TestCase):
     @patch("triad.triad_engine.get_git_diff", return_value="")
     @patch("triad.triad_engine.isolated_worktree")
     @patch("triad.triad_engine.get_repo_root", return_value="/mock/repo")
-    def test_cmd_gate_apply_verified(self, mock_root, mock_worktree, mock_diff, mock_notify, mock_run, mock_tree_safe, mock_tree_bytes, mock_apply_verified, mock_mkdir):
+    def test_cmd_gate_apply_verified(self, mock_root, mock_worktree, mock_diff, mock_notify, mock_run, mock_tree_safe, mock_tree_bytes, mock_apply_verified):
         """Verify that when isolated worktree produces verified self-healing diff, --apply-verified applies it."""
+        recovery_dir = tempfile.mkdtemp(prefix="triad_test_recovery_")
+        self.addCleanup(shutil.rmtree, recovery_dir, ignore_errors=True)
+        recovery_patcher = patch(
+            "triad.triad_engine.get_recovery_patch_path",
+            return_value=Path(recovery_dir) / "triad_recovery.patch",
+        )
+        recovery_patcher.start()
+        self.addCleanup(recovery_patcher.stop)
+
         mock_ctx = MagicMock()
         mock_ctx.__enter__.return_value = Path("/mock/worktree")
         mock_ctx.__exit__.return_value = None
