@@ -182,6 +182,11 @@ class TestTriadHook(unittest.TestCase):
 
 
 class TestClosedLoopApplicator(unittest.TestCase):
+    # get_recovery_patch_path() does a real Path.mkdir() on the resolved
+    # git-path; with a fake "/mock/repo" root that resolves to a top-level
+    # directory, which only root can create. Mock it out so this stays a
+    # pure unit test regardless of the fake path or the user running it.
+    @patch("pathlib.Path.mkdir")
     @patch("triad.triad_engine.apply_verified_patch_to_workspace", return_value=True)
     @patch("triad.triad_engine.run_subprocess_tree_safe_bytes")
     @patch("triad.triad_engine.run_subprocess_tree_safe")
@@ -190,7 +195,7 @@ class TestClosedLoopApplicator(unittest.TestCase):
     @patch("triad.triad_engine.get_git_diff", return_value="")
     @patch("triad.triad_engine.isolated_worktree")
     @patch("triad.triad_engine.get_repo_root", return_value="/mock/repo")
-    def test_cmd_gate_apply_verified(self, mock_root, mock_worktree, mock_diff, mock_notify, mock_run, mock_tree_safe, mock_tree_bytes, mock_apply_verified):
+    def test_cmd_gate_apply_verified(self, mock_root, mock_worktree, mock_diff, mock_notify, mock_run, mock_tree_safe, mock_tree_bytes, mock_apply_verified, mock_mkdir):
         """Verify that when isolated worktree produces verified self-healing diff, --apply-verified applies it."""
         mock_ctx = MagicMock()
         mock_ctx.__enter__.return_value = Path("/mock/worktree")
@@ -1157,10 +1162,6 @@ exit 42
         self.assertEqual(content.count(TRIAD_HOOK_SIGNATURE), 2)  # Exactly [START] and [END]
         self.assertIn("npm test", content)
 
-    # Known bug (see PR #1 audit): same executable-bit-gated chaining issue as
-    # test_legacy_hook_chaining_propagates_failure_exit above; only started
-    # failing once the CLI-discoverability fix let this path run further.
-    @unittest.expectedFailure
     def test_husky_hook_execution_order_and_fail_closed(self):
         """Verify Husky hook fails closed when Triad is missing and halts before terminal exit."""
         import subprocess, shutil

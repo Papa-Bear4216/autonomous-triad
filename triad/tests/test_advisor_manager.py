@@ -9,6 +9,7 @@ Verifies:
 - Auto-failover logic across configured advisor priorities
 """
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,6 +64,10 @@ class TestAdvisorManager(unittest.TestCase):
         self.assertIn("[Mock Advisor]", resp)
         self.assertIn("characters", resp)
 
+    @unittest.skipUnless(
+        shutil.which("claude"),
+        "requires a local, authenticated Claude Code CLI on PATH -- not available in CI",
+    )
     def test_query_configured_advisor_claude(self):
         """Verify live querying of Claude Code advisor."""
         resp = query_configured_advisor("claude", "Respond with OK", timeout=30)
