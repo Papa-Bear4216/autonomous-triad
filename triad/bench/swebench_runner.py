@@ -57,6 +57,15 @@ DEFAULT_INSTANCES_FILE = Path(__file__).resolve().parent / "swebench_instances.j
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Blocks automatic redirects so a scheme/host check on the original URL can't be bypassed."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+urllib.request.install_opener(urllib.request.build_opener(_NoRedirectHandler))
+
+
 def load_instances(file_path: Path) -> List[Dict[str, Any]]:
     """Loads SWE-bench instances from JSON file."""
     if not file_path.exists():
@@ -259,7 +268,7 @@ def ensure_base_file(repo: str, base_commit: str, rel_path: str) -> Tuple[Option
         req = urllib.request.Request(url, headers={"User-Agent": "TriadBench/1.0"})
         if req.type not in ("http", "https"):
             return None, f"Refusing non-HTTP(S) URL scheme: {req.type}"
-        # B310 suppressed below: scheme validated above
+        # B310 suppressed below: scheme validated above, redirects disabled via installed opener
         with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310
             content = resp.read().replace(b"\r\n", b"\n")
             fd, tmp_path = tempfile.mkstemp(dir=str(cache_path.parent), prefix="tmp_cache_")

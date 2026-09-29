@@ -22,6 +22,18 @@ _active_threads_lock = threading.Lock()
 _active_threads = []
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Blocks automatic redirects so a scheme/host check on the original URL can't be bypassed
+    (the primary request carries a bearer token that must not follow a redirect to another host)."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# Installed as the default opener so plain urllib.request.urlopen() calls
+# below stay mockable in tests while still disabling redirects for real.
+urllib.request.install_opener(urllib.request.build_opener(_NoRedirectHandler))
+
+
 def _send_network_payload(
     title: str,
     body: str,
@@ -75,7 +87,7 @@ def _send_network_payload(
                 req = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
                 if req.type not in ("http", "https"):
                     raise ValueError(f"Refusing non-HTTP(S) URL scheme: {req.type}")
-                # B310 suppressed below: scheme validated above
+                # B310 suppressed below: scheme validated above, redirects disabled via installed opener
                 with urllib.request.urlopen(req, timeout=primary_timeout) as resp:  # nosec B310
                     if 200 <= resp.status < 300:
                         if outcome is not None:

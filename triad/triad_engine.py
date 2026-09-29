@@ -4281,7 +4281,7 @@ class _HookLock:
 
     def __enter__(self):
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         self.fd = os.open(str(self.lock_file), flags, 0o600)
         deadline = time.monotonic() + self.timeout
         while True:

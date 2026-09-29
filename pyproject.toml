@@ -30,10 +30,9 @@ line-length = 200
 select = ["E9", "F"]
 
 [tool.bandit]
-# triad_engine.py's hook installer intentionally builds shell scripts as
-# Python string templates (never executed by Python, never shell=True);
-# bandit's subprocess/hardcoded-tmp rules are still useful elsewhere so
-# they stay enabled, just scoped past the known string-template blocks.
+# Test fixtures intentionally do things (chmod, live urlopen calls to
+# loopback test servers) that would be findings in application code but
+# aren't representative of it; scan triad/ but not triad/tests.
 exclude_dirs = ["triad/tests"]
 
 [project.scripts]
