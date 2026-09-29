@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
 
+# Least-privilege default: this workflow only reads the repo and uploads a
+# build artifact, so the GITHUB_TOKEN needs no other scope.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Lint, security scan, and test
