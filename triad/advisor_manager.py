@@ -349,7 +349,6 @@ def query_configured_advisor(
 
         fail_notes = []
         for adv in advisors:
-            adv_name = adv.get("name")
             res = _execute_single_advisor(adv, prompt, context=context, diff=diff, mode=mode, timeout=timeout)
             is_limit = bool(re.match(r"^\[[^\]]*(?:session limit|rate limit|usage limit)[^\]]*\]", res.strip(), re.IGNORECASE))
             is_err = res.startswith("[Error") or is_limit

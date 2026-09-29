@@ -229,7 +229,7 @@ class TestGitWorktreeIsolation(unittest.TestCase):
             (wt_root / "packages" / "bar").mkdir(parents=True)
             (wt_root / "packages" / "bar" / "index.js").write_text("candidate bar", encoding="utf-8")
 
-            provisioned = provision_worktree_dependencies(repo_root, wt_root)
+            provision_worktree_dependencies(repo_root, wt_root)
 
             # wt/node_modules/bar should be retargeted to candidate packages/bar
             cand_bar_link = wt_root / "node_modules" / "bar"

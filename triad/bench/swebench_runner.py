@@ -57,6 +57,15 @@ DEFAULT_INSTANCES_FILE = Path(__file__).resolve().parent / "swebench_instances.j
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Blocks automatic redirects so a scheme/host check on the original URL can't be bypassed."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+urllib.request.install_opener(urllib.request.build_opener(_NoRedirectHandler))
+
+
 def load_instances(file_path: Path) -> List[Dict[str, Any]]:
     """Loads SWE-bench instances from JSON file."""
     if not file_path.exists():
@@ -257,7 +266,10 @@ def ensure_base_file(repo: str, base_commit: str, rel_path: str) -> Tuple[Option
     url = f"https://raw.githubusercontent.com/{repo}/{base_commit}/{rel_path}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "TriadBench/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        if req.type not in ("http", "https"):
+            return None, f"Refusing non-HTTP(S) URL scheme: {req.type}"
+        # B310 suppressed below: scheme validated above, redirects disabled via installed opener
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310
             content = resp.read().replace(b"\r\n", b"\n")
             fd, tmp_path = tempfile.mkstemp(dir=str(cache_path.parent), prefix="tmp_cache_")
             with os.fdopen(fd, "wb") as f:
@@ -796,8 +808,6 @@ def run_swebench(
 
     attempted = len(results)
     pct_res = (resolved_count / attempted * 100) if attempted > 0 else 0.0
-    test_verified_count = sum(1 for r in results if r.get("evaluation", {}).get("test_verified", False))
-    pct_test = (test_verified_count / attempted * 100) if attempted > 0 else 0.0
     git_apply_count = sum(1 for r in results if r.get("evaluation", {}).get("patch_applied", False))
     pct_git = (git_apply_count / attempted * 100) if attempted > 0 else 0.0
     sem_count = sum(1 for r in results if r.get("evaluation", {}).get("semantic_resolved", False))

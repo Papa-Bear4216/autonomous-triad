@@ -7,7 +7,6 @@ Connects autonomous Triad event completions to Bear House Classic push alerts
 
 import json
 import os
-import sys
 import threading
 import urllib.request
 import urllib.error
@@ -21,6 +20,18 @@ MAX_CONCURRENT_NOTIFICATIONS = 8
 _dispatch_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_NOTIFICATIONS)
 _active_threads_lock = threading.Lock()
 _active_threads = []
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Blocks automatic redirects so a scheme/host check on the original URL can't be bypassed
+    (the primary request carries a bearer token that must not follow a redirect to another host)."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# Installed as the default opener so plain urllib.request.urlopen() calls
+# below stay mockable in tests while still disabling redirects for real.
+urllib.request.install_opener(urllib.request.build_opener(_NoRedirectHandler))
 
 
 def _send_network_payload(
@@ -74,7 +85,10 @@ def _send_network_payload(
                 primary_timeout = rem
             try:
                 req = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=primary_timeout) as resp:
+                if req.type not in ("http", "https"):
+                    raise ValueError(f"Refusing non-HTTP(S) URL scheme: {req.type}")
+                # B310 suppressed below: scheme validated above, redirects disabled via installed opener
+                with urllib.request.urlopen(req, timeout=primary_timeout) as resp:  # nosec B310
                     if 200 <= resp.status < 300:
                         if outcome is not None:
                             outcome[0] = True
@@ -99,7 +113,8 @@ def _send_network_payload(
                         headers={"Content-Type": "application/json"},
                         method="POST"
                     )
-                    with urllib.request.urlopen(req, timeout=rem) as resp:
+                    # B310 suppressed below: hardcoded literal https:// URL, no injection surface
+                    with urllib.request.urlopen(req, timeout=rem) as resp:  # nosec B310
                         if 200 <= resp.status < 300:
                             if outcome is not None:
                                 outcome[0] = True

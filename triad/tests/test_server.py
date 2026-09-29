@@ -19,7 +19,7 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 
-from triad.server import TriadRequestHandler, get_telemetry_summary
+from triad.server import TriadRequestHandler
 
 
 def find_free_port() -> int:

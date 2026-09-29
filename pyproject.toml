@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-triad"
+version = "0.1.0"
+description = "Autonomous multi-agent triad CLI (Antigravity / Claude Code / Codex / Hermes orchestration)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "bandit>=1.7",
+]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 200
+
+[tool.ruff.lint]
+# Start conservative: catch real bugs (undefined names, unused imports,
+# broken f-strings) without relitigating this codebase's existing style.
+select = ["E9", "F"]
+
+[tool.bandit]
+# Test fixtures intentionally do things (chmod, live urlopen calls to
+# loopback test servers) that would be findings in application code but
+# aren't representative of it; scan triad/ but not triad/tests.
+exclude_dirs = ["triad/tests"]
+
+[project.scripts]
+triad = "triad.triad_engine:main"
+
+[tool.setuptools]
+packages = ["triad", "triad.bench"]
