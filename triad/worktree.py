@@ -9,6 +9,7 @@ Provides high-reliability ephemeral git worktree lifecycle management on Windows
 
 import sys
 import os
+import re
 import stat
 import shutil
 import subprocess
@@ -289,6 +290,8 @@ def _get_provisioned_manifest_path(worktree_path: Union[str, Path]) -> Path:
     if admin_dir and admin_dir.is_dir():
         return admin_dir / "triad_provisioned_manifest.json"
     h = hashlib.sha256(str(_clean_path(wt)).encode("utf-8")).hexdigest()[:16]
+    if not re.fullmatch(r"[0-9a-f]{16}", h):
+        raise ValueError("Computed manifest hash was not a well-formed hex digest")
     return Path(tempfile.gettempdir()) / f"triad_provisioned_{h}.json"
 
 

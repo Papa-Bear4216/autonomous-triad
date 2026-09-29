@@ -515,6 +515,8 @@ def acquire_repo_mutation_lock(repo_root: Union[str, Path]):
         if lock_file is None:
             import hashlib
             h = hashlib.sha256(str(repo_path).encode("utf-8")).hexdigest()[:12]
+            if not re.fullmatch(r"[0-9a-f]{12}", h):
+                raise ValueError("Computed mutation-lock hash was not a well-formed hex digest")
             lock_file = Path(tempfile.gettempdir()) / f"triad_mutation_{h}.lock"
 
     lock_file.parent.mkdir(parents=True, exist_ok=True)
