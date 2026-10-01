@@ -1274,6 +1274,16 @@ def _rollback(entries: Dict[Path, Dict[str, Any]], target_dir: Path) -> bool:
                                     print(f"⚠️ [Triad Conflict] File {p} replaced by new inode prior to unlink. Preserving file.", file=sys.stderr)
                                     all_clean = False
                                     continue
+                            # A recreated file always gets a fresh ctime, even on
+                            # filesystems that immediately reuse the freed inode
+                            # number (tmpfs/overlayfs), which defeats the
+                            # inode/dev check above when the content is identical.
+                            fd_ctime = getattr(fd_st, "st_ctime_ns", None)
+                            post_ctime = getattr(post_close_st, "st_ctime_ns", None)
+                            if fd_ctime is not None and post_ctime is not None and post_ctime != fd_ctime:
+                                print(f"⚠️ [Triad Conflict] File {p} recreated prior to unlink (ctime changed). Preserving file.", file=sys.stderr)
+                                all_clean = False
+                                continue
                             post_close_bytes = p.read_bytes()
                             if post_close_bytes != expected_bytes:
                                 print(f"⚠️ [Triad Conflict] File {p} content mutated immediately prior to unlink. Preserving file.", file=sys.stderr)
