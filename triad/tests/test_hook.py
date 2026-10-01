@@ -4217,12 +4217,11 @@ fi
             self.assertTrue(test_file.exists(), "File must be preserved on disk")
             self.assertEqual(test_file.read_bytes(), mutated_content)
 
-    # Known bug (see PR #1 audit): on filesystems that reuse a freed inode
-    # number immediately (tmpfs/overlayfs -- most containers and CI runners),
-    # an unlink+recreate with identical content defeats both the content-hash
-    # and inode/dev checks in _rollback. Needs a fix that holds a lock across
-    # the whole verify-then-unlink window, not a test change.
-    @unittest.expectedFailure
+    # Fixed: the post-close re-verification in _rollback now also compares
+    # ctime, which a recreated file always refreshes even on filesystems that
+    # immediately reuse the freed inode number (tmpfs/overlayfs). The inode/dev
+    # and content checks alone could not catch an unlink+recreate with
+    # identical content on such filesystems. Kept as a normal regression test.
     def test_rollback_refuses_unlink_on_replacement_inode_after_descriptor_close(self):
         """Verify _rollback refuses destructive removal if file was replaced with a new inode after descriptor close."""
         from triad.triad_engine import _rollback
