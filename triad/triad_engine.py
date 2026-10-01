@@ -1449,6 +1449,16 @@ def _rollback(entries: Dict[Path, Dict[str, Any]], target_dir: Path) -> bool:
                                     print(f"⚠️ [Triad Conflict] File {p} replaced by new inode prior to unlink. Preserving file.", file=sys.stderr)
                                     all_clean = False
                                     continue
+                            # Best-effort guard (not atomic): a recreated file normally gets a fresh
+                            # ctime, which catches an unlink+recreate with identical content on
+                            # filesystems that reuse the freed inode number (tmpfs/overlayfs). Two
+                            # limits: a recreate inside one coarse clock tick can go undetected, and
+                            # on Windows st_ctime is creation time (NTFS tunneling can restore it),
+                            # where the inode/file-ID check above is the effective protection.
+                            if post_close_st.st_ctime_ns != fd_st.st_ctime_ns:
+                                print(f"⚠️ [Triad Conflict] File {p} recreated prior to unlink (ctime changed). Preserving file.", file=sys.stderr)
+                                all_clean = False
+                                continue
                             post_close_bytes = p.read_bytes()
                             if post_close_bytes != expected_bytes:
                                 print(f"⚠️ [Triad Conflict] File {p} content mutated immediately prior to unlink. Preserving file.", file=sys.stderr)

@@ -29,3 +29,12 @@ credentials.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Packaging build artifacts
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/

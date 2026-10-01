@@ -15,6 +15,7 @@ import os
 import sys
 import shutil
 import tempfile
+import time
 import subprocess
 import unittest
 from pathlib import Path
@@ -4189,6 +4190,7 @@ fi
             self.assertTrue(test_file.exists(), "File must be preserved on disk")
             self.assertEqual(test_file.read_bytes(), mutated_content)
 
+    # Invariant: rollback must not unlink a file that was swapped out after its descriptor closed.
     def test_rollback_refuses_unlink_on_replacement_inode_after_descriptor_close(self):
         """Verify _rollback refuses destructive removal if file was replaced with a new inode after descriptor close."""
         from triad.triad_engine import _rollback
@@ -4215,6 +4217,7 @@ fi
                 orig_close(fd)
                 # Inode replacement: delete and recreate file immediately after descriptor closure
                 os.unlink(str(test_file))
+                time.sleep(0.02)  # step past the coarse filesystem clock tick so ctime differs
                 test_file.write_bytes(initial_content)
 
             with patch("os.close", side_effect=injected_close):
