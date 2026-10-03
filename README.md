@@ -2,7 +2,7 @@
 
 > **Autonomous multi-agent collaboration framework with zero incremental API cost, MCP-stripped advisory prompts, circuit-breaker failover, and an adversarial Red/Blue review arena.**
 
-**Status:** v3.3 (2026-10-02) · 291 unit tests passing (1 skipped) · Windows-hardened
+**Status:** v3.3 (2026-10-02) · 292 unit tests passing (1 skipped) · Windows-hardened
 
 ---
 
