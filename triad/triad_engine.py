@@ -17,7 +17,6 @@ import subprocess
 import argparse
 import json
 import tempfile
-import socket
 import shutil
 import uuid
 import time
@@ -42,8 +41,8 @@ try:
     )
     from triad.procutil import kill_process_tree, is_port_open, classify_advisor_response
     from triad.circuit import snapshot_circuits, is_circuit_open, reset_circuit
-    from triad.advisor_manager import query_configured_advisor, get_advisors, get_active_advisor, build_advisor_prompt, advisor_is_ready
-    from triad.worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root, clean_git_env, provision_worktree_dependencies, deprovision_worktree_dependencies, capture_directory_snapshot, get_provisioned_manifest_entries, is_reparse_or_link
+    from triad.advisor_manager import query_configured_advisor, get_advisors, advisor_is_ready
+    from triad.worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root, clean_git_env, provision_worktree_dependencies, capture_directory_snapshot, get_provisioned_manifest_entries, is_reparse_or_link
     from triad.competition import query_competition_council
     from triad.intent_engine import classify_intent, execute_intent
 except ImportError:
@@ -53,8 +52,8 @@ except ImportError:
     )
     from procutil import kill_process_tree, is_port_open, classify_advisor_response
     from circuit import snapshot_circuits, is_circuit_open, reset_circuit
-    from advisor_manager import query_configured_advisor, get_advisors, get_active_advisor, build_advisor_prompt, advisor_is_ready
-    from worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root, clean_git_env, provision_worktree_dependencies, deprovision_worktree_dependencies, capture_directory_snapshot, get_provisioned_manifest_entries, is_reparse_or_link
+    from advisor_manager import query_configured_advisor, get_advisors, advisor_is_ready
+    from worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root, clean_git_env, provision_worktree_dependencies, capture_directory_snapshot, get_provisioned_manifest_entries, is_reparse_or_link
     from competition import query_competition_council
     from intent_engine import classify_intent, execute_intent
 
@@ -428,7 +427,7 @@ def _handle_adversarial_session_result(session: Dict[str, Any]) -> None:
     status = str(session.get("status", "error"))
     verdict = session.get("verdict")
     if not quorum_met:
-        print(f"\n❌ [Adversarial Arena] Quorum failure: insufficient ready advisors for adversarial evaluation.", file=sys.stderr)
+        print("\n❌ [Adversarial Arena] Quorum failure: insufficient ready advisors for adversarial evaluation.", file=sys.stderr)
         sys.exit(1)
     if status != "ok":
         print(f"\n❌ [Adversarial Arena] Adversarial evaluation failed with status: {status}.", file=sys.stderr)
@@ -494,7 +493,7 @@ def cmd_review(args, env: Optional[Dict[str, str]] = None):
             print(f"\n❌ [Competition Mode] Review evaluation failed with status: {session.get('status')}", file=sys.stderr)
             sys.exit(1)
         elif session.get("status") == "degraded" or not session.get("quorum_met"):
-            print(f"\n⚠️ [Competition Mode Warning] Review ran in degraded mode (quorum not met; single-advisor fallback)", file=sys.stderr)
+            print("\n⚠️ [Competition Mode Warning] Review ran in degraded mode (quorum not met; single-advisor fallback)", file=sys.stderr)
         return
 
     print(f"[Triad] Reviewing {len(diff_content.splitlines())} diff lines via Advisory Council (engine={engine})...\n")
@@ -695,11 +694,16 @@ def acquire_repo_mutation_lock(repo_root: Union[str, Path]):
         if lock_file is None:
             import hashlib
             h = hashlib.sha256(str(repo_path).encode("utf-8")).hexdigest()[:12]
+            if not re.fullmatch(r"[0-9a-f]{12}", h):
+                raise ValueError("Computed mutation-lock hash was not a well-formed hex digest")
             lock_file = Path(tempfile.gettempdir()) / f"triad_mutation_{h}.lock"
 
     lock_file.parent.mkdir(parents=True, exist_ok=True)
 
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    # O_NOFOLLOW: this path can fall back to a name derived from a hash of the
+    # repo path inside the shared system temp directory, so it must never
+    # follow a pre-planted symlink there.
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     try:
         fd = os.open(str(lock_file), flags, 0o600)
     except OSError as e:
@@ -1455,7 +1459,9 @@ def _rollback(entries: Dict[Path, Dict[str, Any]], target_dir: Path) -> bool:
                             # limits: a recreate inside one coarse clock tick can go undetected, and
                             # on Windows st_ctime is creation time (NTFS tunneling can restore it),
                             # where the inode/file-ID check above is the effective protection.
-                            if post_close_st.st_ctime_ns != fd_st.st_ctime_ns:
+                            fd_ctime = getattr(fd_st, "st_ctime_ns", None)
+                            post_ctime = getattr(post_close_st, "st_ctime_ns", None)
+                            if fd_ctime is not None and post_ctime is not None and post_ctime != fd_ctime:
                                 print(f"⚠️ [Triad Conflict] File {p} recreated prior to unlink (ctime changed). Preserving file.", file=sys.stderr)
                                 all_clean = False
                                 continue
@@ -2166,9 +2172,9 @@ def fingerprints_match(f1: Dict[str, Any], f2: Dict[str, Any]) -> Tuple[bool, Li
             mutated.append(f"D\t{rel_p}")
         else:
             v2 = f2[rel_p]
-            s1, m1, h1 = v1[0], v1[1], v1[2]
+            s1, _m1, h1 = v1[0], v1[1], v1[2]
             mode1 = v1[3] if len(v1) > 3 else None
-            s2, m2, h2 = v2[0], v2[1], v2[2]
+            s2, _m2, h2 = v2[0], v2[1], v2[2]
             mode2 = v2[3] if len(v2) > 3 else None
             if s1 != s2 or h1 != h2 or (mode1 is not None and mode2 is not None and mode1 != mode2):
                 desc = f"M\t{rel_p}"
@@ -2550,7 +2556,7 @@ def _run_in_isolated_worktree(
     try:
         post_apply_state = capture_parent_state(repo_root, env=base_env, require_index=False)
         if post_apply_state["index_tree"] != initial_index_tree:
-            print(f"\n❌ [Triad Closed Loop Error] Git index unexpectedly modified during patch application.", file=sys.stderr)
+            print("\n❌ [Triad Closed Loop Error] Git index unexpectedly modified during patch application.", file=sys.stderr)
             sys.exit(1)
     except SystemExit:
         raise
@@ -2836,7 +2842,7 @@ def _check_no_uncommitted_source_dependencies(cwd: Path, exec_env: dict, in_work
 
     if untracked_list:
         if not in_worktree:
-            print(f"\n❌ [Triad Gate BLOCKED] Untracked files present in working directory outside isolation:\n" + "\n".join(untracked_list), file=sys.stderr)
+            print("\n❌ [Triad Gate BLOCKED] Untracked files present in working directory outside isolation:\n" + "\n".join(untracked_list), file=sys.stderr)
             print("Direct gate validation cannot certify the staged index when untracked files exist (tests could pass via uncommitted dependencies).", file=sys.stderr)
             print("Run with 'triad gate --worktree' for isolated ephemeral verification, or stage/ignore the untracked files.", file=sys.stderr)
             sys.exit(1)
@@ -3045,7 +3051,7 @@ def _handle_validation_failure(
     """
     if in_worktree:
         if not _clean_worktree_retry_artifacts(cwd, candidate_tree, exec_env):
-            print(f"\n❌ [Triad Gate Error] Failed to restore worktree baseline before retry.", file=sys.stderr)
+            print("\n❌ [Triad Gate Error] Failed to restore worktree baseline before retry.", file=sys.stderr)
             sys.exit(1)
 
     print(f"\n❌ [Triad Gate: {stage_label}:\n{diag_output}")
@@ -3130,7 +3136,7 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
         # Verify working tree parity with candidate index
         if in_worktree:
             if initial_wt_tree != candidate_tree:
-                print(f"\n❌ [Triad Gate Error] Isolated working tree differs from candidate index.", file=sys.stderr)
+                print("\n❌ [Triad Gate Error] Isolated working tree differs from candidate index.", file=sys.stderr)
                 sys.exit(1)
             # Certify checkout-byte representation in isolated worktree
             wt_mismatches = _verify_checkout_representation(cwd, candidate_tree, exec_env=exec_env)
@@ -3266,7 +3272,7 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                         pass
 
                 if not parent_root and not originating_root:
-                    print(f"\n❌ [Triad Gate Error] Failed to establish parent repository exclusion boundary for Python import isolation.", file=sys.stderr)
+                    print("\n❌ [Triad Gate Error] Failed to establish parent repository exclusion boundary for Python import isolation.", file=sys.stderr)
                     sys.exit(1)
 
                 excluded_roots: List[Path] = []
@@ -3370,7 +3376,7 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
             sys.exit(1)
         ret, post_idx, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=cwd, env=exec_env)
         if ret != 0 or post_idx.strip() != candidate_tree:
-            print(f"\n❌ [Triad Gate BLOCKED] Git index was modified during evaluation.", file=sys.stderr)
+            print("\n❌ [Triad Gate BLOCKED] Git index was modified during evaluation.", file=sys.stderr)
             sys.exit(1)
         _check_no_uncommitted_source_dependencies(cwd, exec_env, in_worktree=in_worktree, stage_name="post-validation")
 
@@ -4356,7 +4362,7 @@ class _HookLock:
 
     def __enter__(self):
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         self.fd = os.open(str(self.lock_file), flags, 0o600)
         deadline = time.monotonic() + self.timeout
         while True:
@@ -4763,7 +4769,7 @@ def cmd_hook(args):
 
             if TRIAD_HOOK_SIGNATURE not in content:
                 if not getattr(args, "force", False):
-                    print(f"[Triad Hook Warning] Existing pre-commit hook was not created by Triad. Use --force to remove.", file=sys.stderr)
+                    print("[Triad Hook Warning] Existing pre-commit hook was not created by Triad. Use --force to remove.", file=sys.stderr)
                     sys.exit(1)
                 # Force removal of an unsigned third-party hook without touching any historical backups
                 try:
@@ -4954,8 +4960,8 @@ def cmd_hook(args):
                 if content.replace("\r\n", "\n").strip() != expected_template.replace("\r\n", "\n").strip():
                     if not force_restore:
                         print(
-                            f"[Triad Hook Warning] Standalone pre-commit hook contains user modifications made after installation.\n"
-                            f"Refusing to uninstall without --force to prevent data loss.",
+                            "[Triad Hook Warning] Standalone pre-commit hook contains user modifications made after installation.\n"
+                            "Refusing to uninstall without --force to prevent data loss.",
                             file=sys.stderr
                         )
                         sys.exit(1)

@@ -10,20 +10,15 @@ Zero-cost, ultra-fast intent classification and autonomous routing across:
 """
 
 import sys
-import os
 import re
-import json
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, Any, Optional, List, Iterable, Pattern
+from typing import Dict, Any, Optional, Iterable, Pattern
 
 try:
     from triad.paths import MEM0_SCRIPT, ANDROID_RELAY_ENV, PORT_HERMES_RELAY, PORT_PIECES_OS, PORT_OLLAMA
-    from triad.procutil import is_port_open
 except ImportError:
     from paths import MEM0_SCRIPT, ANDROID_RELAY_ENV, PORT_HERMES_RELAY, PORT_PIECES_OS, PORT_OLLAMA
-    from procutil import is_port_open
 
 # Ensure UTF-8 console output
 if hasattr(sys.stdout, "reconfigure"):
@@ -405,7 +400,8 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
         pieces_reachable = False
         try:
             import urllib.request
-            with urllib.request.urlopen(f"http://127.0.0.1:{PORT_PIECES_OS}/.well-known/health", timeout=2.0) as resp:
+            # B310 suppressed below: local healthcheck on trusted loopback port, no injection surface
+            with urllib.request.urlopen(f"http://127.0.0.1:{PORT_PIECES_OS}/.well-known/health", timeout=2.0) as resp:  # nosec B310
                 if resp.status == 200:
                     pieces_reachable = True
                     print(f"✓ PiecesOS core daemon is reachable on port {PORT_PIECES_OS}.")

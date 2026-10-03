@@ -19,7 +19,7 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 
-from triad.server import TriadRequestHandler, get_telemetry_summary
+from triad.server import TriadRequestHandler
 
 
 def find_free_port() -> int:
@@ -207,7 +207,6 @@ class TestTriadServer(unittest.TestCase):
 
     def test_action_endpoints(self):
         import os
-        import tempfile
         from unittest.mock import patch
 
         # 1. When SERVER_TOKEN is unset, action endpoints must fail closed (401)

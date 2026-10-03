@@ -9,7 +9,7 @@ import json
 import io
 import os
 import urllib.error
-from triad.nous_bridge import get_nous_token, query_nous, main
+from triad.nous_bridge import get_nous_token, query_nous
 
 
 class TestNousBridge(unittest.TestCase):

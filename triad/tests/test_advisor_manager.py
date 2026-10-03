@@ -10,8 +10,7 @@ Verifies:
 """
 
 import os
-import sys
-import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,7 +23,6 @@ from triad.advisor_manager import (
     add_advisor,
     save_config,
     expand_env_value,
-    DEFAULT_CONFIG_PATH,
 )
 
 
@@ -102,6 +100,10 @@ class TestAdvisorManager(unittest.TestCase):
         self.assertIn("[Mock Advisor]", resp)
         self.assertIn("characters", resp)
 
+    @unittest.skipUnless(
+        shutil.which("claude"),
+        "requires a local, authenticated Claude Code CLI on PATH -- not available in CI",
+    )
     def test_query_configured_advisor_claude(self):
         """Verify live querying of Claude Code advisor."""
         resp = query_configured_advisor("claude", "Respond with OK", timeout=30)

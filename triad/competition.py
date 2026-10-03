@@ -5,13 +5,12 @@ isolated points, and contradictions, and logs full telemetry.
 """
 
 import sys
-import os
 import re
 import json
 import time
 import hashlib
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Tuple, List, Optional
 
 try:
@@ -41,8 +40,8 @@ DEFAULT_LABELS = {"claude": "Claude Code", "codex": "OpenAI Codex"}
 
 
 def hash_content(text: str) -> str:
-    """Generate MD5 hash of diff or prompt for session correlation."""
-    return hashlib.md5((text or "").encode("utf-8")).hexdigest()[:12]
+    """Generate a hash of diff or prompt for session correlation (non-security use)."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
 
 
 def _ready_production_names() -> List[str]:

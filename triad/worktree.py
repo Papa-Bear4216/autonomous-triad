@@ -9,6 +9,7 @@ Provides high-reliability ephemeral git worktree lifecycle management on Windows
 
 import sys
 import os
+import re
 import stat
 import shutil
 import subprocess
@@ -252,6 +253,36 @@ def _get_worktree_admin_dir(worktree_path: Union[str, Path]) -> Optional[Path]:
     return None
 
 
+def _write_text_no_follow(path: Path, content: str, encoding: str = "utf-8") -> None:
+    """
+    Write text to `path` without ever following an existing symlink.
+    `path` may live in a shared, world-writable directory (e.g. the system temp
+    dir) under a name derived from a hash of the worktree path, so it is not
+    safe to assume nothing else can have pre-created it as a symlink pointing
+    somewhere sensitive. Refuses (raises OSError) rather than writing through
+    a symlink.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        # O_NOFOLLOW only blocks a symlink; it doesn't stop something else
+        # from having pre-created a real file at this path in the shared
+        # temp directory. On POSIX, refuse to write (and O_TRUNC away the
+        # contents of) a file this process doesn't own before truncating it.
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"Refusing to write to non-regular file: {path}")
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            raise OSError(f"Refusing to write to a file owned by another user: {path}")
+        os.ftruncate(fd, 0)
+        f = os.fdopen(fd, "w", encoding=encoding)
+    except BaseException:
+        os.close(fd)
+        raise
+    with f:
+        f.write(content)
+
+
 def _get_provisioned_manifest_path(worktree_path: Union[str, Path]) -> Path:
     """Resolve the location of the provisioned dependency manifest OUTSIDE the worktree checkout."""
     wt = Path(worktree_path).resolve()
@@ -259,6 +290,8 @@ def _get_provisioned_manifest_path(worktree_path: Union[str, Path]) -> Path:
     if admin_dir and admin_dir.is_dir():
         return admin_dir / "triad_provisioned_manifest.json"
     h = hashlib.sha256(str(_clean_path(wt)).encode("utf-8")).hexdigest()[:16]
+    if not re.fullmatch(r"[0-9a-f]{16}", h):
+        raise ValueError("Computed manifest hash was not a well-formed hex digest")
     return Path(tempfile.gettempdir()) / f"triad_provisioned_{h}.json"
 
 
@@ -536,7 +569,7 @@ def _check_dependency_graph_compatibility(parent_root: Path, wt_root: Path) -> T
                     p_deps = {k: p_data.get(k) for k in dep_keys}
                     w_deps = {k: w_data.get(k) for k in dep_keys}
                     if p_deps != w_deps:
-                        return False, f"Candidate package.json dependencies differ from parent installation"
+                        return False, "Candidate package.json dependencies differ from parent installation"
                 except Exception:
                     if p_file.read_bytes() != w_file.read_bytes():
                         return False, f"Candidate {name} differs from parent"
@@ -751,7 +784,7 @@ def provision_worktree_dependencies(repo_root: Union[str, Path], worktree_path: 
                 "worktree": str(_clean_path(wt)),
                 "entries": manifest
             }
-            manifest_file.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+            _write_text_no_follow(manifest_file, json.dumps(manifest_payload, indent=2))
         except Exception:
             pass
 
