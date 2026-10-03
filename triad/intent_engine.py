@@ -16,7 +16,14 @@ import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Iterable, Pattern
+
+try:
+    from triad.paths import MEM0_SCRIPT, ANDROID_RELAY_ENV, PORT_HERMES_RELAY, PORT_PIECES_OS, PORT_OLLAMA
+    from triad.procutil import is_port_open
+except ImportError:
+    from paths import MEM0_SCRIPT, ANDROID_RELAY_ENV, PORT_HERMES_RELAY, PORT_PIECES_OS, PORT_OLLAMA
+    from procutil import is_port_open
 
 # Ensure UTF-8 console output
 if hasattr(sys.stdout, "reconfigure"):
@@ -56,6 +63,8 @@ STACK_TRACE_PATTERNS = [
 HIGH_STAKES_KEYWORDS = {
     "auth", "authentication", "authorization", "oauth", "jwt", "crypto",
     "password", "secret", "private key", "database migration", "schema migration",
+    "db migration", "db-migration", "auth token", "api token", "access token",
+    "auth-token", "api-token", "access-token",
     "rls", "row level security", "concurrency", "deadlock", "race condition",
     "stripe", "billing", "payment", "pci", "data loss", "irreversible"
 }
@@ -66,10 +75,13 @@ GATE_KEYWORDS = [
     "precommit", "verification pipeline"
 ]
 
+# NOTE: bare "notification" was deliberately removed - it routed UI work such as
+# "add a toast notification component" to the phone bridge.
 DEVICE_KEYWORDS = [
-    "phone", "android", "sms", "text message", "notification",
+    "phone", "android", "sms", "text message", "push notification",
     "device bridge", "mobile relay", "port 8766", "galaxy s26",
-    "tap screen", "launch app on phone", "read notification", "send text"
+    "tap screen", "launch app on phone", "read notification", "send text",
+    "notification shade", "adb",
 ]
 
 MEMORY_KEYWORDS = [
@@ -78,8 +90,10 @@ MEMORY_KEYWORDS = [
     "mem0 query", "what was worked on", "past work"
 ]
 
+# Bare "doctor" is intentionally absent: it matched domain text like "doctors office".
 DOCTOR_KEYWORDS = [
-    "triad doctor", "doctor", "system health", "platform health",
+    "triad doctor", "run doctor", "run the doctor", "doctor check",
+    "system health", "platform health", "health audit",
     "system audit", "subsystem status", "check connections",
     "audit subscriptions", "verify platforms"
 ]
@@ -99,18 +113,105 @@ REVIEW_KEYWORDS = [
 DEBUG_KEYWORDS = [
     "why is this failing", "why did this fail", "debug this",
     "fix this error", "diagnose error", "fix crash", "how to solve this bug",
-    "what does this error mean", "stack trace"
+    "what does this error mean", "stack trace", "debugging the", "debugging this"
 ]
+
+def _compile_keywords(keywords: Iterable[str], strict_boundary: bool = False, suffixes: str = r"(?:s|es)?") -> Pattern[str]:
+    r"""
+    Build one alternation regex that matches any keyword on word boundaries, tolerating
+    specified inflection suffixes. Strict boundaries (?<![\w-]) prevent partial hits on hyphenated tokens.
+    """
+    parts = sorted({kw.strip().lower() for kw in keywords if kw.strip()}, key=len, reverse=True)
+    alternation = "|".join(re.escape(p).replace(r"\ ", r"\s+") for p in parts)
+    if strict_boundary:
+        return re.compile(rf"(?<![\w-])(?:{alternation}){suffixes}(?![\w-])", re.IGNORECASE)
+    return re.compile(rf"\b(?:{alternation}){suffixes}\b", re.IGNORECASE)
+
+
+MICRO_KEYWORDS = [
+    "format this", "commit message", "generate docstring", "explain lint",
+    "type hint", "sort imports", "generate doc", "ast parse", "regex for"
+]
+
+_GATE_RE = _compile_keywords(GATE_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
+_DEVICE_RE = _compile_keywords(DEVICE_KEYWORDS, strict_boundary=True)
+_MEMORY_RE = _compile_keywords(MEMORY_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
+_DOCTOR_RE = _compile_keywords(DOCTOR_KEYWORDS, strict_boundary=True)
+_ARCHITECT_RE = _compile_keywords(ARCHITECT_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
+_REVIEW_RE = _compile_keywords(REVIEW_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
+_DEBUG_RE = _compile_keywords(DEBUG_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
+_HIGH_STAKES_RE = _compile_keywords(HIGH_STAKES_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
+_MICRO_RE = _compile_keywords(MICRO_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
+
 
 def is_high_stakes(text: str) -> bool:
     """Detect if prompt or context involves sensitive security/database/concurrency domains."""
-    lowered = text.lower()
-    return any(re.search(r"\b" + re.escape(kw) + r"\b", lowered) for kw in HIGH_STAKES_KEYWORDS)
+    return bool(_HIGH_STAKES_RE.search(text or ""))
+
+
+# Soft-score weights preserve the historic first-match precedence when
+# categories do not collide, but let REVIEW/ARCHITECT beat DEVICE so
+# "review the android SMS handler" is not forwarded to the phone bridge.
+_SCORE_WEIGHTS = {
+    "GATE": 6.5,
+    "DEBUG": 6.0,
+    "DOCTOR": 5.5,
+    "MEMORY": 5.0,
+    "REVIEW": 3.5,
+    "ARCHITECT": 3.2,
+    "DEVICE": 2.5,
+}
+
+_INTENT_CONFIDENCE = {
+    "GATE": 0.95,
+    "MEMORY": 0.93,
+    "DEVICE": 0.92,
+    "REVIEW": 0.86,
+    "DOCTOR": 0.94,
+    "DEBUG": 0.88,
+    "ARCHITECT": 0.88,
+}
+
+_INTENT_REASON = {
+    "GATE": "Ground-truth verification gate keywords detected",
+    "MEMORY": "Historical timeline, workstream query, or memory recall keywords detected",
+    "DEVICE": "Mobile phone, SMS, or Android relay bridge keywords detected",
+    "REVIEW": "Code review requested (will extract current git diff)",
+    "DOCTOR": "System health, platform audit, or doctor keywords detected",
+    "DEBUG": "Runtime exception, compiler diagnostics, or debugging keywords detected",
+    "ARCHITECT": "Architectural design inquiry or comparative decision dilemma detected",
+}
+
+_INTENT_MODE = {
+    "GATE": "gate",
+    "MEMORY": "memory",
+    "DEVICE": "device",
+    "REVIEW": "review_diff",
+    "DOCTOR": "doctor",
+    "DEBUG": "debug",
+    "ARCHITECT": "architect",
+    "GENERAL": "general",
+}
+
+_INTENT_ENGINE = {
+    "MEMORY": "pieces",
+    "DEVICE": "hermes",
+    "DOCTOR": "auto",
+}
+
+
+def _council_engine(high_stakes: bool) -> str:
+    return "competition" if high_stakes else "auto"
+
 
 def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[str] = None) -> IntentClassification:
     """
     Classifies raw developer input into a concrete Triad subsystem intent.
     Executes in <1ms with deterministic rule engines and zero external API calls.
+
+    Hard overrides (diff syntax, stack traces) still win outright. Everything
+    else is scored so overlapping keywords pick the higher-value intent
+    instead of whichever regex ran first.
     """
     combined_text = f"{prompt or ''}\n{context or ''}\n{diff or ''}".strip()
     lowered_prompt = (prompt or "").lower().strip()
@@ -120,13 +221,13 @@ def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[s
     has_diff = bool(diff and diff.strip()) or any(p.search(combined_text) for p in DIFF_PATTERNS)
     if has_diff:
         # If diff is paired with an explicit gate request, gate takes precedence
-        if any(kw in lowered_prompt for kw in GATE_KEYWORDS):
+        if _GATE_RE.search(lowered_prompt):
             return IntentClassification(
                 intent="GATE",
                 confidence=0.98,
                 reason="Pre-commit verification keywords detected alongside git diff",
                 suggested_mode="gate",
-                suggested_engine="competition" if high_stakes else "auto",
+                suggested_engine=_council_engine(high_stakes),
                 high_stakes=high_stakes,
                 metadata={"has_diff": True}
             )
@@ -135,98 +236,78 @@ def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[s
             confidence=0.97,
             reason="Unified git diff syntax detected in prompt or context",
             suggested_mode="review_diff",
-            suggested_engine="competition" if high_stakes else "auto",
+            suggested_engine=_council_engine(high_stakes),
             high_stakes=high_stakes,
             metadata={"has_diff": True}
         )
 
-    # 2. Stack Trace / Compiler Error Check
+    # 2. Stack traces are unambiguous - do not let "review this traceback" become REVIEW.
     has_stack_trace = any(p.search(combined_text) for p in STACK_TRACE_PATTERNS)
-    if has_stack_trace or any(kw in lowered_prompt for kw in DEBUG_KEYWORDS):
+    if has_stack_trace:
         return IntentClassification(
             intent="DEBUG",
-            confidence=0.96 if has_stack_trace else 0.88,
+            confidence=0.96,
             reason="Runtime exception, compiler diagnostics, or debugging keywords detected",
             suggested_mode="debug",
-            suggested_engine="competition" if high_stakes else "auto",
+            suggested_engine=_council_engine(high_stakes),
             high_stakes=high_stakes,
-            metadata={"has_stack_trace": has_stack_trace}
+            metadata={"has_stack_trace": True}
         )
 
-    # 3. Pre-Commit Gate / Verification Check
-    if any(kw in lowered_prompt for kw in GATE_KEYWORDS):
+    # 3. Scored soft match. Weights keep historic precedence on non-overlapping
+    #    prompts while letting REVIEW/ARCHITECT beat DEVICE on collisions.
+    scores: Dict[str, float] = {}
+    if _GATE_RE.search(lowered_prompt):
+        scores["GATE"] = _SCORE_WEIGHTS["GATE"]
+    if _DEBUG_RE.search(lowered_prompt):
+        scores["DEBUG"] = _SCORE_WEIGHTS["DEBUG"]
+    if _DOCTOR_RE.search(lowered_prompt):
+        scores["DOCTOR"] = _SCORE_WEIGHTS["DOCTOR"]
+    if _MEMORY_RE.search(lowered_prompt):
+        scores["MEMORY"] = _SCORE_WEIGHTS["MEMORY"]
+    if lowered_prompt.startswith("review") or _REVIEW_RE.search(lowered_prompt):
+        scores["REVIEW"] = _SCORE_WEIGHTS["REVIEW"]
+        if lowered_prompt.startswith("review"):
+            scores["REVIEW"] += 1.5
+    if _ARCHITECT_RE.search(lowered_prompt):
+        scores["ARCHITECT"] = _SCORE_WEIGHTS["ARCHITECT"]
+    if _DEVICE_RE.search(lowered_prompt):
+        scores["DEVICE"] = _SCORE_WEIGHTS["DEVICE"]
+
+    if scores:
+        winner = max(scores, key=lambda k: (scores[k], _SCORE_WEIGHTS.get(k, 0)))
+        meta: Dict[str, Any] = {"scores": scores}
+        if winner == "REVIEW":
+            meta["needs_git_diff"] = True
         return IntentClassification(
-            intent="GATE",
-            confidence=0.95,
-            reason="Ground-truth verification gate keywords detected",
-            suggested_mode="gate",
-            suggested_engine="competition" if high_stakes else "auto",
-            high_stakes=high_stakes
+            intent=winner,
+            confidence=_INTENT_CONFIDENCE.get(winner, 0.80),
+            reason=_INTENT_REASON.get(winner, "Scored intent match"),
+            suggested_mode=_INTENT_MODE.get(winner, "general"),
+            suggested_engine=_INTENT_ENGINE.get(winner, _council_engine(high_stakes)),
+            high_stakes=high_stakes if winner not in ("MEMORY", "DEVICE", "DOCTOR") else False,
+            metadata=meta,
         )
 
-    # 4. Historical Memory & Workstream Recall Check
-    if any(kw in lowered_prompt for kw in MEMORY_KEYWORDS):
+    # 4. Micro-tasks: only evaluated if no higher-precedence intents scored and prompt is not high-stakes
+    # No port probes in classify_intent to preserve the <1ms zero-I/O guarantee.
+    if not high_stakes and _MICRO_RE.search(lowered_prompt):
         return IntentClassification(
-            intent="MEMORY",
-            confidence=0.93,
-            reason="Historical timeline, workstream query, or memory recall keywords detected",
-            suggested_mode="memory",
-            suggested_engine="pieces",
-            high_stakes=False
-        )
-
-    # 5. Mobile / Phone Device Automation Check
-    if any(kw in lowered_prompt for kw in DEVICE_KEYWORDS):
-        return IntentClassification(
-            intent="DEVICE",
-            confidence=0.92,
-            reason="Mobile phone, SMS, or Android relay bridge keywords detected",
-            suggested_mode="device",
-            suggested_engine="hermes",
-            high_stakes=False
-        )
-
-    # 6. Code Review without Embedded Diff (e.g. asking to review working tree or integration points)
-    if lowered_prompt.startswith("review") or any(kw in lowered_prompt for kw in REVIEW_KEYWORDS):
-        return IntentClassification(
-            intent="REVIEW",
-            confidence=0.86,
-            reason="Code review requested (will extract current git diff)",
-            suggested_mode="review_diff",
-            suggested_engine="competition" if high_stakes else "auto",
-            high_stakes=high_stakes,
-            metadata={"needs_git_diff": True}
-        )
-
-    # 7. Triad Doctor / Platform Health Check
-    if any(kw in lowered_prompt for kw in DOCTOR_KEYWORDS):
-        return IntentClassification(
-            intent="DOCTOR",
+            intent="MICRO",
             confidence=0.94,
-            reason="System health, platform audit, or doctor keywords detected",
-            suggested_mode="doctor",
-            suggested_engine="auto",
-            high_stakes=False
+            reason="Low-complexity micro-task routed to Tier-0 local SLM (port 11434)",
+            suggested_mode="general",
+            suggested_engine="ollama",
+            high_stakes=False,
+            metadata={"tier": 0}
         )
 
-    # 8. Architecture / System Design / Consult Check
-    if any(kw in lowered_prompt for kw in ARCHITECT_KEYWORDS):
-        return IntentClassification(
-            intent="ARCHITECT",
-            confidence=0.88,
-            reason="Architectural design inquiry or comparative decision dilemma detected",
-            suggested_mode="architect",
-            suggested_engine="competition" if high_stakes else "auto",
-            high_stakes=high_stakes
-        )
-
-    # 9. General Fallback
     return IntentClassification(
         intent="GENERAL",
         confidence=0.70,
         reason="General development query routed to primary advisory council",
         suggested_mode="general",
-        suggested_engine="competition" if high_stakes else "auto",
+        suggested_engine=_council_engine(high_stakes),
         high_stakes=high_stakes
     )
 
@@ -276,22 +357,30 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
         triad_engine.cmd_debug(args)
         return
 
-    if intent == "ARCHITECT" or intent == "GENERAL":
+    if intent in ("ARCHITECT", "GENERAL", "MICRO"):
         if not getattr(args, "prompt", None):
             setattr(args, "prompt", raw_prompt)
         if classification.suggested_engine == "competition":
             setattr(args, "competition", True)
+        if hasattr(args, "engine") and getattr(args, "engine", "auto") == "auto":
+            if classification.suggested_engine == "ollama":
+                if triad_engine.is_port_open("127.0.0.1", PORT_OLLAMA):
+                    setattr(args, "engine", "ollama")
+                else:
+                    setattr(args, "engine", "auto")
+            elif classification.suggested_engine != "auto":
+                setattr(args, "engine", classification.suggested_engine)
         triad_engine.cmd_consult(args)
         return
 
     if intent == "DEVICE":
         print("[Triad -> Hermes Android Bridge]:")
-        bridge_alive = triad_engine.is_port_open("127.0.0.1", 8766)
+        bridge_alive = triad_engine.is_port_open("127.0.0.1", PORT_HERMES_RELAY)
         if not bridge_alive:
-            print("❌ Android Relay port 8766 is STANDBY (Phone app com.hermesandroid.bridge not dialed in).")
-            print("Ensure android_relay_runner.py is active in C:\\Users\\micha\\android-relay-env\\")
+            print(f"❌ Android Relay port {PORT_HERMES_RELAY} is STANDBY (Phone app com.hermesandroid.bridge not dialed in).")
+            print(f"Ensure android_relay_runner.py is active in {ANDROID_RELAY_ENV}")
         else:
-            print("✓ Android Relay port 8766 is ONLINE.")
+            print(f"✓ Android Relay port {PORT_HERMES_RELAY} is ONLINE.")
         print(f"Forwarding device task to Hermes: {raw_prompt}")
         if triad_engine.HERMES_PATH.exists():
             # Use -z (--oneshot) for script/pipeline single prompt execution
@@ -304,12 +393,11 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
 
     if intent == "MEMORY":
         print(f"[Triad -> Local Memory Hub]: Recalling context for '{raw_prompt}'...")
-        mem0_script = Path(r"C:\Users\micha\.agents\skills\mem0\mem0.js")
         mem0_ran = False
         mem0_success = False
-        if mem0_script.exists():
+        if MEM0_SCRIPT.exists():
             print("\n--- Mem0 Long-Term Memory Recall ---")
-            res = subprocess.run(["node", str(mem0_script), "search", raw_prompt])
+            res = subprocess.run(["node", str(MEM0_SCRIPT), "search", raw_prompt])
             mem0_ran = True
             mem0_success = (res.returncode == 0)
 
@@ -317,19 +405,19 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
         pieces_reachable = False
         try:
             import urllib.request
-            with urllib.request.urlopen("http://127.0.0.1:39300/.well-known/health", timeout=2.0) as resp:
+            with urllib.request.urlopen(f"http://127.0.0.1:{PORT_PIECES_OS}/.well-known/health", timeout=2.0) as resp:
                 if resp.status == 200:
                     pieces_reachable = True
-                    print("✓ PiecesOS core daemon is reachable on port 39300.")
+                    print(f"✓ PiecesOS core daemon is reachable on port {PORT_PIECES_OS}.")
         except Exception:
             pass
 
         if not pieces_reachable:
-            print("Note: PiecesOS port 39300 is standby or busy.")
+            print(f"Note: PiecesOS port {PORT_PIECES_OS} is standby or busy.")
         if mem0_success:
             print("Memory recall completed via Mem0.")
         elif mem0_ran:
             print("Note: Mem0 query completed with no results or errors.")
         else:
-            print("Note: Mem0 script not found at ~/.agents/skills/mem0/mem0.js.")
+            print(f"Note: Mem0 script not found at {MEM0_SCRIPT}.")
         return

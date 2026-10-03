@@ -35,19 +35,25 @@ if hasattr(sys.stderr, "reconfigure"):
 TRIAD_DIR = Path(__file__).resolve().parent
 EMPTY_MCP = TRIAD_DIR / "empty-mcp.json"
 
-CLAUDE_PATH = Path(r"C:\Users\micha\.local\bin\claude.exe")
-CODEX_PATH = Path(r"C:\Users\micha\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe")
-AGY_PATH = Path(r"C:\Users\micha\AppData\Local\agy\bin\agy.exe")
-HERMES_PATH = Path(r"C:\Users\micha\AppData\Local\hermes\bin\hermes.exe")
-CODEX_AUTH = Path(r"C:\Users\micha\.codex\auth.json")
-
 try:
-    from triad.advisor_manager import query_configured_advisor, get_advisors, get_active_advisor
+    from triad.paths import (
+        CLAUDE_PATH, CODEX_PATH, AGY_PATH, HERMES_PATH, CODEX_AUTH,
+        PORT_HERMES_RELAY, PORT_PIECES_OS, PORT_OLLAMA, PORT_TRIAD_SERVER,
+    )
+    from triad.procutil import kill_process_tree, is_port_open, classify_advisor_response
+    from triad.circuit import snapshot_circuits, is_circuit_open, reset_circuit
+    from triad.advisor_manager import query_configured_advisor, get_advisors, get_active_advisor, build_advisor_prompt, advisor_is_ready
     from triad.worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root, clean_git_env, provision_worktree_dependencies, deprovision_worktree_dependencies, capture_directory_snapshot, get_provisioned_manifest_entries, is_reparse_or_link
     from triad.competition import query_competition_council
     from triad.intent_engine import classify_intent, execute_intent
 except ImportError:
-    from advisor_manager import query_configured_advisor, get_advisors, get_active_advisor
+    from paths import (
+        CLAUDE_PATH, CODEX_PATH, AGY_PATH, HERMES_PATH, CODEX_AUTH,
+        PORT_HERMES_RELAY, PORT_PIECES_OS, PORT_OLLAMA, PORT_TRIAD_SERVER,
+    )
+    from procutil import kill_process_tree, is_port_open, classify_advisor_response
+    from circuit import snapshot_circuits, is_circuit_open, reset_circuit
+    from advisor_manager import query_configured_advisor, get_advisors, get_active_advisor, build_advisor_prompt, advisor_is_ready
     from worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root, clean_git_env, provision_worktree_dependencies, deprovision_worktree_dependencies, capture_directory_snapshot, get_provisioned_manifest_entries, is_reparse_or_link
     from competition import query_competition_council
     from intent_engine import classify_intent, execute_intent
@@ -61,74 +67,42 @@ except Exception:
         def notify_event(*args, **kwargs):
             return False
 
-def kill_process_tree(pid: int):
-    """Force kill a process and all its descendants on Windows."""
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5
-        )
-    except Exception:
-        pass
+# Node toolchain launchers: on Windows the npm-provided shims are .cmd files which
+# CreateProcess will not execute without the extension.
+NPX_CMD = "npx.cmd" if os.name == "nt" else "npx"
+NPM_CMD = "npm.cmd" if os.name == "nt" else "npm"
 
-def build_advisor_prompt(prompt: str, context: str = None, diff: str = None, mode: str = "general") -> str:
-    system_preamble = (
-        "You are the Lead Architect and Code Reviewer acting as the autonomous advisory council to Antigravity (the primary coding agent).\n"
-        "Antigravity has already handled the broad workspace and heavy context ingestion.\n"
-        "You are strictly in Advisory mode. Provide direct, high-density analysis, exact code snippets, or architectural flags.\n"
-    )
-
-    if mode == "review_diff":
-        return (
-            f"{system_preamble}\n"
-            "TASK: Review this git diff for subtle bugs, race conditions, edge cases, type soundness, and architectural regressions.\n\n"
-            f"DIFF:\n```\n{diff or context or ''}\n```\n\n"
-            f"ADDITIONAL CONTEXT / GOAL:\n{prompt}\n"
-        )
-    elif mode == "architect":
-        return (
-            f"{system_preamble}\n"
-            "TASK: Evaluate this architectural proposal / design. Spot missing edge cases, security risks, or scalability flaws, and suggest the optimal pattern.\n\n"
-            f"PROPOSAL / PROBLEM:\n{prompt}\n\n"
-            f"CONTEXT:\n{context or ''}\n"
-        )
-    elif mode == "debug":
-        return (
-            f"{system_preamble}\n"
-            "TASK: Diagnose this persistent error. Identify the root cause and provide the cleanest surgical fix.\n\n"
-            f"ERROR / PROBLEM:\n{prompt}\n\n"
-            f"SNIPPET / CONTEXT:\n{context or ''}\n"
-        )
-    else:
-        return f"{system_preamble}\nQUERY:\n{prompt}\n\nCONTEXT:\n{context or ''}\n"
-
-def query_claude(prompt: str, context: str = None, diff: str = None, mode: str = "general", timeout: int = 120) -> str:
+def query_claude(prompt: str, context: str = None, diff: str = None, mode: str = "general", timeout: int = 120, track_circuit: bool = True) -> str:
     """Query Claude advisor via configured advisor manager."""
-    return query_configured_advisor("claude", prompt, context=context, diff=diff, mode=mode, timeout=timeout)
+    return query_configured_advisor("claude", prompt, context=context, diff=diff, mode=mode, timeout=timeout, track_circuit=track_circuit)
 
-def query_codex(prompt: str, context: str = None, diff: str = None, mode: str = "general", timeout: int = 120) -> str:
+def query_codex(prompt: str, context: str = None, diff: str = None, mode: str = "general", timeout: int = 120, track_circuit: bool = True) -> str:
     """Query OpenAI Codex advisor via configured advisor manager."""
-    return query_configured_advisor("codex", prompt, context=context, diff=diff, mode=mode, timeout=timeout)
+    return query_configured_advisor("codex", prompt, context=context, diff=diff, mode=mode, timeout=timeout, track_circuit=track_circuit)
 
-def query_advisory_council(prompt: str, context: str = None, diff: str = None, mode: str = "general", engine: str = "auto", timeout: int = 180) -> str:
+def query_advisory_council(prompt: str, context: str = None, diff: str = None, mode: str = "general", engine: str = "auto", timeout: int = 180, track_circuit: bool = True) -> str:
     """
     Autonomous Advisory Council with zero-downtime failover and dynamic advisor routing:
     Delegates to configured advisors via advisor_manager.
     """
     target = "claude" if engine == "bare_single" else engine
-    return query_configured_advisor(target, prompt, context=context, diff=diff, mode=mode, timeout=timeout)
+    return query_configured_advisor(target, prompt, context=context, diff=diff, mode=mode, timeout=timeout, track_circuit=track_circuit)
 
 def get_git_diff(cached: bool = False, head: bool = False, env: Optional[Dict[str, str]] = None, cwd: Optional[Path] = None, binary: bool = False) -> str:
-    """Retrieve git diff from current repository, bypassing external diff drivers and textconv filters."""
+    """
+    Retrieve git diff from current repository, bypassing external diff drivers and textconv filters.
+
+    ``cached`` -> staged changes vs HEAD; ``head`` -> the most recent commit (HEAD~1..HEAD),
+    *not* the working tree against HEAD~1 - that would silently fold uncommitted edits into a
+    "review the last commit" request.
+    """
     cmd = ["git", "diff", "--no-color", "--no-ext-diff", "--no-textconv"]
     if binary:
         cmd.append("--binary")
     if cached:
         cmd.append("--cached")
     elif head:
-        cmd.append("HEAD~1")
+        cmd.extend(["HEAD~1", "HEAD"])
 
     # Only sanitize Git env when crossing into ephemeral worktrees or explicitly requested.
     # Preserve caller env (including alternate GIT_INDEX_FILE) for direct workspace operations.
@@ -148,142 +122,322 @@ def get_git_diff(cached: bool = False, head: bool = False, env: Optional[Dict[st
         raise RuntimeError(f"git diff failed (exit code {res.returncode}): {res.stderr.strip() or res.stdout.strip()}")
     return res.stdout.strip()
 
-def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
-    """Quick TCP connect check with guaranteed socket cleanup."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+def _decode_codex_auth(auth_path: Path) -> Dict[str, Any]:
+    """
+    Inspect the Codex OAuth cache without touching the network. Returns plan metadata
+    and a computed ``status`` of ``active`` / ``expired`` / ``unknown`` / ``missing``.
+    """
+    info: Dict[str, Any] = {"status": "missing", "plan": None, "active_until": None}
+    if not auth_path.exists():
+        return info
     try:
-        s.connect((host, port))
-        return True
-    except Exception:
-        return False
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        import base64
+        from datetime import datetime, timezone
+        with open(auth_path, "r", encoding="utf-8") as f:
+            auth_data = json.load(f)
+        id_token = (auth_data.get("tokens") or {}).get("id_token", "")
+        info["status"] = "unknown"
+        parts = id_token.split(".") if id_token else []
+        if len(parts) >= 2:
+            padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace"))
+            auth_meta = payload.get("https://api.openai.com/auth", {})
+            info["plan"] = auth_meta.get("chatgpt_plan_type")
+            until_raw = auth_meta.get("chatgpt_subscription_active_until")
+            if until_raw:
+                info["active_until"] = str(until_raw)[:10]
+                try:
+                    until_dt = datetime.fromisoformat(str(until_raw).replace("Z", "+00:00"))
+                    if until_dt.tzinfo is None:
+                        until_dt = until_dt.replace(tzinfo=timezone.utc)
+                    info["status"] = "active" if until_dt >= datetime.now(timezone.utc) else "expired"
+                except ValueError:
+                    info["status"] = "unknown"
+    except Exception as e:
+        info["status"] = "unknown"
+        info["error"] = str(e)
+    return info
 
-def cmd_doctor(args):
-    """Run full diagnostic audit across all 5 platform layers."""
+
+def collect_doctor_report(probe_advisors: bool = True, claude_probe_timeout: int = 15) -> Dict[str, Any]:
+    """
+    Gather the health of every Triad layer as structured data (no printing).
+
+    ``probe_advisors=False`` skips the live Claude round-trip, which otherwise spends a
+    Claude Pro turn on every ``triad doctor`` run.
+    """
+    advisors = get_advisors()
+    by_name = {a.get("name"): a for a in advisors}
+
+    # 1. Antigravity
+    agy = {"binary": str(AGY_PATH), "present": AGY_PATH.exists()}
+
+    # 2. Claude Code
+    claude_cfg = by_name.get("claude", {})
+    claude_ready, _ = advisor_is_ready(claude_cfg) if claude_cfg else (False, "")
+    claude_bin = str(claude_cfg.get("binary_path") or CLAUDE_PATH)
+    claude = {
+        "binary": claude_bin,
+        "present": claude_ready or CLAUDE_PATH.exists(),
+        "enabled": bool(claude_cfg.get("enabled", False)),
+        "probe": "skipped",
+        "probe_detail": "",
+    }
+    if probe_advisors and claude["present"] and claude["enabled"]:
+        resp = query_claude("Respond with OK", timeout=claude_probe_timeout, track_circuit=False)
+        kind = classify_advisor_response(resp)
+        if kind == "limit":
+            claude["probe"] = "limit"
+        elif kind == "ok" and "OK" in resp:
+            claude["probe"] = "online"
+        else:
+            claude["probe"] = "error"
+        claude["probe_detail"] = resp.strip()[:160]
+    elif not claude["present"]:
+        claude["probe"] = "missing"
+
+    # 3. Codex
+    codex_cfg = by_name.get("codex", {})
+    codex_ready, _ = advisor_is_ready(codex_cfg) if codex_cfg else (False, "")
+    codex_bin = str(codex_cfg.get("binary_path") or CODEX_PATH)
+    codex = {
+        "binary": codex_bin,
+        "present": codex_ready or CODEX_PATH.exists(),
+        "enabled": bool(codex_cfg.get("enabled", False)),
+        "auth_file": str(CODEX_AUTH),
+    }
+    codex.update(_decode_codex_auth(CODEX_AUTH))
+    codex_has_key = bool(
+        os.environ.get("OPENAI_API_KEY", "").strip()
+        or os.environ.get("CODEX_API_KEY", "").strip()
+        or (codex_cfg.get("env") or {}).get("OPENAI_API_KEY")
+        or (codex_cfg.get("env") or {}).get("CODEX_API_KEY")
+    )
+    codex["has_api_key"] = codex_has_key
+
+    # 4. Hermes / Nous
+    nous_authed = False
+    general_cascade: List[str] = []
+    nous_error = ""
+    try:
+        try:
+            from triad.nous_bridge import get_nous_token, TASK_MODEL_CASCADES
+        except ImportError:
+            from nous_bridge import get_nous_token, TASK_MODEL_CASCADES
+        nous_authed = bool(get_nous_token())
+        general_cascade = list(TASK_MODEL_CASCADES.get("general", []))
+    except Exception as e:
+        nous_error = str(e)
+    nous_cfg = by_name.get("nous", {})
+    hermes = {
+        "binary": str(HERMES_PATH),
+        "present": HERMES_PATH.exists(),
+        "nous_authed": nous_authed,
+        "nous_enabled": bool(nous_cfg.get("enabled", False)),
+        "nous_priority": nous_cfg.get("priority"),
+        "nous_lead_model": general_cascade[0] if general_cascade else None,
+        "nous_error": nous_error,
+        "relay_port": PORT_HERMES_RELAY,
+        "relay_listening": is_port_open("127.0.0.1", PORT_HERMES_RELAY),
+    }
+
+    # 5. Local subsystems
+    local = {
+        "pieces_os": {"port": PORT_PIECES_OS, "online": is_port_open("127.0.0.1", PORT_PIECES_OS)},
+        "ollama": {"port": PORT_OLLAMA, "online": is_port_open("127.0.0.1", PORT_OLLAMA)},
+        "triad_server": {"port": PORT_TRIAD_SERVER, "online": is_port_open("127.0.0.1", PORT_TRIAD_SERVER)},
+    }
+
+    circuits = snapshot_circuits()
+    open_circuits = {
+        name for name, entry in (circuits.get("advisors") or {}).items()
+        if isinstance(entry, dict) and entry.get("state") == "open"
+    }
+
+    # Aggregate: the council is healthy if at least one enabled advisor is usable
+    # and not sitting behind an open circuit.
+    usable: List[str] = []
+    prod_advisors = get_advisors(enabled_only=True, production_only=True)
+    for adv in prod_advisors:
+        name = str(adv.get("name") or "")
+        if not name or name in open_circuits or is_circuit_open(name):
+            continue
+        ready, _ = advisor_is_ready(adv)
+        if not ready:
+            continue
+        if name == "claude" and claude["probe"] in ("error", "limit", "missing"):
+            continue
+        if name == "codex":
+            # Only exclude codex if definitely expired and has no api key, or missing auth and has no api key
+            if codex["status"] == "expired" and not codex["has_api_key"]:
+                continue
+            if codex["status"] == "missing" and not codex["has_api_key"]:
+                continue
+        if name == "nous" and not hermes["nous_authed"]:
+            continue
+        usable.append(name)
+
+    warnings: List[str] = []
+    if claude["probe"] == "limit" or is_circuit_open("claude"):
+        warnings.append("Claude Code is at its session limit; failover to the next advisor is armed.")
+    if claude["probe"] == "error":
+        warnings.append(f"Claude Code probe failed: {claude['probe_detail']}")
+    if codex["enabled"] and codex["status"] == "expired" and not codex["has_api_key"]:
+        warnings.append(f"Codex ChatGPT subscription appears expired (active until {codex['active_until']}).")
+    if codex["enabled"] and codex["status"] == "missing" and not codex["has_api_key"]:
+        warnings.append(f"Codex auth cache not found at {CODEX_AUTH}; run 'codex login' or set OPENAI_API_KEY.")
+    if codex["enabled"] and codex["status"] == "unknown" and not codex["has_api_key"]:
+        warnings.append("Codex authentication is unverified; operating with session cache.")
+    if hermes["nous_enabled"] and not hermes["nous_authed"]:
+        warnings.append("Nous advisor is enabled but no NOUS_API_KEY / Hermes auth.json token was found.")
+    for name, entry in (circuits.get("advisors") or {}).items():
+        if isinstance(entry, dict) and entry.get("state") == "open":
+            rem = entry.get("remaining_seconds", 0)
+            warnings.append(f"Advisor '{name}' circuit is open ({entry.get('reason')}, {rem}s remaining).")
+
+    return {
+        "healthy": bool(usable),
+        "usable_advisors": usable,
+        "warnings": warnings,
+        "antigravity": agy,
+        "claude": claude,
+        "codex": codex,
+        "hermes": hermes,
+        "local": local,
+        "circuits": circuits,
+    }
+
+
+def _render_doctor_report(report: Dict[str, Any]) -> None:
+    def flag(ok: bool, yes: str = "OK", no: str = "MISSING") -> str:
+        return yes if ok else no
+
     print("================================================================================")
     print("           AUTONOMOUS MULTI-AGENT TRIAD: SYSTEM HEALTH & COST AUDIT              ")
     print("================================================================================")
-    print(f"Policy: STRICT ZERO INCREMENTAL COST (Flat-rate subscriptions & local execution)\n")
+    print("Policy: STRICT ZERO INCREMENTAL COST (Flat-rate subscriptions & local execution)\n")
 
-    # 1. Antigravity
+    agy = report["antigravity"]
     print("[1] Antigravity (Executive Engine & Context Shield)")
-    if AGY_PATH.exists():
-        print(f"    - Binary:       {AGY_PATH} (OK)")
-    else:
-        print(f"    - Binary:       agy (PATH check)")
-    print(f"    - Context:      Up to 2,000,000 tokens")
-    print(f"    - Billing:      $0 extra (Included in Antigravity IDE access)")
+    print(f"    - Binary:       {agy['binary']} ({flag(agy['present'])})")
+    print("    - Context:      Up to 2,000,000 tokens")
+    print("    - Billing:      $0 extra (Included in Antigravity IDE access)")
 
-    # 2. Claude Code
+    c = report["claude"]
     print("\n[2] Claude Code (Chief Architect & Diff Verifier)")
-    if CLAUDE_PATH.exists():
-        print(f"    - Binary:       {CLAUDE_PATH} (OK)")
-    else:
-        print(f"    - Binary:       claude (PATH check)")
-    print(f"    - Subscription: Claude Pro (Flat-rate, $0 extra API cost)")
-    # Quick probe
-    quick_test = query_claude("Respond with OK", timeout=15)
-    if "session limit" in quick_test.lower() or "rate limit" in quick_test.lower():
-        print(f"    - Status:       PAUSED [Session Limit Hit] -> Auto-Failover to Codex active")
-        print(f"                    ({quick_test.strip()})")
-    elif "OK" in quick_test:
-        print(f"    - Status:       ONLINE & READY")
-    else:
-        print(f"    - Status:       {quick_test.strip()[:80]}")
+    print(f"    - Binary:       {c['binary']} ({flag(c['present'])})")
+    print(f"    - Subscription: Claude Pro (Flat-rate, $0 extra API cost) | advisors.json enabled={c['enabled']}")
+    probe_text = {
+        "online": "ONLINE & READY",
+        "limit": "PAUSED [Session Limit Hit] -> Auto-Failover armed",
+        "error": f"ERROR ({c['probe_detail']})",
+        "skipped": "NOT PROBED (--quick)",
+        "missing": "BINARY NOT FOUND",
+    }.get(c["probe"], c["probe"])
+    print(f"    - Status:       {probe_text}")
 
-    # 3. OpenAI Codex
+    x = report["codex"]
     print("\n[3] OpenAI Codex (High-Availability Failover Advisor)")
-    if CODEX_PATH.exists():
-        print(f"    - Binary:       {CODEX_PATH} (OK)")
+    print(f"    - Binary:       {x['binary']} ({flag(x['present'])})")
+    if x["status"] == "missing":
+        print(f"    - Status:       Auth config not found at {x['auth_file']}")
     else:
-        print(f"    - Binary:       codex (PATH check)")
-    if CODEX_AUTH.exists():
-        try:
-            with open(CODEX_AUTH, "r", encoding="utf-8") as f:
-                auth_data = json.load(f)
-            # Find expiry date if present
-            exp_str = "Active"
-            tokens = auth_data.get("tokens", {})
-            id_token = tokens.get("id_token", "")
-            if id_token:
-                # Basic JWT claim preview if parseable
-                import base64
-                parts = id_token.split(".")
-                if len(parts) >= 2:
-                    padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
-                    payload = json.loads(base64.b64decode(padded).decode("utf-8", errors="replace"))
-                    auth_meta = payload.get("https://api.openai.com/auth", {})
-                    plan = auth_meta.get("chatgpt_plan_type", "plus")
-                    exp_until = auth_meta.get("chatgpt_subscription_active_until", "Active")
-                    print(f"    - Plan:         ChatGPT {plan.capitalize()} (Active until {exp_until[:10]})")
-            print(f"    - Mode:         chatgpt OAuth via WebSockets")
-            print(f"    - Model:        gpt-6-astra / gpt-5.6-terra")
-            print(f"    - Billing:      $0 extra (Included in ChatGPT Plus subscription)")
-            print(f"    - Status:       ONLINE & VERIFIED")
-        except Exception as e:
-            print(f"    - Status:       Configured ({e})")
-    else:
-        print(f"    - Status:       Auth config not found at {CODEX_AUTH}")
+        plan = (x.get("plan") or "plus").capitalize()
+        until = x.get("active_until") or "unknown"
+        print(f"    - Plan:         ChatGPT {plan} (active until {until})")
+        print("    - Mode:         chatgpt OAuth via WebSockets")
+        print("    - Billing:      $0 extra (Included in ChatGPT subscription)")
+        print(f"    - Status:       {x['status'].upper()} | advisors.json enabled={x['enabled']}")
 
-    # 4. Hermes Agent & Nous Research Portal
+    h = report["hermes"]
     print("\n[4] Hermes Agent & Nous Research (Device Specialist & Advisory Member)")
-    if HERMES_PATH.exists():
-        print(f"    - Binary:       {HERMES_PATH} (OK)")
-    print(f"    - Model:        stepfun/step-3.7-flash:free (Nous Portal, $0 cost)")
-
-    try:
-        from triad.nous_bridge import get_nous_token, TASK_MODEL_CASCADES
-    except ImportError:
-        try:
-            from nous_bridge import get_nous_token, TASK_MODEL_CASCADES
-        except ImportError as e:
-            get_nous_token = None
-            TASK_MODEL_CASCADES = {}
-            print(f"    - Nous Auth:    ERROR (nous_bridge import failed: {e})")
-
-    if get_nous_token is not None:
-        try:
-            nous_authed = bool(get_nous_token())
-            general_cascade = TASK_MODEL_CASCADES.get("general", [])
-        except Exception as e:
-            print(f"    - Nous Auth:    ERROR (get_nous_token failed: {e})")
-            nous_authed = False
-            general_cascade = []
-        else:
-            print(f"    - Nous Auth:    {'OK (token found)' if nous_authed else 'MISSING (no NOUS_API_KEY / Hermes auth.json entry)'}")
+    print(f"    - Binary:       {h['binary']} ({flag(h['present'])})")
+    if h["nous_lead_model"]:
+        print(f"    - Advisory Lead: {h['nous_lead_model']} (general cascade default, $0 cost)")
+    if h["nous_error"]:
+        print(f"    - Nous Auth:    ERROR ({h['nous_error']})")
     else:
-        nous_authed = False
-        general_cascade = []
+        print(f"    - Nous Auth:    {'OK (token found)' if h['nous_authed'] else 'MISSING (no NOUS_API_KEY / Hermes auth.json entry)'}")
+    advisory_status = "ONLINE" if (h["nous_enabled"] and h["nous_authed"]) else "OFFLINE"
+    print(f"    - Advisory:     {advisory_status} (advisors.json enabled={h['nous_enabled']}, priority {h['nous_priority'] if h['nous_priority'] is not None else 'n/a'})")
+    relay = f"Port {h['relay_port']} LISTENING (Phone bridge connected)" if h["relay_listening"] else f"Port {h['relay_port']} STANDBY (Will accept connection from com.hermesandroid.bridge)"
+    print(f"    - Android Relay: {relay}")
 
-    if general_cascade:
-        print(f"    - Advisory Lead: {general_cascade[0]} (general task default in advisory-council cascade, $0 cost)")
-    nous_adv = next((a for a in get_advisors() if a.get("name") == "nous"), None)
-    nous_enabled = bool(nous_adv and nous_adv.get("enabled"))
-    advisory_status = "ONLINE" if (nous_enabled and nous_authed) else "OFFLINE"
-    print(f"    - Advisory:     {advisory_status} (advisors.json enabled={nous_enabled}, priority {nous_adv.get('priority') if nous_adv else 'n/a'})")
-    print(f"    - Timezone:     America/Chicago")
-    # Check bridge port 8766
-    bridge_open = is_port_open("127.0.0.1", 8766)
-    if bridge_open:
-        print(f"    - Android Relay: Port 8766 LISTENING (Phone bridge connected)")
-    else:
-        print(f"    - Android Relay: Port 8766 STANDBY (Will accept connection from com.hermesandroid.bridge)")
-
-    # 5. Local Infrastructure & Tooling
+    loc = report["local"]
     print("\n[5] Local Subsystems (On-Device Local Memory & Execution)")
-    pieces_open = is_port_open("127.0.0.1", 39300)
-    print(f"    - PiecesOS:     {'ONLINE (Port 39300 responding)' if pieces_open else 'STANDBY (Restored MSIX autostart on user session login)'}")
-    ollama_open = is_port_open("127.0.0.1", 11434)
-    print(f"    - Ollama:       {'ONLINE (Port 11434 responding)' if ollama_open else 'STANDBY (Local on-demand daemon)'}")
+    p = loc["pieces_os"]
+    print(f"    - PiecesOS:     {'ONLINE' if p['online'] else 'STANDBY'} (port {p['port']})")
+    o = loc["ollama"]
+    print(f"    - Ollama:       {'ONLINE' if o['online'] else 'STANDBY'} (port {o['port']})")
+    t = loc["triad_server"]
+    print(f"    - Triad HTTP:   {'LISTENING' if t['online'] else 'NOT RUNNING'} (port {t['port']}, start with 'triad listen')")
+
+    circ = report.get("circuits") or {}
+    print("\n[6] Advisor Circuits (skip open advisors instead of waiting out their timeout)")
+    if not circ.get("enabled", True):
+        print("    - Disabled (TRIAD_CIRCUIT=0)")
+    else:
+        advisors_circ = circ.get("advisors") or {}
+        if not advisors_circ:
+            print("    - All closed (no recent failures)")
+        else:
+            for name, entry in advisors_circ.items():
+                if not isinstance(entry, dict):
+                    continue
+                state = str(entry.get("state") or "closed").upper()
+                if state == "OPEN":
+                    print(f"    - {name}: OPEN ({entry.get('reason')}, {entry.get('remaining_seconds', 0)}s remaining)")
+                else:
+                    print(f"    - {name}: closed")
+        if circ.get("path"):
+            print(f"    - State:        {circ['path']}")
 
     print("\n================================================================================")
-    print("TRIAD AUDIT SUMMARY: ALL SUBSYSTEMS READY. HIGH-AVAILABILITY FAILOVER ARMED.")
+    if report["healthy"]:
+        print(f"TRIAD AUDIT SUMMARY: HEALTHY. Usable advisors: {', '.join(report['usable_advisors'])}.")
+    else:
+        print("TRIAD AUDIT SUMMARY: DEGRADED. No enabled advisor is currently usable.")
+    for w in report["warnings"]:
+        print(f"  ! {w}")
     print("================================================================================\n")
+
+
+def cmd_doctor(args):
+    """
+    Run the diagnostic audit across all platform layers.
+
+    Exit code is 0 when at least one enabled advisor is usable, otherwise 1 - so the
+    command is meaningful in scripts (``scripts/verify.ps1`` previously always succeeded).
+    ``--quick`` skips the live Claude probe; ``--json`` emits the structured report.
+    """
+    if getattr(args, "reset_circuits", False):
+        reset_circuit(None)
+        print("[Triad] Cleared advisor circuit-breaker cooldowns.")
+    quick = bool(getattr(args, "quick", False))
+    report = collect_doctor_report(probe_advisors=not quick)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        _render_doctor_report(report)
+    if not report["healthy"]:
+        sys.exit(1)
+
+def _handle_adversarial_session_result(session: Dict[str, Any]) -> None:
+    """Enforces consistent adversarial arena exit behavior across review, consult, and debug."""
+    quorum_met = bool(session.get("quorum_met", False))
+    status = str(session.get("status", "error"))
+    verdict = session.get("verdict")
+    if not quorum_met:
+        print(f"\n❌ [Adversarial Arena] Quorum failure: insufficient ready advisors for adversarial evaluation.", file=sys.stderr)
+        sys.exit(1)
+    if status != "ok":
+        print(f"\n❌ [Adversarial Arena] Adversarial evaluation failed with status: {status}.", file=sys.stderr)
+        sys.exit(1)
+    if verdict != "RESILIENT":
+        print(f"\n❌ [Adversarial Arena] Red team identified critical vulnerabilities or verdict inconclusive (VERDICT: {verdict or 'UNKNOWN'}).", file=sys.stderr)
+        sys.exit(1)
+    print("\n✅ [Adversarial Arena] Passed adversarial audit (VERDICT: RESILIENT).")
+
 
 def cmd_review(args, env: Optional[Dict[str, str]] = None):
     """Review git diff with the Advisory Council."""
@@ -325,10 +479,22 @@ def cmd_review(args, env: Optional[Dict[str, str]] = None):
         prompt = " ".join(prompt).strip()
     prompt = prompt or "Review this git diff for edge cases, subtle bugs, type soundness, and architectural regressions."
     engine = getattr(args, "engine", "auto")
-    if getattr(args, "competition", False):
-        print(f"[Triad Competition Mode] Evaluating diff via concurrent advisors (Claude Code & OpenAI Codex)...")
-        session = query_competition_council(prompt, diff=diff_content, mode="review_diff")
-        print("\n" + session["synthesis"])
+    competition = getattr(args, "competition", False) or getattr(args, "adversarial", False)
+    if competition:
+        adv_pair = ("mock", "mock") if engine == "mock" else ("claude", "codex")
+        is_adv = bool(getattr(args, "adversarial", False))
+        mode_desc = "Adversarial Red/Blue Arena" if is_adv else "Concurrent Dual Advisors"
+        print(f"[Triad Competition Mode] Evaluating diff via {mode_desc} ({adv_pair[0]} vs {adv_pair[1]})...")
+        session = query_competition_council(prompt, diff=diff_content, mode="review_diff", advisor_names=adv_pair, adversarial=is_adv)
+        synth = session.get("synthesis", "")
+        print("\n" + synth)
+        if is_adv:
+            _handle_adversarial_session_result(session)
+        elif session.get("status") == "error":
+            print(f"\n❌ [Competition Mode] Review evaluation failed with status: {session.get('status')}", file=sys.stderr)
+            sys.exit(1)
+        elif session.get("status") == "degraded" or not session.get("quorum_met"):
+            print(f"\n⚠️ [Competition Mode Warning] Review ran in degraded mode (quorum not met; single-advisor fallback)", file=sys.stderr)
         return
 
     print(f"[Triad] Reviewing {len(diff_content.splitlines())} diff lines via Advisory Council (engine={engine})...\n")
@@ -354,10 +520,16 @@ def cmd_consult(args):
             context = f.read()
 
     engine = getattr(args, "engine", "auto")
-    if getattr(args, "competition", False):
-        print(f"[Triad Competition Mode] Consulting concurrent advisors (Claude Code & OpenAI Codex)...")
-        session = query_competition_council(prompt, context=context, mode="architect")
+    competition = getattr(args, "competition", False) or getattr(args, "adversarial", False)
+    if competition:
+        adv_pair = ("mock", "mock") if engine == "mock" else ("claude", "codex")
+        is_adv = bool(getattr(args, "adversarial", False))
+        mode_desc = "Adversarial Red/Blue Arena" if is_adv else "Concurrent Dual Advisors"
+        print(f"[Triad Competition Mode] Consulting {mode_desc} ({adv_pair[0]} vs {adv_pair[1]})...")
+        session = query_competition_council(prompt, context=context, mode="architect", advisor_names=adv_pair, adversarial=is_adv)
         print("\n" + session["synthesis"])
+        if is_adv:
+            _handle_adversarial_session_result(session)
         return
 
     print(f"[Triad] Consulting Advisory Council (engine={engine})...\n")
@@ -391,10 +563,16 @@ def cmd_debug(args):
             context = f.read()
 
     engine = getattr(args, "engine", "auto")
-    if getattr(args, "competition", False):
-        print(f"[Triad Competition Mode] Diagnosing error via concurrent advisors (Claude Code & OpenAI Codex)...")
-        session = query_competition_council(error, context=context, mode="debug")
+    competition = getattr(args, "competition", False) or getattr(args, "adversarial", False)
+    if competition:
+        adv_pair = ("mock", "mock") if engine == "mock" else ("claude", "codex")
+        is_adv = bool(getattr(args, "adversarial", False))
+        mode_desc = "Adversarial Red/Blue Arena" if is_adv else "Concurrent Dual Advisors"
+        print(f"[Triad Competition Mode] Diagnosing error via {mode_desc} ({adv_pair[0]} vs {adv_pair[1]})...")
+        session = query_competition_council(error, context=context, mode="debug", advisor_names=adv_pair, adversarial=is_adv)
         print("\n" + session["synthesis"])
+        if is_adv:
+            _handle_adversarial_session_result(session)
         return
 
     print(f"[Triad] Diagnosing with Advisory Council (engine={engine})...\n")
@@ -2128,6 +2306,256 @@ def sanitize_worktree_env(
     return iso_env
 
 
+def _notice_recovery_patch(recovery_path: Optional[Path]) -> None:
+    if recovery_path and recovery_path.exists():
+        print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
+
+
+def _run_in_isolated_worktree(
+    args,
+    env: Optional[Dict[str, str]],
+    *,
+    repo_root: Union[str, Path],
+    prefix: str,
+    require_index: bool,
+    runner,
+    error_label: str,
+    phase_label: str,
+    nm_phase_label: str,
+    enforce_clean_explicit_ref: bool,
+    pause_commit_after_apply: bool,
+    notify_async: bool,
+) -> None:
+    """
+    Shared orchestration for ``--worktree`` execution used by both ``triad gate`` and
+    ``triad auto``. The lifecycle is:
+
+      1. Snapshot the parent repository (HEAD, index tree, working-tree tree).
+      2. Spawn an ephemeral worktree, materialize the candidate tree, provision deps.
+      3. Run ``runner(isolated_args, isolated_env)`` inside it.
+      4. If the run self-healed, extract a binary tree-to-tree patch and persist it to
+         a recovery file under ``.git`` *before* the worktree is torn down.
+      5. Re-verify the parent did not mutate concurrently (HEAD / index / working tree).
+      6. Optionally (``--apply-verified``) apply the patch to the parent working tree.
+
+    Every failure path exits non-zero (fail-closed). Parameters that differ between
+    callers are the worktree ``prefix``, whether the candidate is the index
+    (``require_index``, commit gating) or the working tree, the user-facing labels,
+    whether an explicit ``--ref`` is rejected on a dirty parent, and whether a
+    successfully applied patch pauses the commit (gate) or simply continues (auto).
+    """
+    base_env = env if env is not None else os.environ
+    ref = getattr(args, "ref", "HEAD") or "HEAD"
+    apply_verified = getattr(args, "apply_verified", False)
+
+    try:
+        parent_state = capture_parent_state(repo_root, env=base_env, require_index=require_index)
+        candidate_tree = parent_state["candidate_tree"]
+        initial_index_tree = parent_state["index_tree"]
+        initial_wt_tree = parent_state["wt_tree"]
+        initial_head_commit = parent_state.get("head_commit", "UNBORN")
+        has_changes = parent_state["has_changes"]
+        is_unborn = parent_state["is_unborn"]
+    except Exception as e:
+        print(f"\n❌ [Triad Worktree Error] Failed to capture candidate parent state: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    is_explicit_ref = False
+    transfer_local_changes = True
+    if enforce_clean_explicit_ref:
+        is_explicit_ref = bool(getattr(args, "ref", None) and getattr(args, "ref") != "HEAD")
+        if is_explicit_ref and has_changes:
+            print(f"\n❌ [Triad Auto Error] Cannot run 'triad auto --ref {ref}' with uncommitted local changes in working directory or staged index.", file=sys.stderr)
+            print("To fix: Commit or stash local changes, or omit '--ref' to operate on current working tree state.", file=sys.stderr)
+            sys.exit(1)
+        transfer_local_changes = has_changes or (not is_explicit_ref and not is_unborn)
+
+    empty_tree_oid = get_empty_tree_oid(Path(repo_root))
+    isolated_env = clean_git_env(base_env=env)
+    isolated_env = sanitize_worktree_env(isolated_env, repo_root)
+
+    if is_unborn:
+        review_base = empty_tree_oid
+    elif is_explicit_ref and not has_changes:
+        ret_base, base_rev_tree, _ = run_subprocess_tree_safe(["git", "rev-parse", f"{ref}~1^{{tree}}"], cwd=repo_root, env=isolated_env)
+        review_base = base_rev_tree.strip() if ret_base == 0 and base_rev_tree.strip() else empty_tree_oid
+    else:
+        review_base = parent_state.get("head_tree") or ref
+
+    # In an unborn repository, HEAD does not exist, so git worktree add HEAD will fail.
+    # We materialize a temporary commit object from candidate_tree to anchor the worktree.
+    if is_unborn:
+        ret, temp_commit, err = run_subprocess_tree_safe(["git", "commit-tree", candidate_tree, "-m", "triad-temp-unborn-init"], cwd=repo_root, env=isolated_env)
+        if ret != 0 or not temp_commit.strip():
+            print(f"\n❌ [Triad Worktree Error] Failed to create temporary root commit for unborn repo: {err}", file=sys.stderr)
+            sys.exit(1)
+        ref_to_use = temp_commit.strip()
+    else:
+        ref_to_use = ref
+
+    print(f"[Triad Worktree] Spawning isolated ephemeral git worktree from {repo_root} (ref: {ref_to_use[:10]})...")
+
+    verified_patch_to_apply: Optional[bytes] = None
+    recovery_path: Optional[Path] = None
+    validated_tree: Optional[str] = None
+
+    with isolated_worktree(repo_root, branch_or_commit=ref_to_use, prefix=prefix, cd=True, env=isolated_env) as wt:
+        print(f"[Triad Worktree] Active in: {wt}")
+        isolated_env = sanitize_worktree_env(isolated_env, repo_root, wt)
+        if transfer_local_changes and not is_unborn:
+            print(f"[Triad Worktree] Materializing candidate tree snapshot ({candidate_tree[:10]}) into isolated worktree...")
+            ret, _, err = run_subprocess_tree_safe(["git", "read-tree", "-u", "--reset", candidate_tree], cwd=wt, env=isolated_env)
+            if ret != 0:
+                print(f"\n❌ [Triad Worktree Error] Failed to materialize candidate tree in isolated worktree: {err}", file=sys.stderr)
+                sys.exit(1)
+
+            # Verify exact tree parity in isolated worktree (fail-closed)
+            ret, wt_tree, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=wt, env=isolated_env)
+            if ret != 0 or wt_tree.strip() != candidate_tree:
+                print(f"\n❌ [Triad Worktree Error] Worktree tree mismatch (expected {candidate_tree}, got {wt_tree.strip()}): {err}", file=sys.stderr)
+                sys.exit(1)
+
+        # Set base_tree directly from worktree index write-tree
+        ret, base_tree, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=wt, env=isolated_env)
+        if ret != 0 or not base_tree.strip():
+            print(f"\n❌ [Triad Worktree Error] Failed to capture worktree base tree: {err}", file=sys.stderr)
+            sys.exit(1)
+        base_tree = base_tree.strip()
+
+        # Preserve symlinks during Node.js resolution to prevent escaping to parent workspace
+        isolated_env["NODE_PRESERVE_SYMLINKS"] = "1"
+
+        # Capture parent node_modules baseline to detect unauthorized validator mutations
+        parent_nm = Path(repo_root) / "node_modules"
+        parent_nm_snapshot = capture_directory_snapshot(parent_nm)
+
+        # Provision non-tracked external dependencies (e.g. node_modules) from parent repository
+        prov = provision_worktree_dependencies(repo_root, wt)
+        if prov:
+            print(f"[Triad Worktree] Provisioned dependencies: {', '.join(prov)}")
+
+        isolated_args = argparse.Namespace(**vars(args))
+        setattr(isolated_args, "worktree", False)
+        setattr(isolated_args, "_in_worktree", True)
+        setattr(isolated_args, "_originating_root", str(Path(repo_root).resolve()))
+        setattr(isolated_args, "_review_base", review_base)
+        setattr(isolated_args, "_self_healed_patches", [])
+        setattr(isolated_args, "_validated_tree", None)
+
+        try:
+            runner(isolated_args, isolated_env)
+        finally:
+            # Fail closed if parent node_modules was mutated or deleted by validators
+            if parent_nm_snapshot is not None:
+                post_nm_snapshot = capture_directory_snapshot(parent_nm)
+                if post_nm_snapshot != parent_nm_snapshot:
+                    print(f"\n❌ [Triad Worktree Error] Parent node_modules was mutated or deleted during {nm_phase_label} in isolated worktree.", file=sys.stderr)
+                    sys.exit(1)
+
+        # Generate single cohesive binary tree-to-tree diff from candidate tree to validated final state
+        healed = getattr(isolated_args, "_self_healed_patches", [])
+        if healed:
+            validated_tree = getattr(isolated_args, "_validated_tree", None)
+            if not validated_tree:
+                print("\n❌ [Triad Worktree Error] Self-healing succeeded but validated tree was not captured.", file=sys.stderr)
+                sys.exit(1)
+
+            diff_cmd = [
+                "git", "diff",
+                "--binary", "--full-index",
+                "--no-color",
+                "--no-ext-diff", "--no-textconv",
+                "--src-prefix=a/", "--dst-prefix=b/",
+                base_tree, validated_tree, "--"
+            ]
+            ret, final_diff, err = run_subprocess_tree_safe_bytes(diff_cmd, cwd=wt, env=isolated_env)
+            if ret != 0 or not final_diff.strip():
+                err_msg = err.decode("utf-8", errors="replace") if isinstance(err, bytes) else str(err)
+                print(f"\n❌ [Triad Worktree Error] Failed to extract verified patch delta from baseline: {err_msg}", file=sys.stderr)
+                sys.exit(1)
+            verified_patch_to_apply = final_diff if final_diff.endswith(b"\n") else final_diff + b"\n"
+            recovery_path = get_recovery_patch_path(Path(repo_root), unique=True)
+            try:
+                write_atomic_patch(recovery_path, verified_patch_to_apply)
+            except Exception as e:
+                print(f"\n❌ [Triad Worktree Error] Failed to persist verified recovery patch before teardown: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    print("[Triad Worktree] Ephemeral worktree cleanly removed and unlinked.")
+
+    # Concurrency check on parent repository: verify HEAD, index, AND working tree did not mutate
+    try:
+        current_state = capture_parent_state(repo_root, env=base_env, require_index=require_index)
+        if current_state.get("head_commit") != initial_head_commit:
+            _notice_recovery_patch(recovery_path)
+            print(f"\n❌ [{error_label}] Concurrent modification detected: parent git HEAD changed during {phase_label} (expected {initial_head_commit[:10]}, current {current_state.get('head_commit', '')[:10]}).", file=sys.stderr)
+            sys.exit(1)
+        if current_state["index_tree"] != initial_index_tree:
+            _notice_recovery_patch(recovery_path)
+            print(f"\n❌ [{error_label}] Concurrent modification detected: parent git index changed during {phase_label} (expected {initial_index_tree[:10]}, current {current_state['index_tree'][:10]}).", file=sys.stderr)
+            sys.exit(1)
+        if current_state["wt_tree"] != initial_wt_tree:
+            _notice_recovery_patch(recovery_path)
+            print(f"\n❌ [{error_label}] Concurrent modification detected: parent working tree modified during {phase_label}.", file=sys.stderr)
+            sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _notice_recovery_patch(recovery_path)
+        print(f"\n❌ [{error_label}] Failed concurrency re-verification of parent state: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not verified_patch_to_apply:
+        return
+
+    if current_state["wt_tree"] != base_tree:
+        _notice_recovery_patch(recovery_path)
+        print(f"\n❌ [{error_label}] Workspace working tree baseline differs from verified worktree baseline (expected {base_tree[:10]}, current {current_state['wt_tree'][:10]}).", file=sys.stderr)
+        sys.exit(1)
+
+    patch_bytes = verified_patch_to_apply if isinstance(verified_patch_to_apply, bytes) else verified_patch_to_apply.encode("utf-8")
+    line_count = len(patch_bytes.splitlines())
+
+    if not apply_verified:
+        print("\n[Triad Closed Loop Note] A verified self-healing patch was produced in the worktree.")
+        if recovery_path and recovery_path.exists():
+            print(f"[Triad Notice] Preserved verified recovery patch at {recovery_path}")
+        print("Run with '--apply-verified' to automatically merge passing self-healing fixes into your main workspace.")
+        sys.exit(1)
+
+    print(f"\n[Triad Closed Loop] Applying verified self-healing patch to main working tree ({line_count} lines)...")
+    applied = apply_verified_patch_to_workspace(
+        patch_bytes,
+        cwd=Path(repo_root),
+        expected_baseline_tree=base_tree,
+        expected_target_tree=validated_tree
+    )
+    if not applied:
+        print("! Error: Could not cleanly merge verified patch back to main working tree.")
+        if recovery_path and recovery_path.exists():
+            print(f"[Triad Notice] Preserved verified recovery patch at {recovery_path}")
+        notify_event("Patch Merge Conflict", "Could not cleanly merge verified patch back to main working tree.", status="failed", timeout=1.5, async_dispatch=notify_async)
+        sys.exit(1)
+
+    try:
+        post_apply_state = capture_parent_state(repo_root, env=base_env, require_index=False)
+        if post_apply_state["index_tree"] != initial_index_tree:
+            print(f"\n❌ [Triad Closed Loop Error] Git index unexpectedly modified during patch application.", file=sys.stderr)
+            sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"\n❌ [Triad Closed Loop Error] Failed to verify post-apply repository state: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("✓ Successfully applied verified patch to working tree!")
+    notify_event("Self-Healing Patch Applied", f"Merged {line_count} lines of verified fixes to main workspace.", status="success", timeout=1.5, async_dispatch=notify_async)
+    print("\n[Triad Closed Loop Notice] A self-healing patch was applied to your working tree.")
+    if pause_commit_after_apply:
+        print("To ensure verified code is committed, the commit is paused. Please stage the changes (e.g. 'git add .') and commit again.")
+        sys.exit(1)
+
+
 def cmd_gate(args, env: Optional[Dict[str, str]] = None):
     """
     Ground-Truth Verification Gate with self-healing retry loop:
@@ -2144,201 +2572,23 @@ def cmd_gate(args, env: Optional[Dict[str, str]] = None):
         print(f"[Triad Gate Error] Not inside a git repository: {e}", file=sys.stderr)
         sys.exit(1)
 
-    use_worktree = getattr(args, "worktree", False)
-    if use_worktree:
+    if getattr(args, "worktree", False):
+        _run_in_isolated_worktree(
+            args, env,
+            repo_root=repo_root,
+            prefix="triad-gate",
+            require_index=True,
+            runner=lambda a, e: _run_gate(a, env=e, in_worktree=True, review_base=a._review_base),
+            error_label="Triad Gate Error",
+            phase_label="validation",
+            nm_phase_label="gate validation",
+            enforce_clean_explicit_ref=False,
+            pause_commit_after_apply=True,
+            notify_async=True,
+        )
+    else:
+        _run_gate(args, env=env, in_worktree=False, cwd=Path(repo_root))
 
-        ref = getattr(args, "ref", "HEAD") or "HEAD"
-        apply_verified = getattr(args, "apply_verified", False)
-
-        try:
-            parent_state = capture_parent_state(repo_root, env=env if env is not None else os.environ, require_index=True)
-            candidate_tree = parent_state["candidate_tree"]
-            initial_index_tree = parent_state["index_tree"]
-            initial_wt_tree = parent_state["wt_tree"]
-            initial_head_commit = parent_state.get("head_commit", "UNBORN")
-            has_changes = parent_state["has_changes"]
-            is_unborn = parent_state["is_unborn"]
-        except Exception as e:
-            print(f"\n❌ [Triad Worktree Error] Failed to capture candidate parent state: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        empty_tree_oid = get_empty_tree_oid(Path(repo_root))
-        review_base = empty_tree_oid if is_unborn else (parent_state.get("head_tree") or ref)
-        isolated_env = clean_git_env(base_env=env)
-        isolated_env = sanitize_worktree_env(isolated_env, repo_root)
-
-        # In an unborn repository, HEAD does not exist, so git worktree add HEAD will fail.
-        # We materialize a temporary commit object from candidate_tree to anchor the worktree.
-        if is_unborn:
-            ret, temp_commit, err = run_subprocess_tree_safe(["git", "commit-tree", candidate_tree, "-m", "triad-temp-unborn-init"], cwd=repo_root, env=isolated_env)
-            if ret != 0 or not temp_commit.strip():
-                print(f"\n❌ [Triad Worktree Error] Failed to create temporary root commit for unborn repo: {err}", file=sys.stderr)
-                sys.exit(1)
-            ref_to_use = temp_commit.strip()
-        else:
-            ref_to_use = ref
-
-        print(f"[Triad Worktree] Spawning isolated ephemeral git worktree from {repo_root} (ref: {ref_to_use[:10]})...")
-
-        verified_patch_to_apply = None
-        recovery_path = None
-
-        with isolated_worktree(repo_root, branch_or_commit=ref_to_use, prefix="triad-gate", cd=True, env=isolated_env) as wt:
-            print(f"[Triad Worktree] Active in: {wt}")
-            isolated_env = sanitize_worktree_env(isolated_env, repo_root, wt)
-            if not is_unborn:
-                print(f"[Triad Worktree] Materializing candidate tree snapshot ({candidate_tree[:10]}) into isolated worktree...")
-                ret, _, err = run_subprocess_tree_safe(["git", "read-tree", "-u", "--reset", candidate_tree], cwd=wt, env=isolated_env)
-                if ret != 0:
-                    print(f"\n❌ [Triad Worktree Error] Failed to materialize candidate tree in isolated worktree: {err}", file=sys.stderr)
-                    sys.exit(1)
-
-                # Verify exact tree parity in isolated worktree (fail-closed)
-                ret, wt_tree, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=wt, env=isolated_env)
-                if ret != 0 or wt_tree.strip() != candidate_tree:
-                    print(f"\n❌ [Triad Worktree Error] Worktree tree mismatch (expected {candidate_tree}, got {wt_tree.strip()}): {err}", file=sys.stderr)
-                    sys.exit(1)
-
-            # Set base_tree directly from worktree index write-tree
-            ret, base_tree, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=wt, env=isolated_env)
-            if ret != 0 or not base_tree.strip():
-                print(f"\n❌ [Triad Worktree Error] Failed to capture worktree base tree: {err}", file=sys.stderr)
-                sys.exit(1)
-            base_tree = base_tree.strip()
-
-            # Preserve symlinks during Node.js resolution to prevent escaping to parent workspace
-            isolated_env["NODE_PRESERVE_SYMLINKS"] = "1"
-
-            # Capture parent node_modules baseline to detect unauthorized validator mutations
-            parent_nm = Path(repo_root) / "node_modules"
-            parent_nm_mtime = parent_nm.stat().st_mtime_ns if parent_nm.exists() else None
-            parent_nm_snapshot = capture_directory_snapshot(parent_nm)
-
-            # Provision non-tracked external dependencies (e.g. node_modules) from parent repository
-            prov = provision_worktree_dependencies(repo_root, wt)
-            if prov:
-                print(f"[Triad Worktree] Provisioned dependencies: {', '.join(prov)}")
-
-            isolated_args = argparse.Namespace(**vars(args))
-            setattr(isolated_args, "worktree", False)
-            setattr(isolated_args, "_in_worktree", True)
-            setattr(isolated_args, "_originating_root", str(Path(repo_root).resolve()))
-            setattr(isolated_args, "_review_base", review_base)
-            setattr(isolated_args, "_self_healed_patches", [])
-            setattr(isolated_args, "_validated_tree", None)
-
-            try:
-                _run_gate(isolated_args, env=isolated_env, in_worktree=True, review_base=review_base)
-            finally:
-                # Fail closed if parent node_modules was mutated or deleted by validators
-                if parent_nm_snapshot is not None:
-                    post_nm_snapshot = capture_directory_snapshot(parent_nm)
-                    if post_nm_snapshot != parent_nm_snapshot:
-                        print(f"\n❌ [Triad Worktree Error] Parent node_modules was mutated or deleted during gate validation in isolated worktree.", file=sys.stderr)
-                        sys.exit(1)
-
-            # Generate single cohesive binary tree-to-tree diff from candidate tree to validated final state
-            healed = getattr(isolated_args, "_self_healed_patches", [])
-            if healed:
-                validated_tree = getattr(isolated_args, "_validated_tree", None)
-                if not validated_tree:
-                    print("\n❌ [Triad Worktree Error] Self-healing succeeded but validated tree was not captured.", file=sys.stderr)
-                    sys.exit(1)
-
-                diff_cmd = [
-                    "git", "diff",
-                    "--binary", "--full-index",
-                    "--no-color",
-                    "--no-ext-diff", "--no-textconv",
-                    "--src-prefix=a/", "--dst-prefix=b/",
-                    base_tree, validated_tree, "--"
-                ]
-                ret, final_diff, err = run_subprocess_tree_safe_bytes(diff_cmd, cwd=wt, env=isolated_env)
-                if ret != 0 or not final_diff.strip():
-                    err_msg = err.decode("utf-8", errors="replace") if isinstance(err, bytes) else str(err)
-                    print(f"\n❌ [Triad Worktree Error] Failed to extract verified patch delta from baseline: {err_msg}", file=sys.stderr)
-                    sys.exit(1)
-                verified_patch_to_apply = final_diff if final_diff.endswith(b"\n") else final_diff + b"\n"
-                recovery_path = get_recovery_patch_path(Path(repo_root), unique=True)
-                try:
-                    write_atomic_patch(recovery_path, verified_patch_to_apply)
-                except Exception as e:
-                    print(f"\n❌ [Triad Worktree Error] Failed to persist verified recovery patch before teardown: {e}", file=sys.stderr)
-                    sys.exit(1)
-
-        print("[Triad Worktree] Ephemeral worktree cleanly removed and unlinked.")
-
-        # Concurrency check on parent repository: verify HEAD, index, AND working tree did not mutate
-        try:
-            current_state = capture_parent_state(repo_root, env=env if env is not None else os.environ, require_index=True)
-            if current_state.get("head_commit") != initial_head_commit:
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-                print(f"\n❌ [Triad Gate Error] Concurrent modification detected: parent git HEAD changed during validation (expected {initial_head_commit[:10]}, current {current_state.get('head_commit', '')[:10]}).", file=sys.stderr)
-                sys.exit(1)
-            if current_state["index_tree"] != initial_index_tree:
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-                print(f"\n❌ [Triad Gate Error] Concurrent modification detected: parent git index changed during validation (expected {initial_index_tree[:10]}, current {current_state['index_tree'][:10]}).", file=sys.stderr)
-                sys.exit(1)
-            if current_state["wt_tree"] != initial_wt_tree:
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-                print(f"\n❌ [Triad Gate Error] Concurrent modification detected: parent working tree modified during validation.", file=sys.stderr)
-                sys.exit(1)
-        except Exception as e:
-            if recovery_path and recovery_path.exists():
-                print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-            print(f"\n❌ [Triad Gate Error] Failed concurrency re-verification of parent state: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        if verified_patch_to_apply:
-            if current_state["wt_tree"] != base_tree:
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-                print(f"\n❌ [Triad Gate Error] Workspace working tree baseline differs from verified worktree baseline (expected {base_tree[:10]}, current {current_state['wt_tree'][:10]}).", file=sys.stderr)
-                sys.exit(1)
-            patch_bytes = verified_patch_to_apply if isinstance(verified_patch_to_apply, bytes) else verified_patch_to_apply.encode("utf-8")
-            line_count = len(patch_bytes.splitlines())
-            if apply_verified:
-                print(f"\n[Triad Closed Loop] Applying verified self-healing patch to main working tree ({line_count} lines)...")
-                applied = apply_verified_patch_to_workspace(
-                    patch_bytes,
-                    cwd=Path(repo_root),
-                    expected_baseline_tree=base_tree,
-                    expected_target_tree=validated_tree
-                )
-                if applied:
-                    try:
-                        post_apply_state = capture_parent_state(repo_root, env=env if env is not None else os.environ, require_index=False)
-                        if post_apply_state["index_tree"] != initial_index_tree:
-                            print(f"\n❌ [Triad Closed Loop Error] Git index unexpectedly modified during patch application.", file=sys.stderr)
-                            sys.exit(1)
-                    except Exception as e:
-                        print(f"\n❌ [Triad Closed Loop Error] Failed to verify post-apply repository state: {e}", file=sys.stderr)
-                        sys.exit(1)
-                    print("✓ Successfully applied verified patch to working tree!")
-                    notify_event("Self-Healing Patch Applied", f"Merged {line_count} lines of verified fixes to main workspace.", status="success", timeout=1.5, async_dispatch=True)
-                    print("\n[Triad Closed Loop Notice] A self-healing patch was applied to your working tree.")
-                    print("To ensure verified code is committed, the commit is paused. Please stage the changes (e.g. 'git add .') and commit again.")
-                    sys.exit(1)
-                else:
-                    print("! Error: Could not cleanly merge verified patch back to main working tree.")
-                    if recovery_path and recovery_path.exists():
-                        print(f"[Triad Notice] Preserved verified recovery patch at {recovery_path}")
-                    notify_event("Patch Merge Conflict", "Could not cleanly merge verified patch back to main working tree.", status="failed", timeout=1.5, async_dispatch=True)
-                    sys.exit(1)
-            else:
-                print("\n[Triad Closed Loop Note] A verified self-healing patch was produced in the worktree.")
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified recovery patch at {recovery_path}")
-                print("Run with '--apply-verified' to automatically merge passing self-healing fixes into your main workspace.")
-                sys.exit(1)
-
-        notify_event("Pre-Commit Gate Passed", "Type safety, test suites, and Advisory Council review approved.", status="success", timeout=1.5, async_dispatch=True)
-        return
-
-    _run_gate(args, env=env, in_worktree=False, cwd=Path(repo_root))
     notify_event("Pre-Commit Gate Passed", "Type safety, test suites, and Advisory Council review approved.", status="success", timeout=1.5, async_dispatch=True)
 
 
@@ -2756,6 +3006,79 @@ def _verify_checkout_representation(
     return mismatches
 
 
+def _handle_validation_failure(
+    *,
+    stage_label: str,
+    exhausted_label: str,
+    diag_output: str,
+    cwd: Path,
+    exec_env: Dict[str, str],
+    args,
+    in_worktree: bool,
+    candidate_tree: str,
+    attempt: int,
+    max_retries: int,
+) -> Tuple[int, str]:
+    """
+    Shared self-healing path for a failed validation stage (tsc / npm test / python tests).
+
+    Behaviour:
+      * In an isolated worktree, validator side-effects are rolled back to ``candidate_tree``
+        first so a retry starts from a clean baseline.
+      * If the retry budget is exhausted the gate fails closed (exit 1).
+      * Otherwise the Advisory Council is asked for a surgical unified diff.
+          - Direct (non-worktree) execution never mutates the user's files: the proposed
+            patch is persisted to ``.triad_proposed_fix.patch`` and the gate exits 1.
+          - Worktree execution applies the patch, stages it, records it in
+            ``args._self_healed_patches`` and returns the new ``(attempt, candidate_tree)``
+            so the caller can restart the validation sequence.
+    """
+    if in_worktree:
+        if not _clean_worktree_retry_artifacts(cwd, candidate_tree, exec_env):
+            print(f"\n❌ [Triad Gate Error] Failed to restore worktree baseline before retry.", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"\n❌ [Triad Gate: {stage_label}:\n{diag_output}")
+
+    if attempt >= max_retries:
+        print(f"\n❌ [Triad Gate FAILED] {exhausted_label}")
+        sys.exit(1)
+
+    attempt += 1
+    print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
+    advisor_fix = query_gate_fix(diag_output, args)
+    print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
+
+    if not in_worktree:
+        patch_file = cwd / ".triad_proposed_fix.patch"
+        try:
+            patch_file.write_text(advisor_fix, encoding="utf-8")
+            print(f"\n[Triad Direct Execution Notice] Self-healing fix proposed by Advisory Council persisted to:\n  {patch_file}")
+        except Exception:
+            pass
+        print("Direct execution preserves working directory files without uncoordinated in-place mutation.")
+        print("To review or apply the fix: git apply .triad_proposed_fix.patch")
+        print("Or run with 'triad gate --worktree --apply-verified' for isolated verification and atomic application.")
+        sys.exit(1)
+
+    if not apply_patch_text(advisor_fix, cwd=cwd, env=exec_env, allow_3way=True):
+        print("! Could not automatically apply patch via git apply. Aborting gate.")
+        sys.exit(1)
+
+    try:
+        _stage_candidate_worktree_changes(cwd=cwd, exec_env=exec_env, head_tree=candidate_tree)
+    except Exception as stage_err:
+        print(f"\n❌ [Triad Gate Error] Failed to stage healed changes: {stage_err}", file=sys.stderr)
+        sys.exit(1)
+    if hasattr(args, "_self_healed_patches"):
+        args._self_healed_patches.append(advisor_fix)
+    ret_tr, new_tree, _ = run_subprocess_tree_safe(["git", "write-tree"], cwd=cwd, env=exec_env)
+    if ret_tr == 0 and new_tree.strip():
+        candidate_tree = new_tree.strip()
+    print("✓ Applied advisory patch to worktree. Restarting validation sequence...\n")
+    return attempt, candidate_tree
+
+
 def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = False, review_base: Optional[str] = None, cwd: Optional[Path] = None):
     cwd = (cwd or Path.cwd()).resolve()
     exec_env = dict(os.environ if env is None else env)
@@ -2842,53 +3165,16 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                 sys.exit(1)
 
             print("[Step 1/3] Verifying TypeScript type safety (npx tsc --noEmit)...")
-            ret, out, err = run_subprocess_tree_safe(["npx.cmd", "tsc", "--noEmit"], cwd=cwd, timeout=test_timeout, env=exec_env)
+            ret, out, err = run_subprocess_tree_safe([NPX_CMD, "tsc", "--noEmit"], cwd=cwd, timeout=test_timeout, env=exec_env)
             if ret != 0:
-                if in_worktree:
-                    # Clean validator side-effects / artifacts back to candidate_tree baseline
-                    if not _clean_worktree_retry_artifacts(cwd, candidate_tree, exec_env):
-                        print(f"\n❌ [Triad Gate Error] Failed to restore worktree baseline before retry.", file=sys.stderr)
-                        sys.exit(1)
-
-                diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
-                print(f"\n❌ [Triad Gate: Step 1 FAILED] TypeScript errors detected:\n{diag_output}")
-                if attempt < max_retries:
-                    attempt += 1
-                    print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
-                    advisor_fix = query_gate_fix(diag_output, args)
-                    print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
-                    if in_worktree:
-                        applied = apply_patch_text(advisor_fix, cwd=cwd, env=exec_env, allow_3way=True)
-                        if applied:
-                            try:
-                                _stage_candidate_worktree_changes(cwd=cwd, exec_env=exec_env, head_tree=candidate_tree)
-                            except Exception as stage_err:
-                                print(f"\n❌ [Triad Gate Error] Failed to stage healed changes: {stage_err}", file=sys.stderr)
-                                sys.exit(1)
-                            if hasattr(args, "_self_healed_patches"):
-                                args._self_healed_patches.append(advisor_fix)
-                            ret_tr, new_tree, _ = run_subprocess_tree_safe(["git", "write-tree"], cwd=cwd, env=exec_env)
-                            if ret_tr == 0 and new_tree.strip():
-                                candidate_tree = new_tree.strip()
-                            print("✓ Applied advisory patch to worktree. Restarting validation sequence...\n")
-                            continue
-                        else:
-                            print("! Could not automatically apply patch via git apply. Aborting gate.")
-                            sys.exit(1)
-                    else:
-                        patch_file = cwd / ".triad_proposed_fix.patch"
-                        try:
-                            patch_file.write_text(advisor_fix, encoding="utf-8")
-                            print(f"\n[Triad Direct Execution Notice] Self-healing fix proposed by Advisory Council persisted to:\n  {patch_file}")
-                        except Exception:
-                            pass
-                        print("Direct execution preserves working directory files without uncoordinated in-place mutation.")
-                        print("To review or apply the fix: git apply .triad_proposed_fix.patch")
-                        print("Or run with 'triad gate --worktree --apply-verified' for isolated verification and atomic application.")
-                        sys.exit(1)
-                else:
-                    print("\n❌ [Triad Gate FAILED] TypeScript errors persist after retry budget exhausted.")
-                    sys.exit(1)
+                attempt, candidate_tree = _handle_validation_failure(
+                    stage_label="Step 1 FAILED] TypeScript errors detected",
+                    exhausted_label="TypeScript errors persist after retry budget exhausted.",
+                    diag_output=f"STDOUT:\n{out}\nSTDERR:\n{err}".strip(),
+                    cwd=cwd, exec_env=exec_env, args=args, in_worktree=in_worktree,
+                    candidate_tree=candidate_tree, attempt=attempt, max_retries=max_retries,
+                )
+                continue
             print("✓ TypeScript: 0 errors.")
         else:
             print("[Step 1/3] No tsconfig.json found. Skipping tsc check.")
@@ -2905,58 +3191,22 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                 if "test" in scripts:
                     ran_any_tests = True
                     print("[Step 2/3] Running local test suite (npm test)...")
-                    test_cmd = ["npm.cmd", "test", "--", "--run"]
+                    test_cmd = [NPM_CMD, "test", "--", "--run"]
                     ret, out, err = run_subprocess_tree_safe(test_cmd, cwd=cwd, timeout=test_timeout, env=exec_env)
 
                     if ret != 0:
-                        if in_worktree:
-                            # Clean validator side-effects / artifacts back to candidate_tree baseline
-                            if not _clean_worktree_retry_artifacts(cwd, candidate_tree, exec_env):
-                                print(f"\n❌ [Triad Gate Error] Failed to restore worktree baseline before retry.", file=sys.stderr)
-                                sys.exit(1)
-
                         step2_failed = True
-                        diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
-                        print(f"\n❌ [Triad Gate: Step 2 FAILED] Node test suite failed:\n{diag_output}")
-                        if attempt < max_retries:
-                            attempt += 1
-                            print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
-                            advisor_fix = query_gate_fix(diag_output, args)
-                            print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
-                            if in_worktree:
-                                applied = apply_patch_text(advisor_fix, cwd=cwd, env=exec_env, allow_3way=True)
-                                if applied:
-                                    try:
-                                        _stage_candidate_worktree_changes(cwd=cwd, exec_env=exec_env, head_tree=candidate_tree)
-                                    except Exception as stage_err:
-                                        print(f"\n❌ [Triad Gate Error] Failed to stage healed changes: {stage_err}", file=sys.stderr)
-                                        sys.exit(1)
-                                    if hasattr(args, "_self_healed_patches"):
-                                        args._self_healed_patches.append(advisor_fix)
-                                    ret_tr, new_tree, _ = run_subprocess_tree_safe(["git", "write-tree"], cwd=cwd, env=exec_env)
-                                    if ret_tr == 0 and new_tree.strip():
-                                        candidate_tree = new_tree.strip()
-                                    print("✓ Applied advisory patch to worktree. Restarting validation sequence...\n")
-                                    continue
-                                else:
-                                    print("! Could not automatically apply patch via git apply. Aborting gate.")
-                                    sys.exit(1)
-                            else:
-                                patch_file = cwd / ".triad_proposed_fix.patch"
-                                try:
-                                    patch_file.write_text(advisor_fix, encoding="utf-8")
-                                    print(f"\n[Triad Direct Execution Notice] Self-healing fix proposed by Advisory Council persisted to:\n  {patch_file}")
-                                except Exception:
-                                    pass
-                                print("Direct execution preserves working directory files without uncoordinated in-place mutation.")
-                                print("To review or apply the fix: git apply .triad_proposed_fix.patch")
-                                print("Or run with 'triad gate --worktree --apply-verified' for isolated verification and atomic application.")
-                                sys.exit(1)
-                        else:
-                            print("\n❌ [Triad Gate FAILED] Test suite still failing after retry budget exhausted.")
-                            sys.exit(1)
-                    else:
-                        print("✓ Node/npm tests passed successfully.")
+                        attempt, candidate_tree = _handle_validation_failure(
+                            stage_label="Step 2 FAILED] Node test suite failed",
+                            exhausted_label="Test suite still failing after retry budget exhausted.",
+                            diag_output=f"STDOUT:\n{out}\nSTDERR:\n{err}".strip(),
+                            cwd=cwd, exec_env=exec_env, args=args, in_worktree=in_worktree,
+                            candidate_tree=candidate_tree, attempt=attempt, max_retries=max_retries,
+                        )
+                        continue
+                    print("✓ Node/npm tests passed successfully.")
+            except SystemExit:
+                raise
             except Exception as e:
                 print(f"\n❌ [Triad Gate: Step 2 FAILED] Error executing Node test runner: {e}")
                 sys.exit(1)
@@ -3044,54 +3294,17 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
             diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
             is_empty_suite = "Ran 0 tests" in diag_output
             if ret != 0 or is_empty_suite:
-                if in_worktree:
-                    # Clean validator side-effects / artifacts back to candidate_tree baseline
-                    if not _clean_worktree_retry_artifacts(cwd, candidate_tree, exec_env):
-                        print(f"\n❌ [Triad Gate Error] Failed to restore worktree baseline before retry.", file=sys.stderr)
-                        sys.exit(1)
-
                 step2_failed = True
                 reason = "discovering 0 tests" if is_empty_suite else "failures"
-                print(f"\n❌ [Triad Gate: Step 2 FAILED] Python test suite failed ({reason}):\n{diag_output}")
-                if attempt < max_retries:
-                    attempt += 1
-                    print(f"\n[Self-Healing Safety Net: Retry {attempt}/{max_retries}] Consulting Advisory Council in debug mode for surgical fix...")
-                    advisor_fix = query_gate_fix(diag_output, args)
-                    print(f"[Advisory Council Proposed Fix]:\n{advisor_fix}\n")
-                    if in_worktree:
-                        applied = apply_patch_text(advisor_fix, cwd=cwd, env=exec_env, allow_3way=True)
-                        if applied:
-                            try:
-                                _stage_candidate_worktree_changes(cwd=cwd, exec_env=exec_env, head_tree=candidate_tree)
-                            except Exception as stage_err:
-                                print(f"\n❌ [Triad Gate Error] Failed to stage healed changes: {stage_err}", file=sys.stderr)
-                                sys.exit(1)
-                            if hasattr(args, "_self_healed_patches"):
-                                args._self_healed_patches.append(advisor_fix)
-                            ret_tr, new_tree, _ = run_subprocess_tree_safe(["git", "write-tree"], cwd=cwd, env=exec_env)
-                            if ret_tr == 0 and new_tree.strip():
-                                candidate_tree = new_tree.strip()
-                            print("✓ Applied advisory patch to worktree. Restarting validation sequence...\n")
-                            break  # breaks out of targets loop to restart validation
-                        else:
-                            print("! Could not automatically apply patch via git apply. Aborting gate.")
-                            sys.exit(1)
-                    else:
-                        patch_file = cwd / ".triad_proposed_fix.patch"
-                        try:
-                            patch_file.write_text(advisor_fix, encoding="utf-8")
-                            print(f"\n[Triad Direct Execution Notice] Self-healing fix proposed by Advisory Council persisted to:\n  {patch_file}")
-                        except Exception:
-                            pass
-                        print("Direct execution preserves working directory files without uncoordinated in-place mutation.")
-                        print("To review or apply the fix: git apply .triad_proposed_fix.patch")
-                        print("Or run with 'triad gate --worktree --apply-verified' for isolated verification and atomic application.")
-                        sys.exit(1)
-                else:
-                    print("\n❌ [Triad Gate FAILED] Python test suite still failing after retry budget exhausted.")
-                    sys.exit(1)
-            else:
-                print(f"✓ Python tests ({py_test_target}) passed successfully.")
+                attempt, candidate_tree = _handle_validation_failure(
+                    stage_label=f"Step 2 FAILED] Python test suite failed ({reason})",
+                    exhausted_label="Python test suite still failing after retry budget exhausted.",
+                    diag_output=diag_output,
+                    cwd=cwd, exec_env=exec_env, args=args, in_worktree=in_worktree,
+                    candidate_tree=candidate_tree, attempt=attempt, max_retries=max_retries,
+                )
+                break  # breaks out of targets loop to restart validation
+            print(f"✓ Python tests ({py_test_target}) passed successfully.")
 
         if step2_failed:
             continue
@@ -3311,6 +3524,10 @@ def cmd_auto(args, env: Optional[Dict[str, str]] = None):
     Auto-classify intent and autonomously route to the appropriate subsystem.
     Supports isolated worktree execution via --worktree (-w).
     """
+    if getattr(args, "classify_only", False):
+        _print_classification_only(args)
+        return
+
     if getattr(args, "worktree", False):
         try:
             repo_root = get_repo_root(".", env=env)
@@ -3318,227 +3535,73 @@ def cmd_auto(args, env: Optional[Dict[str, str]] = None):
             print(f"[Triad Worktree Error] Not inside a git repository: {e}", file=sys.stderr)
             sys.exit(1)
 
-        ref = getattr(args, "ref", "HEAD") or "HEAD"
-        apply_verified = getattr(args, "apply_verified", False)
-
-        try:
-            parent_state = capture_parent_state(repo_root, env=env if env is not None else os.environ, require_index=False)
-            candidate_tree = parent_state["candidate_tree"]
-            initial_index_tree = parent_state["index_tree"]
-            initial_wt_tree = parent_state["wt_tree"]
-            initial_head_commit = parent_state.get("head_commit", "UNBORN")
-            has_changes = parent_state["has_changes"]
-            is_unborn = parent_state["is_unborn"]
-        except Exception as e:
-            print(f"\n❌ [Triad Worktree Error] Failed to capture candidate parent state: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        is_explicit_ref = bool(getattr(args, "ref", None) and getattr(args, "ref") != "HEAD")
-        if is_explicit_ref and has_changes:
-            print(f"\n❌ [Triad Auto Error] Cannot run 'triad auto --ref {ref}' with uncommitted local changes in working directory or staged index.", file=sys.stderr)
-            print("To fix: Commit or stash local changes, or omit '--ref' to operate on current working tree state.", file=sys.stderr)
-            sys.exit(1)
-        transfer_local_changes = has_changes or (not is_explicit_ref and not is_unborn)
-
-        empty_tree_oid = get_empty_tree_oid(Path(repo_root))
-        isolated_env = clean_git_env(base_env=env)
-        isolated_env = sanitize_worktree_env(isolated_env, repo_root)
-        if is_unborn:
-            review_base = empty_tree_oid
-        elif is_explicit_ref and not has_changes:
-            ret_base, base_rev_tree, _ = run_subprocess_tree_safe(["git", "rev-parse", f"{ref}~1^{{tree}}"], cwd=repo_root, env=isolated_env)
-            review_base = base_rev_tree.strip() if ret_base == 0 and base_rev_tree.strip() else empty_tree_oid
-        else:
-            review_base = parent_state.get("head_tree") or ref
-
-        # In an unborn repository, HEAD does not exist, so git worktree add HEAD will fail.
-        # We materialize a temporary commit object from candidate_tree to anchor the worktree.
-        if is_unborn:
-            ret, temp_commit, err = run_subprocess_tree_safe(["git", "commit-tree", candidate_tree, "-m", "triad-temp-unborn-init"], cwd=repo_root, env=isolated_env)
-            if ret != 0 or not temp_commit.strip():
-                print(f"\n❌ [Triad Worktree Error] Failed to create temporary root commit for unborn repo: {err}", file=sys.stderr)
-                sys.exit(1)
-            ref_to_use = temp_commit.strip()
-        else:
-            ref_to_use = ref
-
-        print(f"[Triad Worktree] Spawning isolated ephemeral git worktree from {repo_root} (ref: {ref_to_use[:10]})...")
-
-        verified_patch_to_apply = None
-        recovery_path = None
-
-        with isolated_worktree(repo_root, branch_or_commit=ref_to_use, prefix="triad-auto", cd=True, env=isolated_env) as wt:
-            print(f"[Triad Worktree] Active in: {wt}")
-            isolated_env = sanitize_worktree_env(isolated_env, repo_root, wt)
-            if transfer_local_changes and not is_unborn:
-                print(f"[Triad Worktree] Materializing candidate tree snapshot ({candidate_tree[:10]}) into isolated worktree...")
-                ret, _, err = run_subprocess_tree_safe(["git", "read-tree", "-u", "--reset", candidate_tree], cwd=wt, env=isolated_env)
-                if ret != 0:
-                    print(f"\n❌ [Triad Worktree Error] Failed to materialize candidate tree in isolated worktree: {err}", file=sys.stderr)
-                    sys.exit(1)
-
-                # Verify exact tree parity in isolated worktree (fail-closed)
-                ret, wt_tree, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=wt, env=isolated_env)
-                if ret != 0 or wt_tree.strip() != candidate_tree:
-                    print(f"\n❌ [Triad Worktree Error] Worktree tree mismatch (expected {candidate_tree}, got {wt_tree.strip()}): {err}", file=sys.stderr)
-                    sys.exit(1)
-
-            # Set base_tree directly from worktree index write-tree
-            ret, base_tree, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=wt, env=isolated_env)
-            if ret != 0 or not base_tree.strip():
-                print(f"\n❌ [Triad Worktree Error] Failed to capture worktree base tree: {err}", file=sys.stderr)
-                sys.exit(1)
-            base_tree = base_tree.strip()
-
-            # Preserve symlinks during Node.js resolution to prevent escaping to parent workspace
-            isolated_env["NODE_PRESERVE_SYMLINKS"] = "1"
-
-            # Capture parent node_modules baseline to detect unauthorized validator mutations
-            parent_nm = Path(repo_root) / "node_modules"
-            parent_nm_mtime = parent_nm.stat().st_mtime_ns if parent_nm.exists() else None
-            parent_nm_snapshot = capture_directory_snapshot(parent_nm)
-
-            # Provision non-tracked external dependencies (e.g. node_modules) from parent repository
-            prov = provision_worktree_dependencies(repo_root, wt)
-            if prov:
-                print(f"[Triad Worktree] Provisioned dependencies: {', '.join(prov)}")
-
-            isolated_args = argparse.Namespace(**vars(args))
-            setattr(isolated_args, "worktree", False)
-            setattr(isolated_args, "_in_worktree", True)
-            setattr(isolated_args, "_originating_root", str(Path(repo_root).resolve()))
-            setattr(isolated_args, "_review_base", review_base)
-            setattr(isolated_args, "_self_healed_patches", [])
-            setattr(isolated_args, "_validated_tree", None)
-
-            try:
-                _run_auto(isolated_args, env=isolated_env)
-            finally:
-                # Fail closed if parent node_modules was mutated or deleted by validators
-                if parent_nm_snapshot is not None:
-                    post_nm_snapshot = capture_directory_snapshot(parent_nm)
-                    if post_nm_snapshot != parent_nm_snapshot:
-                        print(f"\n❌ [Triad Worktree Error] Parent node_modules was mutated or deleted during auto-execution in isolated worktree.", file=sys.stderr)
-                        sys.exit(1)
-
-            # Generate single cohesive binary tree-to-tree diff from candidate tree to validated final state
-            healed = getattr(isolated_args, "_self_healed_patches", [])
-            if healed:
-                validated_tree = getattr(isolated_args, "_validated_tree", None)
-                if not validated_tree:
-                    print("\n❌ [Triad Worktree Error] Self-healing succeeded but validated tree was not captured.", file=sys.stderr)
-                    sys.exit(1)
-
-                diff_cmd = [
-                    "git", "diff",
-                    "--binary", "--full-index",
-                    "--no-color",
-                    "--no-ext-diff", "--no-textconv",
-                    "--src-prefix=a/", "--dst-prefix=b/",
-                    base_tree, validated_tree, "--"
-                ]
-                ret, final_diff, err = run_subprocess_tree_safe_bytes(diff_cmd, cwd=wt, env=isolated_env)
-                if ret != 0 or not final_diff.strip():
-                    err_msg = err.decode("utf-8", errors="replace") if isinstance(err, bytes) else str(err)
-                    print(f"\n❌ [Triad Worktree Error] Failed to extract verified patch delta from baseline: {err_msg}", file=sys.stderr)
-                    sys.exit(1)
-                verified_patch_to_apply = final_diff if final_diff.endswith(b"\n") else final_diff + b"\n"
-                recovery_path = get_recovery_patch_path(Path(repo_root), unique=True)
-                try:
-                    write_atomic_patch(recovery_path, verified_patch_to_apply)
-                except Exception as e:
-                    print(f"\n❌ [Triad Worktree Error] Failed to persist verified recovery patch before teardown: {e}", file=sys.stderr)
-                    sys.exit(1)
-
-        print("[Triad Worktree] Ephemeral worktree cleanly removed and unlinked.")
-
-        # Concurrency check on parent repository: verify HEAD, index, AND working tree did not mutate
-        try:
-            current_state = capture_parent_state(repo_root, env=env if env is not None else os.environ, require_index=False)
-            if current_state.get("head_commit") != initial_head_commit:
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-                print(f"\n❌ [Triad Worktree Error] Concurrent modification detected: parent git HEAD changed during auto execution (expected {initial_head_commit[:10]}, current {current_state.get('head_commit', '')[:10]}).", file=sys.stderr)
-                sys.exit(1)
-            if current_state["index_tree"] != initial_index_tree:
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-                print(f"\n❌ [Triad Worktree Error] Concurrent modification detected: parent git index changed during auto execution (expected {initial_index_tree[:10]}, current {current_state['index_tree'][:10]}).", file=sys.stderr)
-                sys.exit(1)
-            if current_state["wt_tree"] != initial_wt_tree:
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-                print(f"\n❌ [Triad Worktree Error] Concurrent modification detected: parent working tree modified during auto execution.", file=sys.stderr)
-                sys.exit(1)
-        except Exception as e:
-            if recovery_path and recovery_path.exists():
-                print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-            print(f"\n❌ [Triad Worktree Error] Failed concurrency re-verification of parent state: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        if verified_patch_to_apply:
-            if current_state["wt_tree"] != base_tree:
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
-                print(f"\n❌ [Triad Worktree Error] Workspace working tree baseline differs from verified worktree baseline (expected {base_tree[:10]}, current {current_state['wt_tree'][:10]}).", file=sys.stderr)
-                sys.exit(1)
-            patch_bytes = verified_patch_to_apply if isinstance(verified_patch_to_apply, bytes) else verified_patch_to_apply.encode("utf-8")
-            line_count = len(patch_bytes.splitlines())
-            if apply_verified:
-                print(f"\n[Triad Closed Loop] Applying verified self-healing patch to main working tree ({line_count} lines)...")
-                applied = apply_verified_patch_to_workspace(
-                    patch_bytes,
-                    cwd=Path(repo_root),
-                    expected_baseline_tree=base_tree,
-                    expected_target_tree=validated_tree
-                )
-                if applied:
-                    try:
-                        post_apply_state = capture_parent_state(repo_root, env=env if env is not None else os.environ, require_index=False)
-                        if post_apply_state["index_tree"] != initial_index_tree:
-                            print(f"\n❌ [Triad Closed Loop Error] Git index unexpectedly modified during patch application.", file=sys.stderr)
-                            sys.exit(1)
-                    except Exception as e:
-                        print(f"\n❌ [Triad Closed Loop Error] Failed to verify post-apply repository state: {e}", file=sys.stderr)
-                        sys.exit(1)
-                    print("✓ Successfully applied verified patch to working tree!")
-                    notify_event("Self-Healing Patch Applied", f"Merged {line_count} lines of verified fixes to main workspace.", status="success", timeout=1.5)
-                    print("\n[Triad Closed Loop Notice] A self-healing patch was applied to your working tree.")
-                else:
-                    print("! Error: Could not cleanly merge verified patch back to main working tree.")
-                    if recovery_path and recovery_path.exists():
-                        print(f"[Triad Notice] Preserved verified recovery patch at {recovery_path}")
-                    notify_event("Patch Merge Conflict", "Could not cleanly merge verified patch back to main working tree.", status="failed", timeout=1.5)
-                    sys.exit(1)
-            else:
-                print("\n[Triad Closed Loop Note] A verified self-healing patch was produced in the worktree.")
-                if recovery_path and recovery_path.exists():
-                    print(f"[Triad Notice] Preserved verified recovery patch at {recovery_path}")
-                print("Run with '--apply-verified' to automatically merge passing self-healing fixes into your main workspace.")
-                sys.exit(1)
-
+        _run_in_isolated_worktree(
+            args, env,
+            repo_root=repo_root,
+            prefix="triad-auto",
+            require_index=False,
+            runner=lambda a, e: _run_auto(a, env=e),
+            error_label="Triad Worktree Error",
+            phase_label="auto execution",
+            nm_phase_label="auto-execution",
+            enforce_clean_explicit_ref=True,
+            pause_commit_after_apply=False,
+            notify_async=False,
+        )
         return
 
     _run_auto(args, env=env)
 
 
-def _run_auto(args, env: Optional[Dict[str, str]] = None):
+def _resolve_auto_inputs(args) -> Tuple[str, str, Optional[str]]:
+    """Normalize the (prompt, diff, context) triple that ``triad auto`` classifies."""
+    diff_file = getattr(args, "diff_file", None)
+    stdin_is_diff = diff_file == "-"
+
     prompt = getattr(args, "prompt", "")
     if isinstance(prompt, list):
         prompt = " ".join(prompt).strip()
-    if not prompt and not sys.stdin.isatty():
+    # stdin can only be consumed once: when it carries the diff, never read it as the prompt.
+    if not prompt and not stdin_is_diff and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
     setattr(args, "prompt", prompt)
 
     diff_content = ""
-    if getattr(args, "diff_file", None):
-        if args.diff_file == "-":
+    if diff_file:
+        if stdin_is_diff:
             diff_content = sys.stdin.read()
-        elif os.path.exists(args.diff_file):
-            with open(args.diff_file, "r", encoding="utf-8", errors="replace") as f:
+        elif os.path.exists(diff_file):
+            with open(diff_file, "r", encoding="utf-8", errors="replace") as f:
                 diff_content = f.read()
 
-    context = getattr(args, "context", None)
+    context = getattr(args, "context", None) or None
+    context_file = getattr(args, "context_file", "")
+    if context_file and os.path.exists(context_file):
+        with open(context_file, "r", encoding="utf-8", errors="replace") as f:
+            context = f.read()
+    return prompt, diff_content, context
+
+
+def _print_classification_only(args) -> None:
+    """``triad auto --classify-only``: emit the intent decision as JSON without executing it."""
+    prompt, diff_content, context = _resolve_auto_inputs(args)
+    classification = classify_intent(prompt, context=context, diff=diff_content)
+    if getattr(args, "competition", False):
+        classification.suggested_engine = "competition"
+    payload = {
+        "intent": classification.intent,
+        "confidence": classification.confidence,
+        "reason": classification.reason,
+        "suggested_mode": classification.suggested_mode,
+        "suggested_engine": classification.suggested_engine,
+        "high_stakes": classification.high_stakes,
+        "metadata": classification.metadata,
+    }
+    print(json.dumps(payload, indent=2))
+
+
+def _run_auto(args, env: Optional[Dict[str, str]] = None):
+    prompt, diff_content, context = _resolve_auto_inputs(args)
     classification = classify_intent(prompt, context=context, diff=diff_content)
 
     # Force competition if user passed flag
@@ -4991,25 +5054,31 @@ def main():
     p_auto.add_argument("--context", default="", help="Inline context or error snippet")
     p_auto.add_argument("--context-file", default="", help="Path to context file")
     p_auto.add_argument("--competition", action="store_true", help="Force competition mode regardless of auto-stake assessment")
+    p_auto.add_argument("--adversarial", action="store_true", help="Execute Red/Blue adversarial arena audit")
     p_auto.add_argument("--engine", default="auto", help="Advisor engine override")
     p_auto.add_argument("--cached", "--staged", action="store_true", help="Review staged changes if routing to review")
-    p_auto.add_argument("--head", action="store_true", help="Review latest commit (HEAD~1) if routing to review")
+    p_auto.add_argument("--head", action="store_true", help="Review the most recent commit (HEAD~1..HEAD) if routing to review")
     p_auto.add_argument("--worktree", "-w", action="store_true", help="Execute in an isolated ephemeral git worktree")
     p_auto.add_argument("--ref", default="HEAD", help="Git ref/branch/commit to base ephemeral worktree on (default: HEAD)")
     p_auto.add_argument("--apply-verified", action="store_true", help="Apply passing self-healing patches back to parent working tree")
     p_auto.add_argument("--test-timeout", type=int, default=300, help="Test runner timeout in seconds (default 300)")
+    p_auto.add_argument("--classify-only", action="store_true", help="Print the intent classification as JSON and exit without executing")
 
     # doctor
-    p_doc = subparsers.add_parser("doctor", help="Run comprehensive health and billing audit across all platforms")
+    p_doc = subparsers.add_parser("doctor", help="Run comprehensive health and billing audit across all platforms (exit 1 if no advisor is usable)")
+    p_doc.add_argument("--quick", action="store_true", help="Skip the live Claude probe (saves a Claude Pro turn)")
+    p_doc.add_argument("--json", action="store_true", help="Emit the structured report as JSON")
+    p_doc.add_argument("--reset-circuits", action="store_true", help="Clear advisor circuit-breaker cooldowns before the audit")
 
     # review
     p_rev = subparsers.add_parser("review", help="Review a git diff with the Advisory Council")
     p_rev.add_argument("prompt", nargs="?", default="", help="Specific review instructions or feature intent")
     p_rev.add_argument("--diff-file", default="", help="Path to diff file or - for stdin")
     p_rev.add_argument("--cached", "--staged", action="store_true", help="Review staged changes")
-    p_rev.add_argument("--head", action="store_true", help="Review latest commit (HEAD~1)")
+    p_rev.add_argument("--head", action="store_true", help="Review the most recent commit (HEAD~1..HEAD)")
     p_rev.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, ollama, mock)")
     p_rev.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
+    p_rev.add_argument("--adversarial", action="store_true", help="Execute Red/Blue adversarial arena security and resilience audit")
 
     # consult
     p_con = subparsers.add_parser("consult", help="Consult Advisory Council on architectural design")
@@ -5018,6 +5087,7 @@ def main():
     p_con.add_argument("--context-file", default="", help="Path to context file")
     p_con.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, ollama, mock)")
     p_con.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
+    p_con.add_argument("--adversarial", action="store_true", help="Execute Red/Blue adversarial arena architecture challenge")
 
     # debug
     p_dbg = subparsers.add_parser("debug", help="Diagnose a stubborn error or bug with Advisory Council")
@@ -5026,6 +5096,7 @@ def main():
     p_dbg.add_argument("--context-file", default="", help="Path to context file")
     p_dbg.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, ollama, mock)")
     p_dbg.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
+    p_dbg.add_argument("--adversarial", action="store_true", help="Execute Red/Blue adversarial diagnosis")
 
     # gate
     p_gate = subparsers.add_parser("gate", help="Run full pre-commit verification (tsc + tests + diff review)")

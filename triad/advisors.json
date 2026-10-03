@@ -3,7 +3,7 @@
     {
       "name": "claude",
       "display_name": "Claude 3.7 Sonnet (Claude Pro)",
-      "binary_path": "C:\\Users\\micha\\.local\\bin\\claude.exe",
+      "binary_path": "~/.local/bin/claude.exe",
       "fallback_binary": "claude",
       "priority": 1,
       "execution_flags": [
@@ -23,7 +23,7 @@
     {
       "name": "codex",
       "display_name": "OpenAI Codex (gpt-6-astra via ChatGPT Plus)",
-      "binary_path": "C:\\Users\\micha\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe",
+      "binary_path": "{localappdata}/Programs/OpenAI/Codex/bin/codex.exe",
       "fallback_binary": "codex",
       "priority": 2,
       "execution_flags": [
@@ -63,7 +63,7 @@
     {
       "name": "ollama",
       "display_name": "Ollama Local Advisor (qwen2.5-coder:14b)",
-      "binary_path": "C:\\Users\\micha\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
+      "binary_path": "{localappdata}/Programs/Ollama/ollama.exe",
       "fallback_binary": "ollama",
       "priority": 4,
       "execution_flags": [
@@ -72,6 +72,7 @@
       ],
       "input_mode": "stdin",
       "output_mode": "stdout",
+      "readiness_port": "{port_ollama}",
       "env": {
         "PYTHONIOENCODING": "utf-8"
       },
@@ -80,6 +81,7 @@
     {
       "name": "mock",
       "display_name": "Mock Test Advisor",
+      "role": "test",
       "binary_path": "python",
       "fallback_binary": "python3",
       "priority": 99,

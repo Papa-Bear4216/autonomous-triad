@@ -13,7 +13,9 @@ import sys
 import subprocess
 import argparse
 import os
+import shutil
 import tempfile
+from pathlib import Path
 
 # Ensure UTF-8 output on Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -21,15 +23,75 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-def kill_process_tree(pid: int):
-    """Force kill a process and all its descendants on Windows."""
+_HOME = Path.home()
+_LOCAL_APPDATA = Path(os.environ.get("LOCALAPPDATA", str(_HOME / "AppData" / "Local")))
+
+# Places the triad package may live relative to this skill (repo checkout or ~/.agents install)
+_TRIAD_CANDIDATE_ROOTS = [
+    Path(__file__).resolve().parents[2],          # <repo>/skills/claude-advisor -> <repo>
+    _HOME / ".agents",                             # ~/.agents/triad/*.py  (installed flat copy)
+    _HOME / "projects" / "autonomous-triad",
+]
+_TRIAD_IMPORT_ATTEMPTED = False
+_TRIAD_ADVISOR_MANAGER = None
+_TRIAD_COMPETITION = None
+
+
+def _import_triad():
+    """Best-effort import of the shared Triad engine so this skill does not drift from it."""
+    global _TRIAD_IMPORT_ATTEMPTED, _TRIAD_ADVISOR_MANAGER, _TRIAD_COMPETITION
+    if _TRIAD_IMPORT_ATTEMPTED:
+        return _TRIAD_ADVISOR_MANAGER, _TRIAD_COMPETITION
+    _TRIAD_IMPORT_ATTEMPTED = True
+    env_root = os.environ.get("TRIAD_ROOT", "").strip()
+    roots = ([Path(os.path.expanduser(env_root))] if env_root else []) + _TRIAD_CANDIDATE_ROOTS
+    for root in roots:
+        if root.exists() and str(root) not in sys.path:
+            sys.path.append(str(root))
+    # Also ensure flat installed path is available for direct imports
+    flat_triad = _HOME / ".agents" / "triad"
+    if flat_triad.exists() and str(flat_triad) not in sys.path:
+        sys.path.append(str(flat_triad))
     try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5
-        )
+        from triad import advisor_manager as am  # type: ignore
+        from triad import competition as comp    # type: ignore
+        _TRIAD_ADVISOR_MANAGER, _TRIAD_COMPETITION = am, comp
+    except Exception as exc1:
+        try:
+            import advisor_manager as am  # type: ignore
+            import competition as comp    # type: ignore
+            _TRIAD_ADVISOR_MANAGER, _TRIAD_COMPETITION = am, comp
+        except Exception as exc2:
+            print(f"[Advisor Warning] Could not import triad engine ({exc1}; {exc2}); falling back to standalone advisor path.", file=sys.stderr)
+    return _TRIAD_ADVISOR_MANAGER, _TRIAD_COMPETITION
+
+
+def _resolve(cmd: str, *defaults: Path) -> str:
+    """Resolve a CLI binary: PATH first, then conventional per-user locations."""
+    which = shutil.which(cmd)
+    if which:
+        return which
+    for d in defaults:
+        if d.exists():
+            return str(d)
+    return cmd
+
+
+def kill_process_tree(pid: int):
+    """Force kill a process and all its descendants (delegates to triad.procutil when available)."""
+    am, _ = _import_triad()
+    if am is not None:
+        try:
+            am.kill_process_tree(pid)
+            return
+        except Exception:
+            pass
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        else:
+            import signal
+            os.kill(pid, signal.SIGKILL)
     except Exception:
         pass
 
@@ -65,9 +127,7 @@ def build_prompt(prompt: str, context: str = None, diff: str = None, mode: str =
         return f"{system_preamble}\nQUERY:\n{prompt}\n\nCONTEXT:\n{context or ''}\n"
 
 def query_claude(prompt: str, context: str = None, diff: str = None, mode: str = "general") -> str:
-    claude_path = r"C:\Users\micha\.local\bin\claude.exe"
-    if not os.path.exists(claude_path):
-        claude_path = "claude"
+    claude_path = _resolve("claude", _HOME / ".local" / "bin" / "claude.exe", _HOME / ".local" / "bin" / "claude")
 
     full_prompt = build_prompt(prompt, context=context, diff=diff, mode=mode)
 
@@ -124,9 +184,7 @@ def query_claude(prompt: str, context: str = None, diff: str = None, mode: str =
         return f"[Error calling Claude Advisor: {e}]"
 
 def query_codex(prompt: str, context: str = None, diff: str = None, mode: str = "general") -> str:
-    codex_path = r"C:\Users\micha\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe"
-    if not os.path.exists(codex_path):
-        codex_path = "codex"
+    codex_path = _resolve("codex", _LOCAL_APPDATA / "Programs" / "OpenAI" / "Codex" / "bin" / "codex.exe")
 
     full_prompt = build_prompt(prompt, context=context, diff=diff, mode=mode)
 
@@ -215,28 +273,9 @@ def query_competition(
     advisor_names: tuple = ("claude", "codex")
 ) -> str:
     """Executes concurrent dual-advisor review & structured synthesis via Triad Competition Council."""
-    try:
-        from triad.competition import query_competition_council
-    except ImportError:
-        candidate_paths = [
-            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
-            r"C:\Users\micha\projects\autonomous-triad",
-            r"C:\Users\micha\.agents\triad",
-            r"C:\Users\micha\.agents",
-        ]
-        for p in candidate_paths:
-            if os.path.exists(p) and p not in sys.path:
-                sys.path.insert(0, p)
-        try:
-            from triad.competition import query_competition_council
-        except ImportError:
-            try:
-                from competition import query_competition_council
-            except ImportError:
-                query_competition_council = None
-
-    if query_competition_council:
-        session = query_competition_council(
+    _, comp = _import_triad()
+    if comp is not None:
+        session = comp.query_competition_council(
             prompt,
             context=context,
             diff=diff,
@@ -262,6 +301,19 @@ def query_advisor(
         advisors = ("mock", "mock") if engine == "mock" else ("claude", "codex")
         return query_competition(prompt, context=context, diff=diff, mode=mode, timeout=timeout, advisor_names=advisors)
 
+    # Preferred path: the shared, config-driven advisor manager (advisors.json priorities,
+    # Nous/Ollama/mock advisors, structured failover, telemetry). This keeps the skill in
+    # lock-step with `triad review/consult/debug`.
+    am, _ = _import_triad()
+    if am is not None:
+        return am.query_configured_advisor(engine or "auto", prompt, context=context, diff=diff, mode=mode, timeout=timeout)
+
+    # Standalone fallback (skill copied without the triad package)
+    if engine not in (None, "auto", "claude", "codex"):
+        raise RuntimeError(
+            f"Advisor {engine!r} requires the shared Triad manager"
+        )
+
     if engine == "codex":
         return query_codex(prompt, context=context, diff=diff, mode=mode)
     elif engine == "claude":
@@ -280,7 +332,7 @@ def main():
     parser = argparse.ArgumentParser(description="Query Claude or OpenAI Codex as an autonomous advisor.")
     parser.add_argument("prompt", nargs="?", default="", help="The question or task prompt")
     parser.add_argument("--mode", choices=["general", "review_diff", "architect", "debug"], default="general")
-    parser.add_argument("--engine", choices=["auto", "claude", "codex", "competition", "mock"], default="auto", help="Advisor engine (default: auto with failover)")
+    parser.add_argument("--engine", default="auto", help="Advisor engine: auto (priority failover), competition, or any advisors.json name (claude, codex, nous, ollama, mock)")
     parser.add_argument("--competition", action="store_true", help="Execute Claude Code & OpenAI Codex concurrently with structured synthesis")
     parser.add_argument("--context", default="", help="Relevant code or context")
     parser.add_argument("--diff-file", default="", help="Path to a diff file or - for stdin")
@@ -297,7 +349,7 @@ def main():
                 diff_content = f.read()
 
     prompt = args.prompt
-    if not prompt and not sys.stdin.isatty() and not args.diff_file == "-":
+    if not prompt and not sys.stdin.isatty() and args.diff_file != "-":
         prompt = sys.stdin.read().strip()
 
     if not prompt and not diff_content:

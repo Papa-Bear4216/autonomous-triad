@@ -7,6 +7,7 @@ Uses model-as-a-judge scoring (replacing keyword matching) and negative controls
 
 import sys
 import os
+import re
 import json
 import argparse
 from pathlib import Path
@@ -40,7 +41,7 @@ class JudgeUnavailableError(RuntimeError):
     """Raised when judging instruments cannot provide an authoritative evaluation."""
     pass
 
-def query_judge(prompt: str, timeout: int = 30) -> str:
+def query_judge(prompt: str, timeout: int = 90) -> str:
     """
     Independent judging instrument with zero-downtime failover (Claude -> Codex).
     Fixed across all reviewed engines to maintain measurement validity and score comparability.
@@ -98,7 +99,7 @@ def judge_catch(bug_description: str, review_response: str) -> bool:
         "Score the reviewer's final verdict, not exploratory or retracted hypotheses.\n"
         "Answer with exactly one word: YES or NO."
     )
-    verdict = query_judge(judge_prompt, timeout=30)
+    verdict = query_judge(judge_prompt, timeout=90)
     return _parse_judge_verdict(verdict)
 
 def judge_false_positive(review_response: str) -> bool:
@@ -114,7 +115,7 @@ def judge_false_positive(review_response: str) -> bool:
         "Answer YES only if the review's final verdict asserts that the diff itself introduces an actual defect, bug, or vulnerability.\n"
         "Answer with exactly one word: YES or NO."
     )
-    verdict = query_judge(judge_prompt, timeout=30)
+    verdict = query_judge(judge_prompt, timeout=90)
     return _parse_judge_verdict(verdict)
 
 def run_benchmark(

@@ -107,5 +107,54 @@ class TestIntentEngine(unittest.TestCase):
         self.assertTrue(is_high_stakes("Fixing race condition and deadlock in pool"))
         self.assertFalse(is_high_stakes("Change background color of button to blue"))
 
+    def test_review_beats_device_keywords(self):
+        """Code review of mobile code must not be forwarded to the phone bridge."""
+        res = classify_intent("review the android SMS notification handler")
+        self.assertEqual(res.intent, "REVIEW")
+        self.assertEqual(res.suggested_mode, "review_diff")
+        self.assertNotEqual(res.suggested_engine, "hermes")
+
+    def test_architect_beats_device_for_comparisons(self):
+        res = classify_intent("compare these android SMS approaches")
+        self.assertEqual(res.intent, "ARCHITECT")
+        self.assertEqual(res.suggested_mode, "architect")
+
+    def test_gate_still_beats_review_when_both_match(self):
+        res = classify_intent("review this pre-commit verification before pushing")
+        self.assertEqual(res.intent, "GATE")
+
+    def test_high_stakes_hyphenated_compounds(self):
+        self.assertTrue(is_high_stakes("fix auth-token race"))
+        self.assertTrue(is_high_stakes("update db-migration script"))
+
+    def test_debugging_inflection(self):
+        res = classify_intent("debugging the queue")
+        self.assertEqual(res.intent, "DEBUG")
+
+    def test_micro_task_routing(self):
+        res = classify_intent("format this file and sort imports")
+        self.assertEqual(res.intent, "MICRO")
+        self.assertEqual(res.suggested_engine, "ollama")
+
+    def test_bare_token_and_migration_not_high_stakes(self):
+        self.assertFalse(is_high_stakes("design tokens for the landing page"))
+        self.assertFalse(is_high_stakes("migration guide documentation"))
+        self.assertTrue(is_high_stakes("validate access token"))
+        self.assertTrue(is_high_stakes("run database migration"))
+
+    def test_gate_beats_micro(self):
+        res = classify_intent("run pre-commit and sort imports")
+        self.assertEqual(res.intent, "GATE")
+
+    def test_high_stakes_beats_micro(self):
+        res = classify_intent("generate docstring for the auth token verifier")
+        self.assertTrue(res.high_stakes)
+        self.assertNotEqual(res.intent, "MICRO")
+
+    def test_gate_beats_debug(self):
+        res = classify_intent("run pre-commit verification and fix debugging issues")
+        self.assertEqual(res.intent, "GATE")
+
+
 if __name__ == "__main__":
     unittest.main()

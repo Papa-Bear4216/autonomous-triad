@@ -28,31 +28,38 @@ Execute via PowerShell:
 
 ### 1. Diff Review (Pre-Commit Gate)
 ```powershell
-python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "Reviewing changes for [feature name]" --mode review_diff --diff-file -
+python $env:USERPROFILE\.agents\skills\claude-advisor\advisor.py "Reviewing changes for [feature name]" --mode review_diff --diff-file -
 ```
 *(Or pass a path to a diff file)*
 
 ### 2. Architectural Consultation
 ```powershell
-python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "Should we use optimistic UI or server-confirmed state for this queue?" --mode architect --context "Relevant schema / interfaces here"
+python $env:USERPROFILE\.agents\skills\claude-advisor\advisor.py "Should we use optimistic UI or server-confirmed state for this queue?" --mode architect --context "Relevant schema / interfaces here"
 ```
 
 ### 3. Stubborn Bug Diagnosis
 ```powershell
-python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "TypeError: Type 'string | undefined' is not assignable to type 'string'" --mode debug --context "Function definition and caller"
+python $env:USERPROFILE\.agents\skills\claude-advisor\advisor.py "TypeError: Type 'string | undefined' is not assignable to type 'string'" --mode debug --context "Function definition and caller"
 ```
 
 ### 4. Competition Mode (Dual-Advisor Concurrent Adjudication)
 ```powershell
-python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "Reviewing changes for [feature name]" --mode review_diff --diff-file - --competition
-python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "Should we migrate to WebSocket or Server-Sent Events?" --mode architect --competition
+python $env:USERPROFILE\.agents\skills\claude-advisor\advisor.py "Reviewing changes for [feature name]" --mode review_diff --diff-file - --competition
+python $env:USERPROFILE\.agents\skills\claude-advisor\advisor.py "Should we migrate to WebSocket or Server-Sent Events?" --mode architect --competition
 ```
 
 ### 5. Engine Override (Optional)
 ```powershell
-python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "..." --engine codex   # Force OpenAI Codex
-python C:\Users\micha\.agents\skills\claude-advisor\advisor.py "..." --engine claude  # Force Claude Code
+python $env:USERPROFILE\.agents\skills\claude-advisor\advisor.py "..." --engine codex   # Force OpenAI Codex
+python $env:USERPROFILE\.agents\skills\claude-advisor\advisor.py "..." --engine claude  # Force Claude Code
+python $env:USERPROFILE\.agents\skills\claude-advisor\advisor.py "..." --engine ollama  # Any advisors.json name works
 ```
+
+## Routing
+When the Triad engine is importable (repo checkout, `~/.agents/triad`, or `TRIAD_ROOT`), `advisor.py` delegates
+to `triad.advisor_manager` so it honours `advisors.json` priorities, structured failover and per-call telemetry -
+identical behaviour to `triad review / consult / debug`. Without the engine it falls back to a built-in
+Claude -> Codex bridge.
 
 ## Response Handling
 Antigravity ingests the advisory council's feedback, adjusts the code or plan accordingly, applies edits with surgical precision, and verifies with the local test suite.

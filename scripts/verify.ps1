@@ -8,7 +8,8 @@ $ErrorActionPreference = "Stop"
 Write-Host "Running Triad verification..." -ForegroundColor Cyan
 triad doctor
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "`nAll Triad subsystems verified successfully!" -ForegroundColor Green
+    Write-Host "`nTriad advisory council is healthy (at least one enabled advisor is usable)." -ForegroundColor Green
 } else {
-    Write-Host "`nTriad verification reported an issue." -ForegroundColor Red
+    Write-Host "`nTriad verification reported a problem: no enabled advisor is currently usable." -ForegroundColor Red
 }
+exit $LASTEXITCODE

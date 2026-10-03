@@ -9,11 +9,13 @@ Verifies:
 - Auto-failover logic across configured advisor priorities
 """
 
+import os
 import sys
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from triad.advisor_manager import (
     get_advisors,
@@ -21,11 +23,45 @@ from triad.advisor_manager import (
     query_configured_advisor,
     add_advisor,
     save_config,
+    expand_env_value,
     DEFAULT_CONFIG_PATH,
 )
 
 
 class TestAdvisorManager(unittest.TestCase):
+    def setUp(self):
+        # Keep live advisor probes from writing into the user's real circuit file.
+        self._circuit_tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._circuit_tmp.close()
+        self._circuit_env = patch.dict(os.environ, {
+            "TRIAD_CIRCUIT_PATH": self._circuit_tmp.name,
+            "TRIAD_CIRCUIT": "1",
+        })
+        self._circuit_env.start()
+
+    def tearDown(self):
+        self._circuit_env.stop()
+        try:
+            os.unlink(self._circuit_tmp.name)
+        except OSError:
+            pass
+
+    def test_expand_env_value_leaves_tokens_alone(self):
+        self.assertEqual(expand_env_value("API_KEY", "sk-$HOME-%USERPROFILE%"), "sk-$HOME-%USERPROFILE%")
+        self.assertEqual(expand_env_value("PYTHONIOENCODING", "utf-8"), "utf-8")
+        self.assertEqual(expand_env_value("SERVICE_URL", "https://api.anthropic.com/v1"), "https://api.anthropic.com/v1")
+
+    def test_expand_env_value_expands_path_keys(self):
+        expanded = expand_env_value("TRIAD_CLAUDE_PATH", "{home}/.local/bin/claude.exe")
+        self.assertNotIn("{home}", expanded)
+        self.assertTrue(expanded.endswith(".local\\bin\\claude.exe") or expanded.endswith(".local/bin/claude.exe"))
+
+        path_expanded = expand_env_value("PATH", "{home}/bin")
+        self.assertNotIn("{home}", path_expanded)
+
+        models_expanded = expand_env_value("OLLAMA_MODELS", "{home}/.ollama/models")
+        self.assertNotIn("{home}", models_expanded)
+
     def test_get_advisors_loading_and_sorting(self):
         """Verify advisors are loaded from advisors.json in priority order."""
         advisors = get_advisors()
@@ -173,6 +209,34 @@ class TestAdvisorManager(unittest.TestCase):
                 try:
                     temp_config_path.unlink()
                 except Exception:
+                    pass
+
+
+    def test_resolve_binary_precedence(self):
+        from triad.advisor_manager import resolve_binary
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".exe", delete=False) as f_cfg:
+            f_cfg.write("")
+            cfg_path = f_cfg.name
+        with tempfile.NamedTemporaryFile("w", suffix=".exe", delete=False) as f_env:
+            f_env.write("")
+            env_path = f_env.name
+
+        try:
+            # 1. Configured binary takes precedence over canonical binary
+            resolved = resolve_binary(binary_path=cfg_path, advisor_name="claude")
+            self.assertEqual(resolved, cfg_path)
+
+            # 2. Environment override takes precedence over configured binary
+            with patch.dict(os.environ, {"TRIAD_CLAUDE_PATH": env_path}):
+                resolved_env = resolve_binary(binary_path=cfg_path, advisor_name="claude")
+                self.assertEqual(resolved_env, env_path)
+        finally:
+            for p in (cfg_path, env_path):
+                try:
+                    os.unlink(p)
+                except OSError:
                     pass
 
 

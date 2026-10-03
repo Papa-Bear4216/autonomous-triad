@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-triad"
+version = "3.2.0"
+description = "Autonomous multi-agent CLI orchestrator: zero-token MCP stripping, advisory-council failover, isolated worktree gates."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Papa-Bear4216" }]
+keywords = ["ai-agents", "code-review", "pre-commit", "claude", "codex", "orchestration"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Quality Assurance",
+]
+# The engine has no hard third-party dependencies; psutil only improves process-tree cleanup.
+dependencies = []
+
+[project.optional-dependencies]
+proc = ["psutil>=5.9"]
+dev = ["psutil>=5.9"]
+
+[project.scripts]
+triad = "triad.triad_engine:main"
+
+[project.urls]
+Homepage = "https://github.com/Papa-Bear4216/autonomous-triad"
+
+[tool.setuptools]
+packages = ["triad", "triad.bench"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+triad = ["advisors.json", "empty-mcp.json"]
+"triad.bench" = ["swebench_instances.json", "cases/*", "cases_v1/*"]

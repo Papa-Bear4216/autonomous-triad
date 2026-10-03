@@ -44,5 +44,29 @@ if (-not (Test-Path $advisorSkillDir)) {
 }
 Copy-Item "$repoRoot\skills\claude-advisor\*" $advisorSkillDir -Recurse -Force
 
-Write-Host "Installation successful! Verifying triad health..." -ForegroundColor Cyan
-& python "$triadDir\triad_engine.py" doctor
+# 5. Ensure ~/.local/bin is on the user PATH so `triad` resolves from any shell
+try {
+    $regKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+    if ($regKey) {
+        $rawPath = [string]$regKey.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $pathKind = try { $regKey.GetValueKind("Path") } catch { [Microsoft.Win32.RegistryValueKind]::String }
+        if (-not ($rawPath -split ";" | Where-Object { $_ -eq $localBin })) {
+            Write-Host "Adding $localBin to user PATH (preserving $pathKind)..." -ForegroundColor Green
+            $newPath = if ($rawPath.Trim()) { "$rawPath;$localBin" } else { $localBin }
+            $regKey.SetValue("Path", $newPath, $pathKind)
+        }
+        $regKey.Close()
+    }
+} catch {
+    Write-Warning "Could not update User Environment Path in registry: $_"
+}
+if (-not ($env:Path -split ";" | Where-Object { $_ -eq $localBin })) {
+    $env:Path = "$env:Path;$localBin"
+}
+
+Write-Host "Installation successful! Verifying triad health (quick mode, no live advisor probe)..." -ForegroundColor Cyan
+& python "$triadDir\triad_engine.py" doctor --quick
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Triad installed successfully, but no enabled advisor is currently authenticated. Run 'codex login', configure API keys, or enable local Ollama to complete setup."
+}
+exit 0

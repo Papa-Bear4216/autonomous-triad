@@ -14,6 +14,7 @@ swebench_full_output.txt
 swebench_full_run.txt
 swebench_*.txt
 codex_test_out.txt
+.triad_proposed_fix.patch
 
 # Environment & credentials (Strict Invariant: No Secrets)
 .env

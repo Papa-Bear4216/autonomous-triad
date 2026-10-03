@@ -10,13 +10,28 @@ Config-driven management and dynamic query routing for advisory models:
 
 import sys
 import os
-import re
 import subprocess
 import json
+import time
 import tempfile
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Tuple
+
+try:
+    from triad.procutil import kill_process_tree, is_failed_advisor_response, classify_advisor_response, is_port_open
+    from triad.paths import expand_path, PORT_OLLAMA, CLAUDE_PATH, CODEX_PATH, HERMES_PATH, OLLAMA_PATH
+    from triad.circuit import (
+        is_circuit_open, circuit_remaining, circuit_reason,
+        record_success, record_failure,
+    )
+except ImportError:  # flat install (~/.agents/triad) without the package prefix
+    from procutil import kill_process_tree, is_failed_advisor_response, classify_advisor_response, is_port_open
+    from paths import expand_path, PORT_OLLAMA, CLAUDE_PATH, CODEX_PATH, HERMES_PATH, OLLAMA_PATH
+    from circuit import (
+        is_circuit_open, circuit_remaining, circuit_reason,
+        record_success, record_failure,
+    )
 
 # Ensure UTF-8 console output
 if hasattr(sys.stdout, "reconfigure"):
@@ -27,32 +42,107 @@ if hasattr(sys.stderr, "reconfigure"):
 TRIAD_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = TRIAD_DIR / "advisors.json"
 DEFAULT_EMPTY_MCP = TRIAD_DIR / "empty-mcp.json"
+LOGS_DIR = TRIAD_DIR / "logs"
+ADVISOR_CALLS_LOG = LOGS_DIR / "advisor_calls.jsonl"
+
+LIMIT_MARKERS = ("session limit", "rate limit", "usage limit")
+TEST_ROLES = frozenset({"test", "mock"})
 
 
-import psutil
+def test_advisors_allowed() -> bool:
+    """Explicit ``--engine mock`` still works; this only gates *auto* failover."""
+    return os.environ.get("TRIAD_ALLOW_MOCK", "").strip().lower() in ("1", "true", "yes", "on")
 
-def kill_process_tree(pid: int) -> None:
-    """Force-terminate a process and all child descendants on Windows."""
+
+def is_test_advisor(advisor: Dict[str, Any]) -> bool:
+    name = str(advisor.get("name") or "").lower()
+    role = str(advisor.get("role") or "").lower()
+    return name == "mock" or role in TEST_ROLES
+
+
+def _resolve_readiness_port(advisor: Dict[str, Any]) -> Optional[int]:
+    raw = advisor.get("readiness_port")
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        token = raw.strip()
+        if token in ("{port_ollama}", "ollama"):
+            return PORT_OLLAMA
+        if token.isdigit():
+            return int(token)
+        return None
     try:
-        parent = psutil.Process(pid)
-        for child in parent.children(recursive=True):
-            try:
-                child.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        parent.kill()
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def advisor_is_ready(advisor: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Cheap preflight: skip advisors whose local daemon is down or whose binary
+    cannot be resolved, instead of burning the full subprocess timeout.
+    """
+    port = _resolve_readiness_port(advisor)
+    if port is not None and not is_port_open("127.0.0.1", port, timeout=0.2):
+        return False, f"port {port} closed"
+    raw = advisor.get("binary_path", "")
+    fallback = advisor.get("fallback_binary")
+    if not raw and not fallback:
+        return True, ""
+    resolved = resolve_binary(str(raw), fallback, advisor_name=advisor.get("name"))
+    if not resolved:
+        return False, "no binary resolved"
+    if resolved in ("python", "python3", sys.executable):
+        return True, ""
+    path = Path(resolved)
+    try:
+        if path.exists() or shutil.which(resolved):
+            return True, ""
+    except OSError:
         pass
+    return False, f"binary not found: {resolved}"
+
+
+def _record_circuit_outcome(advisor: Dict[str, Any], text: str, track_circuit: bool = True, call_start_time: Optional[float] = None) -> None:
+    if not track_circuit:
+        return
+    if is_test_advisor(advisor):
+        return
+    name = str(advisor.get("name") or "")
+    if not name:
+        return
+    try:
+        kind = classify_advisor_response(text)
+        if kind == "ok":
+            record_success(name, track_circuit=True, call_start_time=call_start_time)
+        elif kind in ("limit", "error", "empty", "timeout"):
+            record_failure(name, kind, track_circuit=True, call_start_time=call_start_time)
     except Exception:
         pass
 
+
+def _telemetry_enabled() -> bool:
+    return os.environ.get("TRIAD_TELEMETRY", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def record_advisor_call(advisor_name: str, mode: str, elapsed_seconds: float, status: str, prompt_chars: int = 0) -> None:
+    """
+    Append one line of per-call telemetry (advisor, mode, latency, outcome) to
+    ``logs/advisor_calls.jsonl``. Best-effort and silent; disable with TRIAD_TELEMETRY=0.
+    """
+    if not _telemetry_enabled():
+        return
     try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5
-        )
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(ADVISOR_CALLS_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "advisor": advisor_name,
+                "mode": mode,
+                "status": status,
+                "elapsed_seconds": round(elapsed_seconds, 2),
+                "prompt_chars": prompt_chars,
+            }) + "\n")
     except Exception:
         pass
 
@@ -108,14 +198,23 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[Union[str, Pa
         json.dump(config_data, f, indent=2)
 
 
-def get_advisors(config_path: Optional[Union[str, Path]] = None, enabled_only: bool = False) -> List[Dict[str, Any]]:
+def get_advisors(
+    config_path: Optional[Union[str, Path]] = None,
+    enabled_only: bool = False,
+    production_only: bool = False,
+) -> List[Dict[str, Any]]:
     """
     Return all configured advisors ordered by priority (lower priority number = higher precedence).
+
+    ``production_only`` drops test/mock advisors so auto-failover can never
+    rubber-stamp a gate with ``VERDICT: APPROVED`` from the mock engine.
     """
     data = load_config(config_path)
     advisors = data.get("advisors", [])
     if enabled_only:
         advisors = [adv for adv in advisors if adv.get("enabled", True)]
+    if production_only:
+        advisors = [adv for adv in advisors if not is_test_advisor(adv)]
     return sorted(advisors, key=lambda x: x.get("priority", 999))
 
 
@@ -139,28 +238,94 @@ def get_active_advisor(name: Optional[str] = None, config_path: Optional[Union[s
     return advisors[0]
 
 
-def resolve_binary(binary_path: str, fallback_binary: Optional[str] = None) -> str:
-    """Resolve absolute executable path or check PATH."""
-    if binary_path in ("python", "python3"):
+def _resolve_one(candidate: str) -> Optional[str]:
+    """Resolve a single binary spec: python alias -> expanded absolute path -> PATH lookup."""
+    if not candidate:
+        return None
+    if candidate in ("python", "python3"):
         return sys.executable
+    expanded = expand_path(candidate)
+    if "/" in candidate or "\\" in candidate:
+        p = Path(expanded)
+        try:
+            if p.exists():
+                return str(p)
+        except OSError:
+            pass
+    which_bin = shutil.which(expanded) or shutil.which(candidate)
+    return which_bin
 
-    p = Path(binary_path)
-    if p.exists():
-        return str(p)
 
-    which_bin = shutil.which(binary_path)
-    if which_bin:
-        return which_bin
+def expand_env_value(key: str, value: str) -> str:
+    """
+    Expand path tokens in an advisor env value.
 
+    Ordinary values are returned unchanged. ``expand_path`` rewrites ``$``,
+    ``%VAR%`` and a leading ``~``, which corrupts tokens and API keys.
+    """
+    key_up = key.upper()
+    path_key_names = {"PATH", "TEMP", "TMP", "OLLAMA_MODELS", "GOOGLE_APPLICATION_CREDENTIALS"}
+    path_like = (
+        key_up in path_key_names
+        or key_up.endswith(("_PATH", "_DIR", "_FILE", "_HOME", "_ROOT"))
+        or "{home}" in value
+        or "{localappdata}" in value
+        or value == "~"
+        or value.startswith("~/")
+        or value.startswith("~\\")
+    )
+    if not path_like:
+        return value
+    if "://" in value:
+        return value
+    return str(expand_path(value))
+
+
+def resolve_binary(binary_path: str, fallback_binary: Optional[str] = None, advisor_name: Optional[str] = None) -> str:
+    """
+    Resolve an advisor executable with strict precedence:
+      1. Explicit environment override (e.g. TRIAD_CLAUDE_PATH)
+      2. Configured binary_path
+      3. Discovered / canonical default binary (paths.py)
+      4. fallback_binary
+    """
+    name = (advisor_name or "").lower()
+    canonical_map = {
+        "claude": CLAUDE_PATH,
+        "codex": CODEX_PATH,
+        "ollama": OLLAMA_PATH,
+        "hermes": HERMES_PATH,
+    }
+
+    # 1. Explicit environment override
+    if name:
+        env_var = f"TRIAD_{name.upper()}_PATH"
+        env_override = os.environ.get(env_var, "").strip()
+        if env_override:
+            res_env = _resolve_one(env_override)
+            if res_env:
+                return res_env
+
+    # 2. Configured binary_path
+    if binary_path:
+        res_cfg = _resolve_one(binary_path)
+        if res_cfg:
+            return res_cfg
+
+    # 3. Discovered / canonical default binary
+    if name in canonical_map:
+        canon = canonical_map[name]
+        try:
+            if canon.exists():
+                return str(canon)
+        except OSError:
+            pass
+
+    # 4. Fallback binary
     if fallback_binary:
-        if fallback_binary in ("python", "python3"):
-            return sys.executable
-        fb = Path(fallback_binary)
-        if fb.exists():
-            return str(fb)
-        which_fb = shutil.which(fallback_binary)
-        if which_fb:
-            return which_fb
+        res_fallback = _resolve_one(fallback_binary)
+        if res_fallback:
+            return res_fallback
 
     return binary_path
 
@@ -200,7 +365,7 @@ def remove_advisor(advisor_name: str, config_path: Optional[Union[str, Path]] = 
     return False
 
 
-def _execute_single_advisor(
+def _execute_single_advisor_raw(
     advisor: Dict[str, Any],
     prompt: str,
     context: Optional[str] = None,
@@ -211,7 +376,7 @@ def _execute_single_advisor(
     """Execute a single advisor using its declared configuration."""
     raw_bin = advisor.get("binary_path", "")
     fallback_bin = advisor.get("fallback_binary")
-    bin_path = resolve_binary(raw_bin, fallback_bin)
+    bin_path = resolve_binary(raw_bin, fallback_bin, advisor_name=advisor.get("name"))
 
     full_prompt = build_advisor_prompt(prompt, context=context, diff=diff, mode=mode)
     flags = list(advisor.get("execution_flags", []))
@@ -243,20 +408,23 @@ def _execute_single_advisor(
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     for k, v in advisor.get("env", {}).items():
-        env[k] = str(v)
+        env[k] = expand_env_value(str(k), str(v))
 
+    started = time.monotonic()
     proc = None
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE if input_mode == "stdin" else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env
-        )
+        popen_kwargs = {
+            "stdin": subprocess.PIPE if input_mode == "stdin" else None,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "env": env,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **popen_kwargs)
 
         stdin_data = full_prompt if input_mode == "stdin" else None
         stdout, stderr = proc.communicate(input=stdin_data, timeout=timeout)
@@ -276,9 +444,16 @@ def _execute_single_advisor(
         # Handle process exit codes
         if proc.returncode != 0:
             err_msg = stderr.strip() or output
-            out_lower = output.lower()
-            if "session limit" in out_lower or "rate limit" in out_lower or "usage limit" in out_lower:
-                return f"[{display_name} Session Limit]: {output}"
+            # Inspect first ~5 non-empty lines of stderr and output for authoritative limit notices
+            # (handles warning lines like Node deprecation warnings preceding limit notices)
+            err_lines = [l.strip().lower() for l in stderr.splitlines() if l.strip()][:5]
+            out_lines = [l.strip().lower() for l in output.splitlines() if l.strip()][:5]
+            checked_lines = err_lines + out_lines
+            is_limit = any(any(marker in line for marker in LIMIT_MARKERS) for line in checked_lines)
+            if is_limit:
+                record_advisor_call(advisor_name, mode, time.monotonic() - started, "limit", len(full_prompt))
+                return f"[{display_name} Session Limit]: {output or err_msg}"
+            record_advisor_call(advisor_name, mode, time.monotonic() - started, "error", len(full_prompt))
             return f"[Error from {display_name} (exit code {proc.returncode})]: {err_msg}"
 
         # Advisor-specific cleaning
@@ -288,7 +463,7 @@ def _execute_single_advisor(
                 if "Permission allow rule" in line or "Warning: no stdin data received" in line:
                     continue
                 clean_lines.append(line)
-            return "\n".join(clean_lines).strip()
+            output = "\n".join(clean_lines).strip()
 
         elif advisor_name.lower() == "codex" and not output_mode == "file":
             clean_lines = []
@@ -304,17 +479,20 @@ def _execute_single_advisor(
                     clean_lines.append(line)
             parsed = "\n".join(clean_lines).strip()
             if parsed:
-                return parsed
+                output = parsed
 
+        record_advisor_call(advisor_name, mode, time.monotonic() - started, "ok" if output else "empty", len(full_prompt))
         return output
 
     except subprocess.TimeoutExpired:
         if proc:
             kill_process_tree(proc.pid)
+        record_advisor_call(advisor_name, mode, time.monotonic() - started, "timeout", len(full_prompt))
         return f"[Error: {display_name} timed out after {timeout}s (process tree killed)]"
     except Exception as e:
         if proc:
             kill_process_tree(proc.pid)
+        record_advisor_call(advisor_name, mode, time.monotonic() - started, "error", len(full_prompt))
         return f"[Error calling {display_name}: {e}]"
     finally:
         if proc:
@@ -329,6 +507,26 @@ def _execute_single_advisor(
                 pass
 
 
+def _execute_single_advisor(
+    advisor: Dict[str, Any],
+    prompt: str,
+    context: Optional[str] = None,
+    diff: Optional[str] = None,
+    mode: str = "general",
+    timeout: int = 120,
+    track_circuit: bool = True,
+) -> str:
+    start_time = time.time()
+    result = _execute_single_advisor_raw(
+        advisor, prompt, context=context, diff=diff, mode=mode, timeout=timeout
+    )
+    try:
+        _record_circuit_outcome(advisor, result, track_circuit=track_circuit, call_start_time=start_time)
+    except Exception:
+        pass
+    return result
+
+
 def query_configured_advisor(
     advisor_name: str,
     prompt: str,
@@ -336,37 +534,76 @@ def query_configured_advisor(
     diff: Optional[str] = None,
     mode: str = "general",
     timeout: int = 120,
-    config_path: Optional[Union[str, Path]] = None
+    config_path: Optional[Union[str, Path]] = None,
+    track_circuit: bool = True,
+    force_probe: bool = False,
 ) -> str:
     """
     Query an advisor defined in advisors.json by name.
     If advisor_name is 'auto', attempts advisors in priority order with zero-downtime failover.
     """
     if advisor_name.lower() == "auto":
-        advisors = get_advisors(config_path=config_path, enabled_only=True)
+        advisors = get_advisors(
+            config_path=config_path,
+            enabled_only=True,
+            production_only=not test_advisors_allowed(),
+        )
         if not advisors:
             return "[Error: No enabled advisors found in configuration]"
 
         fail_notes = []
+        skipped = []
         for adv in advisors:
-            adv_name = adv.get("name")
-            res = _execute_single_advisor(adv, prompt, context=context, diff=diff, mode=mode, timeout=timeout)
-            is_limit = bool(re.match(r"^\[[^\]]*(?:session limit|rate limit|usage limit)[^\]]*\]", res.strip(), re.IGNORECASE))
-            is_err = res.startswith("[Error") or is_limit
-            if not is_err:
-                if fail_notes:
-                    header = f"[Advisor Auto-Failover: Preceding advisors failed ({'; '.join(fail_notes)}). Active Advisor: {adv.get('display_name')}]\n\n"
+            name = str(adv.get("name") or "unknown")
+            if is_circuit_open(name):
+                rem = int(circuit_remaining(name))
+                reason = circuit_reason(name) or "cooldown"
+                skipped.append(f"{name}: circuit open ({reason}, {rem}s left)")
+                print(f"[Triad Circuit] Skipping {name} (open: {reason}, {rem}s remaining)", file=sys.stderr)
+                continue
+            ready, why = advisor_is_ready(adv)
+            if not ready:
+                skipped.append(f"{name}: {why}")
+                print(f"[Triad Ready] Skipping {name} ({why})", file=sys.stderr)
+                continue
+            adv_timeout = int(adv.get("timeout") or timeout)
+            res = _execute_single_advisor(adv, prompt, context=context, diff=diff, mode=mode, timeout=adv_timeout, track_circuit=track_circuit)
+            if not is_failed_advisor_response(res):
+                if fail_notes or skipped:
+                    prior = "; ".join(fail_notes + skipped)
+                    header = f"[Advisor Auto-Failover: Preceding advisors failed ({prior}). Active Advisor: {adv.get('display_name')}]\n\n"
                     return header + res
                 return res
-            fail_notes.append(f"{adv.get('name')}: {res.strip()[:60]}")
+            fail_notes.append(f"{name}: {res.strip()[:60]}")
 
-        return f"[Advisor Auto-Failover Exhausted]: All configured advisors failed: {'; '.join(fail_notes)}"
+        # Circuit protection: if every ready advisor was skipped by an open circuit,
+        # respect the cooldown until expiry to prevent retry stampedes, unless force_probe is explicitly requested.
+        circuit_skipped = [adv for adv in advisors if is_circuit_open(str(adv.get("name") or "")) and advisor_is_ready(adv)[0]]
+        if circuit_skipped and not fail_notes:
+            if force_probe:
+                best_fallback = min(circuit_skipped, key=lambda a: circuit_remaining(str(a.get("name") or "")))
+                name = str(best_fallback.get("name") or "")
+                print(f"[Triad Circuit Fallback] Force-probing {name} (earliest cooldown)...", file=sys.stderr)
+                res = _execute_single_advisor(best_fallback, prompt, context=context, diff=diff, mode=mode, timeout=timeout, track_circuit=track_circuit)
+                if not is_failed_advisor_response(res):
+                    header = f"[Advisor Circuit Fallback: Preceding advisors in cooldown. Active Advisor: {best_fallback.get('display_name')}]\n\n"
+                    return header + res
+                fail_notes.append(f"{name} (fallback): {res.strip()[:60]}")
+            else:
+                earliest_adv = min(circuit_skipped, key=lambda a: circuit_remaining(str(a.get("name") or "")))
+                rem = int(circuit_remaining(str(earliest_adv.get("name") or "")))
+                reason = circuit_reason(str(earliest_adv.get("name") or "")) or "cooldown"
+                return f"[Error: All ready advisors are in cooldown ({earliest_adv.get('name')}: {reason}, {rem}s remaining)]"
+
+        parts = fail_notes + skipped
+        detail = "; ".join(parts) if parts else "none ready"
+        return f"[Advisor Auto-Failover Exhausted]: All configured advisors failed: {detail}"
 
     advisor = get_active_advisor(advisor_name, config_path=config_path)
     if not advisor:
         return f"[Error: Advisor '{advisor_name}' not found in configuration]"
 
-    return _execute_single_advisor(advisor, prompt, context=context, diff=diff, mode=mode, timeout=timeout)
+    return _execute_single_advisor(advisor, prompt, context=context, diff=diff, mode=mode, timeout=timeout, track_circuit=track_circuit)
 
 
 if __name__ == "__main__":
