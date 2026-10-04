@@ -47,3 +47,10 @@ dist/
 # Virtual environments
 .venv/
 venv/
+
+# Test & coverage artifacts
+.coverage
+.coverage.*
+.pytest_cache/
+htmlcov/
+coverage.xml

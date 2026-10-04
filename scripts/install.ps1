@@ -32,10 +32,23 @@ Copy-Item "$repoRoot\bin\triad.ps1" $localBin -Force
 
 # 3. Synchronize triad engine to ~/.agents/triad
 Write-Host "Synchronizing triad engine to $triadDir..." -ForegroundColor Green
-if (-not (Test-Path $triadDir)) {
-    New-Item -ItemType Directory -Path $triadDir -Force | Out-Null
+$item = Get-Item $triadDir -Force -ErrorAction SilentlyContinue
+$isLinked = $item -and $item.LinkType -in @('Junction','SymbolicLink')
+$norm = { param($p) if ($p) { [IO.Path]::GetFullPath($p).TrimEnd('\') } }
+$target = if ($isLinked) { & $norm ($item.Target | Select-Object -First 1) }
+$repoTriad = & $norm "$repoRoot\triad"
+if ($isLinked -and $target -ieq $repoTriad) {
+    Write-Host "Triad engine is already linked via junction ($triadDir -> $repoTriad)." -ForegroundColor Green
+} else {
+    if ($isLinked) {
+        Write-Warning "$triadDir is a link to '$target'; replacing with a real copy."
+        $item.Delete()
+    }
+    if (-not (Test-Path $triadDir)) {
+        New-Item -ItemType Directory -Path $triadDir -Force | Out-Null
+    }
+    Copy-Item "$repoRoot\triad\*" $triadDir -Recurse -Force
 }
-Copy-Item "$repoRoot\triad\*" $triadDir -Recurse -Force
 
 # 4. Synchronize claude-advisor skill to ~/.agents/skills/claude-advisor
 Write-Host "Synchronizing claude-advisor skill to $advisorSkillDir..." -ForegroundColor Green

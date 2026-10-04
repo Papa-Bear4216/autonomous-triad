@@ -25,7 +25,7 @@ proc = ["psutil>=5.9"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=5.0",
-    "pytest-xdist>=3.5",
+    "pytest-xdist>=3.5",  # Parallel test runner for CI and local gating
     "ruff>=0.6",
     "bandit>=1.7",
     "psutil>=5.9",
