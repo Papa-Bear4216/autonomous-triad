@@ -98,3 +98,32 @@
      - Advisory Council pre-commit signoff: **VERDICT: APPROVED**.
      - Pushed to `origin/master` as commit [`6c1bbf8`](https://github.com/Papa-Bear4216/autonomous-triad/commit/6c1bbf8).
 
+
+---
+
+## 7. Tier-2 Performance Optimizations (Commits `cabfb98` & `5413161`)
+- **Status:** **VERIFIED, APPROVED BY ADVISORY COUNCIL, AND PUSHED TO MASTER**
+- **Commits:**
+  - [`cabfb98`](https://github.com/Papa-Bear4216/autonomous-triad/commit/cabfb98): `feat(engine): tier-2 performance optimizations (parallel runner, multi-target union, mtime AST caching, ephemeral pycache)`
+  - [`5413161`](https://github.com/Papa-Bear4216/autonomous-triad/commit/5413161): `fix(engine): polish AST cache bounding and verify direct file cache hits`
+- **Key Enhancements:**
+  1. **Parallel Test Runner (`pytest-xdist`):**
+     - Added `--parallel` CLI flag to `triad gate` and `triad auto`.
+     - `_resolve_pytest_xdist_cmd`: auto-detects `pytest` + `xdist` availability via current `sys.executable` or `uv run --no-sync`, executing with `-n auto`, `--dist=loadfile`, and `-p no:cacheprovider` to prevent repo cache dirt.
+     - Preserves clean process isolation by running in full-suite local/CI modes while cleanly reporting bypass notices in worktree or targeted executions.
+  2. **Multi-Target Pattern Unions:**
+     - `_normalize_target`: supports comma-separated patterns (`test_a.py,test_b.py`) and resolves multi-file leaf changes into an exact union of targeted tests instead of falling back to all 339 tests.
+     - Unified `_render_unittest_suite_runner`: shared between `_build_python_isolation_script` (worktree) and `_build_python_multi_pattern_script` (local), deduplicating test cases by test-ID, warning on partial unmatched patterns, and exiting code 5 only when the suite is empty.
+     - Defensively scoped `target_patterns` to each target directory, guarded by `is_targeted` to eliminate unnecessary directory walks on full runs.
+  3. **Mtime/Size-Keyed AST Import Index Caching:**
+     - Implemented `_FILE_IMPORT_CACHE` keyed by file path, `st_mtime_ns`, and `st_size`, avoiding re-parsing unchanged Python files across multiple runs.
+     - Dropped redundant `p.resolve()` calls in `os.walk` to avoid expensive OS path resolution syscalls across hundreds of files.
+     - Enforced `_MAX_FILE_IMPORT_CACHE_ENTRIES = 5000` to prevent memory growth across long-lived processes.
+  4. **Run-Scoped Ephemeral Bytecode Caching:**
+     - Created run-scoped `gate_pycache_dir = Path(tempfile.mkdtemp(prefix="triad_gate_pycache_"))` with `try / finally` cleanup, checking `exec_env` for `PYTHONDONTWRITEBYTECODE`.
+     - Automatically wipes and recreates `gate_pycache_dir` on self-healing retry attempts (`attempt > 0`) to eliminate stale `.pyc` reuse on patched files.
+- **Verification:**
+  - 47 comprehensive unit tests in `triad/tests/test_diff_bloat.py` passing in ~0.25s.
+  - Full suite (339 tests) verified passing in ephemeral worktrees with 100% pass rate.
+  - Advisory Council pre-commit signoff: **VERDICT: APPROVED**.
+  - Pushed to `origin/master`.
