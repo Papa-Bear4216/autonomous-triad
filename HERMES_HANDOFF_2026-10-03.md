@@ -72,3 +72,29 @@
      - Full 302-test suite passing cleanly.
      - Advisory Council pre-commit gate signoff: **VERDICT: APPROVED**.
 
+---
+
+## 6. Targeted Test Discovery & Adversarial Mock Leak Optimization (Commit `6c1bbf8`)
+- **Status:** **VERIFIED, APPROVED BY ADVISORY COUNCIL, AND PUSHED TO MASTER**
+- **Key Enhancements:**
+  1. **Adversarial Mock Synthesis Fix (`triad/competition.py`):**
+     - Line 420: `if adv1_name == adv2_name == "mock": synth_engine = "mock"` eliminates live LLM calls during hermetic test execution while preserving multi-advisor production consensus.
+     - `test_competition.py` run time plummeted from ~42s down to 0.50s (98.8% latency reduction).
+  2. **Sub-Second Targeted Test Discovery (`--target` and `--targeted` in `triad/triad_engine.py`):**
+     - CLI flags added to `triad gate` and `triad auto`.
+     - `_normalize_target`: normalizes inputs (`circuit` -> `test_circuit.py`, `triad/tests` -> `test_*.py`, `*.py` -> `test_*.py`).
+     - `_import_index` & `_has_importers`: AST-based reverse import analysis indexing module imports, dynamic f-string imports (`importlib.import_module(f"triad.{mod}")`), path string constants (`prompts/system.md`), and build manifests/workflows (`pyproject.toml`, `.github/workflows/*.yml`).
+     - Conservative closed fallback: build manifests (`BUILD_MANIFEST_NAMES`), non-Python assets (`data.json`, `schema.sql`), and modules with external callers or manifests trigger full suite `test_*.py`.
+     - Resilient AST parser: syntax errors extract raw identifier tokens instead of disabling targeting for the entire repository.
+     - Directory pruning: preserves user packages (e.g. `mypkg/worktrees`) while skipping ephemeral `.triad/worktrees` and caches.
+  3. **Strict Safety Invariants:**
+     - `_check_apply_verified_safety`: rejects `--apply-verified` paired with targeted flags at the entry of `cmd_gate`, `cmd_auto`, `_run_gate`, and `_run_in_isolated_worktree`. Explicit `test_*.py` allowed.
+     - Retry safety: `attempt > 0` (post-heal verification) forces full suite `test_*.py` to guarantee zero side regressions.
+     - CI safety: `_is_ci` (`CI=1`, `CI=true`, `CI=yes`) forces full suite `test_*.py`.
+     - Empty suite handling: targeted patterns with 0 matching files fall back safely to `test_*.py`; explicit target with 0 files exits with code 5.
+  4. **Verification:**
+     - 40 tests in `triad/tests/test_diff_bloat.py`, 12 tests in `test_competition.py`.
+     - Full test discovery (330+ tests) passed with exit code 0.
+     - Advisory Council pre-commit signoff: **VERDICT: APPROVED**.
+     - Pushed to `origin/master` as commit [`6c1bbf8`](https://github.com/Papa-Bear4216/autonomous-triad/commit/6c1bbf8).
+
