@@ -696,7 +696,8 @@ class TestTargetedTestResolution(unittest.TestCase):
             cached_entry = _FILE_IMPORT_CACHE[f1_str]
             self.assertIn("json", cached_entry[2])
 
-            # Repeat indexing with unchanged file hits cache
+            # Repeat indexing with unchanged file hits file-level AST cache even when lru_cache is cleared
+            _import_index.cache_clear()
             idx2 = _import_index(repo)
             self.assertIn("json", idx2)
             self.assertIs(_FILE_IMPORT_CACHE[f1_str], cached_entry)

@@ -3272,6 +3272,7 @@ SKIP_IMPORT_INDEX_DIRS = {
 
 
 _FILE_IMPORT_CACHE: Dict[str, Tuple[int, int, Set[str]]] = {}
+_MAX_FILE_IMPORT_CACHE_ENTRIES = 5000
 
 
 def _clear_import_index_caches() -> None:
@@ -3351,12 +3352,16 @@ def _import_index(cwd_resolved: Path) -> Optional[Dict[str, Set[str]]]:
                             for match in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b", n.value):
                                 for part in match.split("."):
                                     file_tokens.add(part)
+                    if len(_FILE_IMPORT_CACHE) >= _MAX_FILE_IMPORT_CACHE_ENTRIES:
+                        _FILE_IMPORT_CACHE.clear()
                     _FILE_IMPORT_CACHE[p_str] = (mtime_ns, size, file_tokens)
                 except (SyntaxError, ValueError, RecursionError):
                     file_tokens = set()
                     for tok in set(re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", content)):
                         for part in tok.split("."):
                             file_tokens.add(part)
+                    if len(_FILE_IMPORT_CACHE) >= _MAX_FILE_IMPORT_CACHE_ENTRIES:
+                        _FILE_IMPORT_CACHE.clear()
                     _FILE_IMPORT_CACHE[p_str] = (mtime_ns, size, file_tokens)
                 except OSError:
                     return None
@@ -3824,6 +3829,8 @@ def _run_gate_impl(args, env: Optional[Dict[str, str]] = None, in_worktree: bool
 
                 is_parallel_requested = bool(getattr(args, "parallel", False) or py_test_env.get("TRIAD_PARALLEL_TESTS") == "1")
                 target_patterns = [pat for pat in active_patterns if any((cwd / py_test_target).rglob(pat))] if is_targeted else active_patterns
+                if not target_patterns:
+                    target_patterns = ["test_*.py"]
                 if in_worktree:
                     if is_parallel_requested:
                         print("[Step 2/3] [Notice] --parallel is bypassed in isolated worktree mode (worktree runner manages process isolation).")
