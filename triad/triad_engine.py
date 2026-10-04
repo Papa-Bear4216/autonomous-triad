@@ -39,7 +39,10 @@ try:
         CLAUDE_PATH, CODEX_PATH, AGY_PATH, HERMES_PATH, CODEX_AUTH,
         PORT_HERMES_RELAY, PORT_PIECES_OS, PORT_OLLAMA, PORT_TRIAD_SERVER,
     )
-    from triad.procutil import kill_process_tree, is_port_open, classify_advisor_response
+    from triad.procutil import (
+        kill_process_tree, is_port_open, classify_advisor_response,
+        strip_diff_bloat, is_doc_or_asset_file,
+    )
     from triad.circuit import snapshot_circuits, is_circuit_open, reset_circuit
     from triad.advisor_manager import query_configured_advisor, get_advisors, advisor_is_ready
     from triad.worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root, clean_git_env, provision_worktree_dependencies, capture_directory_snapshot, get_provisioned_manifest_entries, is_reparse_or_link
@@ -50,7 +53,10 @@ except ImportError:
         CLAUDE_PATH, CODEX_PATH, AGY_PATH, HERMES_PATH, CODEX_AUTH,
         PORT_HERMES_RELAY, PORT_PIECES_OS, PORT_OLLAMA, PORT_TRIAD_SERVER,
     )
-    from procutil import kill_process_tree, is_port_open, classify_advisor_response
+    from procutil import (
+        kill_process_tree, is_port_open, classify_advisor_response,
+        strip_diff_bloat, is_doc_or_asset_file,
+    )
     from circuit import snapshot_circuits, is_circuit_open, reset_circuit
     from advisor_manager import query_configured_advisor, get_advisors, advisor_is_ready
     from worktree import create_worktree, remove_worktree, isolated_worktree, list_worktrees, prune_worktrees, get_repo_root, clean_git_env, provision_worktree_dependencies, capture_directory_snapshot, get_provisioned_manifest_entries, is_reparse_or_link
@@ -3095,6 +3101,29 @@ def _handle_validation_failure(
     return attempt, candidate_tree
 
 
+def _affects_typescript(changed_files: List[str]) -> bool:
+    ts_exts = frozenset({".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"})
+    ts_configs = frozenset({"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock"})
+    for f in changed_files:
+        p = f.replace("\\", "/").lower()
+        base = os.path.basename(p)
+        if base in ts_configs or (base.startswith("tsconfig") and base.endswith(".json")):
+            return True
+        if base.endswith(".d.ts"):
+            return True
+        _, ext = os.path.splitext(base)
+        if ext in ts_exts:
+            return True
+    return False
+
+
+def _affects_code(changed_files: List[str]) -> bool:
+    for f in changed_files:
+        if not is_doc_or_asset_file(f):
+            return True
+    return False
+
+
 def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = False, review_base: Optional[str] = None, cwd: Optional[Path] = None):
     cwd = (cwd or Path.cwd()).resolve()
     exec_env = dict(os.environ if env is None else env)
@@ -3104,6 +3133,48 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
 
     ret_head, initial_head_commit, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd, env=exec_env)
     initial_head_commit = initial_head_commit.strip() if ret_head == 0 else "UNBORN"
+
+    # Resolve target baseline tree for change detection and diff
+    try:
+        if review_base:
+            ret_base, base_tree, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", f"{review_base}^{{tree}}"], cwd=cwd, env=exec_env)
+            if ret_base == 0 and base_tree.strip():
+                target_base = base_tree.strip()
+            else:
+                ret_base2, base_tree2, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", review_base], cwd=cwd, env=exec_env)
+                target_base = base_tree2.strip() if ret_base2 == 0 and base_tree2.strip() else review_base
+        else:
+            ret_head_tree, head_tree, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", "HEAD^{tree}"], cwd=cwd, env=exec_env)
+            target_base = head_tree.strip() if ret_head_tree == 0 and head_tree.strip() else get_empty_tree_oid(cwd)
+    except Exception as e:
+        print(f"\n❌ [Triad Gate BLOCKED] Failed to resolve baseline tree: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    def _verify_final_stability(cand_tree: Optional[str] = None, init_wt: Optional[str] = None, init_fp: Optional[dict] = None):
+        c_tree = cand_tree if cand_tree is not None else candidate_tree
+        i_wt = init_wt if init_wt is not None else initial_wt_tree
+        i_fp = init_fp if init_fp is not None else initial_fingerprint
+        ret_head, current_head_commit, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd, env=exec_env)
+        current_head_commit = current_head_commit.strip() if ret_head == 0 else "UNBORN"
+        if current_head_commit != initial_head_commit:
+            print(f"\n❌ [Triad Gate BLOCKED] Git HEAD was modified during validation (expected {initial_head_commit[:10]}, got {current_head_commit[:10]}).", file=sys.stderr)
+            sys.exit(1)
+        post_wt = snapshot_worktree_tree(cwd, head_tree=c_tree, env=exec_env)
+        if post_wt != i_wt:
+            ret, diff_summary, _ = run_subprocess_tree_safe(["git", "diff", "--no-color", "--name-status", i_wt, post_wt], cwd=cwd, env=exec_env)
+            print(f"\n❌ [Triad Gate BLOCKED] Working tree was modified during evaluation:\n{diff_summary}", file=sys.stderr)
+            sys.exit(1)
+        post_fingerprint = compute_working_tree_fingerprint(cwd, env=exec_env)
+        fp_match, mutated = fingerprints_match(i_fp, post_fingerprint)
+        if not fp_match:
+            diff_msg = "\n".join(mutated)
+            print(f"\n❌ [Triad Gate BLOCKED] Working tree files mutated on disk during evaluation:\n{diff_msg}", file=sys.stderr)
+            sys.exit(1)
+        ret, post_idx, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=cwd, env=exec_env)
+        if ret != 0 or post_idx.strip() != c_tree:
+            print("\n❌ [Triad Gate BLOCKED] Git index was modified during evaluation.", file=sys.stderr)
+            sys.exit(1)
+        _check_no_uncommitted_source_dependencies(cwd, exec_env, in_worktree=in_worktree, stage_name="post-validation")
 
     print(f"[Triad Gate] Running pre-commit verification in {cwd}...\n")
     max_retries = max(0, getattr(args, "max_retries", 1))
@@ -3171,8 +3242,25 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                 print("Either stage all changes, discard unstaged edits, or use 'triad gate --worktree' for isolated index verification.", file=sys.stderr)
                 sys.exit(1)
 
+        # Query which files changed between target_base and candidate_tree
+        ret_df, changed_files_raw, _ = run_subprocess_tree_safe(
+            ["git", "diff", "--no-color", "--no-ext-diff", "--no-renames", "--name-only", "-z", target_base, candidate_tree, "--"],
+            cwd=cwd, env=exec_env
+        )
+        changed_files = [f.strip() for f in changed_files_raw.split("\0") if f.strip()]
+        if changed_files:
+            affects_code = _affects_code(changed_files)
+            affects_ts = _affects_typescript(changed_files)
+        else:
+            affects_code = True
+            affects_ts = True
+
         # Step 1: TypeScript Check
-        if tsconfig.exists():
+        if not affects_code:
+            print("[Step 1/3] Only documentation / non-code assets changed. Skipping TypeScript check.")
+        elif not affects_ts:
+            print("[Step 1/3] No TypeScript or JavaScript files changed. Skipping tsc check.")
+        elif tsconfig.exists():
             nm_dir = cwd / "node_modules"
             if not nm_dir.exists() and package_json.exists():
                 print(f"\n❌ [Triad Gate Error] tsconfig.json found but node_modules does not exist in {cwd}.", file=sys.stderr)
@@ -3195,138 +3283,141 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
         else:
             print("[Step 1/3] No tsconfig.json found. Skipping tsc check.")
 
-        # Step 2: Test Suites (Supports polyglot projects: Node/Jest/Vitest AND Python/Unittest)
+        # Step 2: Test Suites (Supports polyglot projects: Node/Jest/Vitest AND Python/Unittest/Pytest)
         ran_any_tests = False
         step2_failed = False
 
-        if package_json.exists():
-            try:
-                with open(package_json, "r", encoding="utf-8") as f:
-                    pkg_data = json.load(f)
-                scripts = pkg_data.get("scripts", {})
-                if "test" in scripts:
-                    ran_any_tests = True
-                    print("[Step 2/3] Running local test suite (npm test)...")
-                    test_cmd = [NPM_CMD, "test", "--", "--run"]
-                    ret, out, err = run_subprocess_tree_safe(test_cmd, cwd=cwd, timeout=test_timeout, env=exec_env)
-
-                    if ret != 0:
-                        step2_failed = True
-                        attempt, candidate_tree = _handle_validation_failure(
-                            stage_label="Step 2 FAILED] Node test suite failed",
-                            exhausted_label="Test suite still failing after retry budget exhausted.",
-                            diag_output=f"STDOUT:\n{out}\nSTDERR:\n{err}".strip(),
-                            cwd=cwd, exec_env=exec_env, args=args, in_worktree=in_worktree,
-                            candidate_tree=candidate_tree, attempt=attempt, max_retries=max_retries,
-                        )
-                        continue
-                    print("✓ Node/npm tests passed successfully.")
-            except SystemExit:
-                raise
-            except Exception as e:
-                print(f"\n❌ [Triad Gate: Step 2 FAILED] Error executing Node test runner: {e}")
-                sys.exit(1)
-
-        # Python test discovery: run all configured suites
-        py_test_targets = []
-        if (cwd / "triad" / "tests").exists():
-            py_test_targets.append("triad/tests")
-        if (cwd / "tests").exists():
-            py_test_targets.append("tests")
-
-        for py_test_target in py_test_targets:
-            ran_any_tests = True
-            print(f"[Step 2/3] Running Python unit test suite ({py_test_target})...")
-            py_test_env = dict(exec_env if exec_env is not None else os.environ)
-            py_test_env["PYTHONDONTWRITEBYTECODE"] = "1"
-            py_test_env["TRIAD_GATE_ACTIVE"] = "1"
-            if in_worktree:
-                py_test_env["TRIAD_ISOLATED_WORKTREE"] = "1"
-                orig_pp = py_test_env.get("PYTHONPATH", "")
-                sanitized_pp_parts = [str(cwd.resolve())]
-                originating_root_val = getattr(args, "_originating_root", None)
-                originating_root = Path(originating_root_val).resolve() if originating_root_val else None
-                if not originating_root:
-                    try:
-                        originating_root = get_repo_root(cwd, env=exec_env)
-                    except Exception:
-                        pass
-
-                parent_root = None
+        if not affects_code:
+            print("[Step 2/3] Only documentation / non-code assets changed. Skipping test suite.")
+        else:
+            if package_json.exists():
                 try:
-                    ret_c, out_c, _ = run_subprocess_tree_safe(
-                        ["git", "rev-parse", "--git-common-dir"],
-                        cwd=cwd, env=exec_env
-                    )
-                    if ret_c == 0 and out_c.strip():
-                        common_git = Path(out_c.strip())
-                        if not common_git.is_absolute():
-                            common_git = (cwd / common_git).resolve()
-                        parent_root = common_git.parent.resolve()
-                except Exception:
-                    pass
-                if not parent_root:
-                    try:
-                        parent_root = get_repo_root(cwd, env=exec_env)
-                    except Exception:
-                        pass
+                    with open(package_json, "r", encoding="utf-8") as f:
+                        pkg_data = json.load(f)
+                    scripts = pkg_data.get("scripts", {})
+                    if "test" in scripts:
+                        ran_any_tests = True
+                        print("[Step 2/3] Running local test suite (npm test)...")
+                        test_cmd = [NPM_CMD, "test", "--", "--run"]
+                        ret, out, err = run_subprocess_tree_safe(test_cmd, cwd=cwd, timeout=test_timeout, env=exec_env)
 
-                if not parent_root and not originating_root:
-                    print("\n❌ [Triad Gate Error] Failed to establish parent repository exclusion boundary for Python import isolation.", file=sys.stderr)
+                        if ret != 0:
+                            step2_failed = True
+                            attempt, candidate_tree = _handle_validation_failure(
+                                stage_label="Step 2 FAILED] Node test suite failed",
+                                exhausted_label="Test suite still failing after retry budget exhausted.",
+                                diag_output=f"STDOUT:\n{out}\nSTDERR:\n{err}".strip(),
+                                cwd=cwd, exec_env=exec_env, args=args, in_worktree=in_worktree,
+                                candidate_tree=candidate_tree, attempt=attempt, max_retries=max_retries,
+                            )
+                            continue
+                        print("✓ Node/npm tests passed successfully.")
+                except SystemExit:
+                    raise
+                except Exception as e:
+                    print(f"\n❌ [Triad Gate: Step 2 FAILED] Error executing Node test runner: {e}")
                     sys.exit(1)
 
-                excluded_roots: List[Path] = []
-                for candidate_root in [parent_root, originating_root]:
-                    if candidate_root and candidate_root not in excluded_roots and candidate_root != cwd.resolve():
-                        excluded_roots.append(candidate_root)
+            # Python test discovery: run all configured suites
+            py_test_targets = []
+            if (cwd / "triad" / "tests").exists():
+                py_test_targets.append("triad/tests")
+            if (cwd / "tests").exists():
+                py_test_targets.append("tests")
 
-                if orig_pp:
-                    for part in orig_pp.split(os.pathsep):
-                        if not part:
-                            continue
+            for py_test_target in py_test_targets:
+                ran_any_tests = True
+                print(f"[Step 2/3] Running Python unit test suite ({py_test_target})...")
+                py_test_env = dict(exec_env if exec_env is not None else os.environ)
+                py_test_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                py_test_env["TRIAD_GATE_ACTIVE"] = "1"
+                if in_worktree:
+                    py_test_env["TRIAD_ISOLATED_WORKTREE"] = "1"
+                    orig_pp = py_test_env.get("PYTHONPATH", "")
+                    sanitized_pp_parts = [str(cwd.resolve())]
+                    originating_root_val = getattr(args, "_originating_root", None)
+                    originating_root = Path(originating_root_val).resolve() if originating_root_val else None
+                    if not originating_root:
                         try:
-                            resolved_part = Path(part).resolve()
-                            is_venv_dep = any(seg.lower() in ("site-packages", "dist-packages") for seg in resolved_part.parts)
-                            is_excluded = any(
-                                (resolved_part == ex or ex in resolved_part.parents)
-                                for ex in excluded_roots
-                            )
-                            if is_excluded and not is_venv_dep:
-                                if not (cwd.resolve() == resolved_part or cwd.resolve() in resolved_part.parents):
-                                    continue
-                            if str(resolved_part) not in sanitized_pp_parts:
-                                sanitized_pp_parts.append(str(resolved_part))
+                            originating_root = get_repo_root(cwd, env=exec_env)
                         except Exception:
                             pass
-                py_test_env["PYTHONPATH"] = os.pathsep.join(sanitized_pp_parts)
 
-            if in_worktree:
-                isolation_script = _build_python_isolation_script(cwd, py_test_target, excluded_roots)
-                test_cmd = [sys.executable, "-c", isolation_script]
-            else:
-                test_cmd = [sys.executable, "-m", "unittest", "discover", "-s", py_test_target, "-p", "test_*.py"]
-            ret, out, err = run_subprocess_tree_safe(test_cmd, cwd=cwd, timeout=test_timeout, env=py_test_env)
+                    parent_root = None
+                    try:
+                        ret_c, out_c, _ = run_subprocess_tree_safe(
+                            ["git", "rev-parse", "--git-common-dir"],
+                            cwd=cwd, env=exec_env
+                        )
+                        if ret_c == 0 and out_c.strip():
+                            common_git = Path(out_c.strip())
+                            if not common_git.is_absolute():
+                                common_git = (cwd / common_git).resolve()
+                            parent_root = common_git.parent.resolve()
+                    except Exception:
+                        pass
+                    if not parent_root:
+                        try:
+                            parent_root = get_repo_root(cwd, env=exec_env)
+                        except Exception:
+                            pass
 
-            diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
-            is_empty_suite = "Ran 0 tests" in diag_output
-            if ret != 0 or is_empty_suite:
-                step2_failed = True
-                reason = "discovering 0 tests" if is_empty_suite else "failures"
-                attempt, candidate_tree = _handle_validation_failure(
-                    stage_label=f"Step 2 FAILED] Python test suite failed ({reason})",
-                    exhausted_label="Python test suite still failing after retry budget exhausted.",
-                    diag_output=diag_output,
-                    cwd=cwd, exec_env=exec_env, args=args, in_worktree=in_worktree,
-                    candidate_tree=candidate_tree, attempt=attempt, max_retries=max_retries,
-                )
-                break  # breaks out of targets loop to restart validation
-            print(f"✓ Python tests ({py_test_target}) passed successfully.")
+                    if not parent_root and not originating_root:
+                        print("\n❌ [Triad Gate Error] Failed to establish parent repository exclusion boundary for Python import isolation.", file=sys.stderr)
+                        sys.exit(1)
 
-        if step2_failed:
-            continue
+                    excluded_roots: List[Path] = []
+                    for candidate_root in [parent_root, originating_root]:
+                        if candidate_root and candidate_root not in excluded_roots and candidate_root != cwd.resolve():
+                            excluded_roots.append(candidate_root)
 
-        if not ran_any_tests:
-            print("[Step 2/3] No test runner found (package.json / Python tests). Skipping.")
+                    if orig_pp:
+                        for part in orig_pp.split(os.pathsep):
+                            if not part:
+                                continue
+                            try:
+                                resolved_part = Path(part).resolve()
+                                is_venv_dep = any(seg.lower() in ("site-packages", "dist-packages") for seg in resolved_part.parts)
+                                is_excluded = any(
+                                    (resolved_part == ex or ex in resolved_part.parents)
+                                    for ex in excluded_roots
+                                )
+                                if is_excluded and not is_venv_dep:
+                                    if not (cwd.resolve() == resolved_part or cwd.resolve() in resolved_part.parents):
+                                        continue
+                                if str(resolved_part) not in sanitized_pp_parts:
+                                    sanitized_pp_parts.append(str(resolved_part))
+                            except Exception:
+                                pass
+                    py_test_env["PYTHONPATH"] = os.pathsep.join(sanitized_pp_parts)
+
+                if in_worktree:
+                    isolation_script = _build_python_isolation_script(cwd, py_test_target, excluded_roots)
+                    test_cmd = [sys.executable, "-c", isolation_script]
+                else:
+                    test_cmd = [sys.executable, "-m", "unittest", "discover", "-s", py_test_target, "-p", "test_*.py"]
+                ret, out, err = run_subprocess_tree_safe(test_cmd, cwd=cwd, timeout=test_timeout, env=py_test_env)
+
+                diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
+                is_empty_suite = ("Ran 0 tests" in diag_output) or ("collected 0 items" in diag_output) or (ret == 5)
+                if ret != 0 or is_empty_suite:
+                    step2_failed = True
+                    reason = "discovering 0 tests" if is_empty_suite else "failures"
+                    attempt, candidate_tree = _handle_validation_failure(
+                        stage_label=f"Step 2 FAILED] Python test suite failed ({reason})",
+                        exhausted_label="Python test suite still failing after retry budget exhausted.",
+                        diag_output=diag_output,
+                        cwd=cwd, exec_env=exec_env, args=args, in_worktree=in_worktree,
+                        candidate_tree=candidate_tree, attempt=attempt, max_retries=max_retries,
+                    )
+                    break  # breaks out of targets loop to restart validation
+                print(f"✓ Python tests ({py_test_target}) passed successfully.")
+
+            if step2_failed:
+                continue
+
+            if not ran_any_tests:
+                print("[Step 2/3] No test runner found (package.json / Python tests). Skipping.")
 
         # Check for uncommitted source dependencies created during validation
         _check_no_uncommitted_source_dependencies(cwd, exec_env, in_worktree=in_worktree, stage_name="post-validation")
@@ -3357,46 +3448,14 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
         # All steps verified clean
         break
 
-    def _verify_final_stability():
-        ret_head, current_head_commit, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd, env=exec_env)
-        current_head_commit = current_head_commit.strip() if ret_head == 0 else "UNBORN"
-        if current_head_commit != initial_head_commit:
-            print(f"\n❌ [Triad Gate BLOCKED] Git HEAD was modified during validation (expected {initial_head_commit[:10]}, got {current_head_commit[:10]}).", file=sys.stderr)
-            sys.exit(1)
-        post_wt = snapshot_worktree_tree(cwd, head_tree=candidate_tree, env=exec_env)
-        if post_wt != initial_wt_tree:
-            ret, diff_summary, _ = run_subprocess_tree_safe(["git", "diff", "--no-color", "--name-status", initial_wt_tree, post_wt], cwd=cwd, env=exec_env)
-            print(f"\n❌ [Triad Gate BLOCKED] Working tree was modified during evaluation:\n{diff_summary}", file=sys.stderr)
-            sys.exit(1)
-        post_fingerprint = compute_working_tree_fingerprint(cwd, env=exec_env)
-        fp_match, mutated = fingerprints_match(initial_fingerprint, post_fingerprint)
-        if not fp_match:
-            diff_msg = "\n".join(mutated)
-            print(f"\n❌ [Triad Gate BLOCKED] Working tree files mutated on disk during evaluation:\n{diff_msg}", file=sys.stderr)
-            sys.exit(1)
-        ret, post_idx, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=cwd, env=exec_env)
-        if ret != 0 or post_idx.strip() != candidate_tree:
-            print("\n❌ [Triad Gate BLOCKED] Git index was modified during evaluation.", file=sys.stderr)
-            sys.exit(1)
-        _check_no_uncommitted_source_dependencies(cwd, exec_env, in_worktree=in_worktree, stage_name="post-validation")
+    _verify_final_stability(candidate_tree, initial_wt_tree, initial_fingerprint)
 
     # Step 3: Advisory Council Diff Signoff
     print("\n[Step 3/3] Submitting diff to Advisory Council for pre-commit signoff...")
     try:
-        if review_base:
-            ret_base, base_tree, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", f"{review_base}^{{tree}}"], cwd=cwd, env=exec_env)
-            if ret_base == 0 and base_tree.strip():
-                target_base = base_tree.strip()
-            else:
-                ret_base2, base_tree2, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", review_base], cwd=cwd, env=exec_env)
-                target_base = base_tree2.strip() if ret_base2 == 0 and base_tree2.strip() else review_base
-        else:
-            ret_head, head_tree, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", "HEAD^{tree}"], cwd=cwd, env=exec_env)
-            target_base = head_tree.strip() if ret_head == 0 and head_tree.strip() else get_empty_tree_oid(cwd)
-
         # 1. Determine whether changes exist strictly from tree identity
         if candidate_tree == target_base:
-            _verify_final_stability()
+            _verify_final_stability(candidate_tree, initial_wt_tree, initial_fingerprint)
             setattr(args, "_validated_tree", candidate_tree)
             print("✓ No changes detected in git working tree. Gate passed.")
             return
@@ -3407,6 +3466,7 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
         if ret != 0 or not diff or not diff.strip():
             err_msg = err.strip() if err.strip() else "diff produced empty output despite different tree object IDs"
             raise RuntimeError(f"Failed to generate diff against baseline ({target_base[:10]} != {candidate_tree[:10]}): {err_msg}")
+        diff = strip_diff_bloat(diff)
     except Exception as e:
         print(f"\n❌ [Triad Gate BLOCKED] Failed to retrieve git diff: {e}", file=sys.stderr)
         sys.exit(1)

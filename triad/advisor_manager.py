@@ -19,14 +19,20 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Tuple
 
 try:
-    from triad.procutil import kill_process_tree, is_failed_advisor_response, classify_advisor_response, is_port_open
+    from triad.procutil import (
+        kill_process_tree, is_failed_advisor_response, classify_advisor_response,
+        is_port_open, strip_diff_bloat,
+    )
     from triad.paths import expand_path, PORT_OLLAMA, CLAUDE_PATH, CODEX_PATH, HERMES_PATH, OLLAMA_PATH
     from triad.circuit import (
         is_circuit_open, circuit_remaining, circuit_reason,
         record_success, record_failure,
     )
 except ImportError:  # flat install (~/.agents/triad) without the package prefix
-    from procutil import kill_process_tree, is_failed_advisor_response, classify_advisor_response, is_port_open
+    from procutil import (
+        kill_process_tree, is_failed_advisor_response, classify_advisor_response,
+        is_port_open, strip_diff_bloat,
+    )
     from paths import expand_path, PORT_OLLAMA, CLAUDE_PATH, CODEX_PATH, HERMES_PATH, OLLAMA_PATH
     from circuit import (
         is_circuit_open, circuit_remaining, circuit_reason,
@@ -149,6 +155,9 @@ def record_advisor_call(advisor_name: str, mode: str, elapsed_seconds: float, st
 
 def build_advisor_prompt(prompt: str, context: Optional[str] = None, diff: Optional[str] = None, mode: str = "general") -> str:
     """Construct structured advisor prompt based on query mode."""
+    if diff:
+        diff = strip_diff_bloat(diff)
+
     system_preamble = (
         "You are the Lead Architect and Code Reviewer acting as the autonomous advisory council to Antigravity (the primary coding agent).\n"
         "Antigravity has already handled the broad workspace and heavy context ingestion.\n"

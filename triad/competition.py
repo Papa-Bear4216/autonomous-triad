@@ -15,11 +15,11 @@ from typing import Dict, Any, Tuple, List, Optional
 
 try:
     from triad.advisor_manager import query_configured_advisor, get_advisors, is_test_advisor, advisor_is_ready
-    from triad.procutil import is_failed_advisor_response
+    from triad.procutil import is_failed_advisor_response, strip_diff_bloat
     from triad.circuit import is_circuit_open
 except ImportError:
     from advisor_manager import query_configured_advisor, get_advisors, is_test_advisor, advisor_is_ready
-    from procutil import is_failed_advisor_response
+    from procutil import is_failed_advisor_response, strip_diff_bloat
     from circuit import is_circuit_open
 
 # Ensure logs directory exists (fallback to user-writable directory in site-packages)
@@ -272,7 +272,7 @@ def query_competition_council(
     if isinstance(diff, list):
         diff = "\n".join(diff)
     prompt = str(prompt or "")
-    diff = str(diff or "")
+    diff = strip_diff_bloat(str(diff or ""))
 
     results = {}
 
