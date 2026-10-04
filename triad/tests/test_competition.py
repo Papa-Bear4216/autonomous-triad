@@ -116,7 +116,8 @@ class TestCompetitionMode(unittest.TestCase):
         self.assertEqual(res["advisors"], ["mock", "mock"])
         self.assertTrue(res.get("quorum_met"))
         self.assertTrue(res.get("adversarial"))
-        self.assertIn(res.get("status"), ("ok", "error"))
+        self.assertEqual(res.get("status"), "ok")
+        self.assertIn("Mock Advisor", res.get("synthesis", ""))
 
     def test_parse_adversarial_verdict(self):
         from triad.competition import parse_adversarial_verdict

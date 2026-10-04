@@ -416,9 +416,12 @@ def query_competition_council(
         )
     else:
         if adversarial:
-            # Blue never judges itself. Prefer an independent 3rd ready advisor; fallback to Red
-            third = next((n for n in _ready_production_names() if n not in (adv1_name, adv2_name)), None)
-            synth_engine = third or (adv2_name if not failed2 else adv1_name)
+            # Blue never judges itself. If both mock requested, use mock; otherwise prefer an independent 3rd ready advisor; fallback to Red
+            if adv1_name == adv2_name == "mock":
+                synth_engine = "mock"
+            else:
+                third = next((n for n in _ready_production_names() if n not in (adv1_name, adv2_name)), None)
+                synth_engine = third or (adv2_name if not failed2 else adv1_name)
             synth_prompt = build_adversarial_synthesis_prompt(
                 prompt, resp1, resp2, context=context, diff=diff,
                 blue_label=f"Blue Team ({_label_for(adv1_name)})",

@@ -21,7 +21,9 @@ import shutil
 import uuid
 import time
 import hashlib
+import ast
 import contextlib
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union, Set
 
@@ -2333,6 +2335,53 @@ def _notice_recovery_patch(recovery_path: Optional[Path]) -> None:
         print(f"[Triad Notice] Preserved verified self-healing patch at {recovery_path}")
 
 
+def _is_ci(env: Optional[Dict[str, str]] = None) -> bool:
+    """Return True if running in a Continuous Integration environment (GitHub Actions, GitLab, etc.)."""
+    exec_env = os.environ if env is None else env
+    return str(exec_env.get("CI", "")).strip().lower() in ("1", "true", "yes")
+
+
+def _normalize_target(raw: str) -> str:
+    """Normalize a target test pattern or file path into a test pattern (e.g. 'test_*.py')."""
+    s = (raw or "").strip().replace("\\", "/")
+    base = os.path.basename(s)
+    if not base or base == "test_*.py":
+        return "test_*.py"
+    if s.endswith("/") or base in ("tests", "test"):
+        return "test_*.py"
+    if "*" in base:
+        if not base.startswith("test_"):
+            return f"test_{base}" if base.endswith(".py") else f"test_{base}.py"
+        return base if base.endswith(".py") else f"{base}.py"
+    if not base.startswith("test_"):
+        stem = base[:-3] if base.endswith(".py") else base
+        base = f"test_{stem}.py"
+    elif not base.endswith(".py"):
+        base = f"{base}.py"
+    return base
+
+
+def _check_apply_verified_safety(args, env: Optional[Dict[str, str]] = None) -> None:
+    exec_env = os.environ if env is None else env
+    if _is_ci(exec_env):
+        return
+    raw_target = getattr(args, "target", "") or exec_env.get("TRIAD_TEST_TARGET", "")
+    norm_target = _normalize_target(raw_target)
+    is_targeted_req = bool(
+        (norm_target != "test_*.py")
+        or getattr(args, "targeted", False)
+        or exec_env.get("TRIAD_TARGETED_TESTS") == "1"
+    )
+    if getattr(args, "apply_verified", False) and is_targeted_req:
+        env_hint = " (via TRIAD_TARGETED_TESTS environment variable)" if exec_env.get("TRIAD_TARGETED_TESTS") == "1" else ""
+        print(
+            f"\n[Triad Gate Error] Cannot use --apply-verified with targeted test execution (--target / --targeted){env_hint}.\n"
+            "A full test suite run is required before applying verified changes back to parent repository.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _run_in_isolated_worktree(
     args,
     env: Optional[Dict[str, str]],
@@ -2367,6 +2416,7 @@ def _run_in_isolated_worktree(
     successfully applied patch pauses the commit (gate) or simply continues (auto).
     """
     base_env = env if env is not None else os.environ
+    _check_apply_verified_safety(args, base_env)
     ref = getattr(args, "ref", "HEAD") or "HEAD"
     apply_verified = getattr(args, "apply_verified", False)
 
@@ -2467,6 +2517,8 @@ def _run_in_isolated_worktree(
         try:
             runner(isolated_args, isolated_env)
         finally:
+            if hasattr(isolated_args, "_active_test_pattern"):
+                setattr(args, "_active_test_pattern", getattr(isolated_args, "_active_test_pattern"))
             # Fail closed if parent node_modules was mutated or deleted by validators
             if parent_nm_snapshot is not None:
                 post_nm_snapshot = capture_directory_snapshot(parent_nm)
@@ -2594,6 +2646,9 @@ def cmd_gate(args, env: Optional[Dict[str, str]] = None):
         print(f"[Triad Gate Error] Not inside a git repository: {e}", file=sys.stderr)
         sys.exit(1)
 
+    exec_env = os.environ if env is None else env
+    _check_apply_verified_safety(args, exec_env)
+
     if getattr(args, "worktree", False):
         _run_in_isolated_worktree(
             args, env,
@@ -2611,14 +2666,17 @@ def cmd_gate(args, env: Optional[Dict[str, str]] = None):
     else:
         _run_gate(args, env=env, in_worktree=False, cwd=Path(repo_root))
 
-    notify_event("Pre-Commit Gate Passed", "Type safety, test suites, and Advisory Council review approved.", status="success", timeout=1.5, async_dispatch=True)
+    active_pat = getattr(args, "_active_test_pattern", None)
+    pat_detail = f" (targeted: {active_pat})" if active_pat and active_pat != "test_*.py" else ""
+    notify_event("Pre-Commit Gate Passed", f"Type safety, test suites{pat_detail}, and Advisory Council review approved.", status="success", timeout=1.5, async_dispatch=True)
 
 
-def _build_python_isolation_script(cwd: Path, py_test_target: str, excluded_roots: List[Path]) -> str:
+def _build_python_isolation_script(cwd: Path, py_test_target: str, excluded_roots: List[Path], pattern: str = "test_*.py") -> str:
     """Generate isolation script for running Python tests in worktree without leaking parent or originating checkouts."""
     excluded_roots_repr = repr([str(r.resolve()) for r in excluded_roots])
     cwd_root_repr = repr(str(cwd.resolve()))
     test_target_repr = repr(py_test_target)
+    test_pattern_repr = repr(pattern or "test_*.py")
     return (
         "import sys\n\n"
         f"_ex_roots_raw = tuple({excluded_roots_repr})\n"
@@ -2809,7 +2867,10 @@ def _build_python_isolation_script(cwd: Path, py_test_target: str, excluded_root
         "sys.meta_path = [_IsolatingFinder(f) for f in sys.meta_path if not isinstance(f, _IsolatingFinder)]\n\n"
         "import unittest\n"
         "loader = unittest.defaultTestLoader\n"
-        f"suite = loader.discover(start_dir={test_target_repr}, pattern='test_*.py')\n"
+        f"suite = loader.discover(start_dir={test_target_repr}, pattern={test_pattern_repr})\n"
+        "if suite.countTestCases() == 0:\n"
+        f"    print('[Triad Test Error] No tests matched pattern ' + {test_pattern_repr} + ' in ' + {test_target_repr}, file=sys.stderr)\n"
+        "    sys.exit(5)\n"
         "runner = unittest.TextTestRunner(verbosity=2)\n"
         "result = runner.run(suite)\n"
         "sys.exit(0 if result.wasSuccessful() else 1)\n"
@@ -3124,12 +3185,196 @@ def _affects_code(changed_files: List[str]) -> bool:
     return False
 
 
+CORE_MODULE_NAMES = {
+    "triad_engine",
+    "worktree",
+    "paths",
+    "server",
+    "intent_engine",
+    "competition",
+    "circuit",
+    "advisor_manager",
+}
+
+
+BUILD_MANIFEST_NAMES = {
+    "pyproject.toml", "uv.lock", "setup.py", "setup.cfg", "tox.ini", "pytest.ini",
+    "conftest.py", "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+    "bun.lockb", "Pipfile", "Pipfile.lock",
+}
+
+
+SKIP_IMPORT_INDEX_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages", ".eggs",
+}
+
+
+@lru_cache(maxsize=8)
+def _import_index(cwd_resolved: Path) -> Optional[Dict[str, Set[str]]]:
+    """
+    Build index mapping imported module name to set of importing file relative paths across repository.
+    Scans repository via AST parsing (conservative fallback on parse or read error).
+    """
+    imported_to_callers: Dict[str, Set[str]] = {}
+    for root, dirs, files in os.walk(str(cwd_resolved)):
+        rel_root = os.path.relpath(root, str(cwd_resolved)).replace("\\", "/")
+        dirs[:] = [
+            d for d in dirs
+            if d not in SKIP_IMPORT_INDEX_DIRS
+            and not (rel_root == "." and d in (".cursor", ".next", ".turbo"))
+            and not ((rel_root == ".triad" or rel_root.startswith(".triad/")) and d == "worktrees")
+            and not (Path(root) / d / "pyvenv.cfg").exists()
+        ]
+        for f in files:
+            if not f.endswith(".py"):
+                continue
+            p = Path(root) / f
+            try:
+                rel = p.relative_to(cwd_resolved)
+            except ValueError:
+                rel = p
+            rel_str = str(rel).replace("\\", "/")
+            try:
+                content = p.read_text(encoding="utf-8", errors="ignore")
+                tree = ast.parse(content)
+            except (SyntaxError, ValueError, RecursionError):
+                for tok in set(re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", content)):
+                    for part in tok.split("."):
+                        imported_to_callers.setdefault(part, set()).add(rel_str)
+                continue
+            except OSError:
+                return None  # conservative fallback -> caller treats as "has importers"
+
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Import):
+                    for a in n.names:
+                        for part in a.name.split("."):
+                            imported_to_callers.setdefault(part, set()).add(rel_str)
+                elif isinstance(n, ast.ImportFrom):
+                    if n.module:
+                        for part in n.module.split("."):
+                            imported_to_callers.setdefault(part, set()).add(rel_str)
+                    for a in n.names:
+                        imported_to_callers.setdefault(a.name, set()).add(rel_str)
+                elif isinstance(n, ast.Call):
+                    func_id = ""
+                    if isinstance(n.func, ast.Name):
+                        func_id = n.func.id
+                    elif isinstance(n.func, ast.Attribute):
+                        func_id = n.func.attr
+                    if func_id in ("import_module", "__import__") and n.args:
+                        for c in ast.walk(n.args[0]):
+                            if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                                for part in re.findall(r"[A-Za-z_]\w*", c.value):
+                                    imported_to_callers.setdefault(part, set()).add(rel_str)
+                elif isinstance(n, ast.Constant) and isinstance(n.value, str) and 0 < len(n.value) < 200:
+                    v = n.value.replace("\\", "/")
+                    imported_to_callers.setdefault(v, set()).add(rel_str)
+                    imported_to_callers.setdefault(v.rsplit("/", 1)[-1], set()).add(rel_str)
+                    for match in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b", n.value):
+                        for part in match.split("."):
+                            imported_to_callers.setdefault(part, set()).add(rel_str)
+
+    return imported_to_callers
+
+
+def _has_importers(name: str, cwd: Path) -> bool:
+    """
+    Check if any Python module other than the module itself and its dedicated unit test imports this module.
+    """
+    idx = _import_index(cwd.resolve())
+    if idx is None:
+        return True  # conservative fallback on unparseable/error repository
+    callers = idx.get(name, set())
+    own = {
+        f"triad/{name}.py", f"{name}.py",
+        f"triad/tests/test_{name}.py", f"tests/test_{name}.py",
+    }
+    for caller_rel in callers:
+        norm_caller = caller_rel.replace("\\", "/")
+        if norm_caller.startswith("./"):
+            norm_caller = norm_caller[2:]
+        if norm_caller not in own:
+            return True
+
+    # Check if entrypoints, manifests, or CI workflows reference this module name
+    manifest_paths = [cwd / m for m in BUILD_MANIFEST_NAMES]
+    wf_dir = cwd / ".github" / "workflows"
+    if wf_dir.exists():
+        manifest_paths.extend(wf_dir.glob("*.yml"))
+        manifest_paths.extend(wf_dir.glob("*.yaml"))
+    pat = re.compile(rf"\b{re.escape(name)}\b")
+    for mp in manifest_paths:
+        if mp.exists() and mp.is_file():
+            try:
+                txt = mp.read_text(encoding="utf-8", errors="ignore")
+                if pat.search(txt):
+                    return True
+            except OSError:
+                pass
+
+    return False
+
+
+def _resolve_targeted_test_pattern(changed_files: List[str], cwd: Path) -> str:
+    """Resolve targeted test pattern from changed files, falling back to 'test_*.py' for core/imported files or ambiguity."""
+    if not changed_files:
+        return "test_*.py"
+    matched_patterns = set()
+    for f in changed_files:
+        norm = f.replace("\\", "/")
+        base = os.path.basename(norm)
+        name, ext = os.path.splitext(base)
+
+        # 1. Core infrastructure or build manifest files MUST trigger full test suite
+        if name in CORE_MODULE_NAMES or base in BUILD_MANIFEST_NAMES or base.startswith("requirements"):
+            return "test_*.py"
+
+        # 2. Test file itself modified
+        if base.startswith("test_") and ext == ".py":
+            matched_patterns.add(base)
+            continue
+
+        # 3. Documentation or non-code assets
+        if is_doc_or_asset_file(norm):
+            if _has_importers(name, cwd) or _has_importers(base, cwd):
+                return "test_*.py"
+            # Pure documentation files can be safely skipped
+            if ext.lower() in (".md", ".txt", ".rst"):
+                continue
+            # Any other non-pure-doc asset (e.g. .json, .yaml, .png, templates) triggers full suite
+            return "test_*.py"
+
+        # 4. Only Python source files can resolve to targeted Python tests
+        if ext != ".py":
+            return "test_*.py"
+
+        # 5. If any other module or external test imports this module, partial testing is unsound
+        if _has_importers(name, cwd):
+            return "test_*.py"
+
+        candidate_name = f"test_{name}.py"
+        if (cwd / "triad" / "tests" / candidate_name).exists() or (cwd / "tests" / candidate_name).exists():
+            matched_patterns.add(candidate_name)
+        else:
+            return "test_*.py"
+
+    if len(matched_patterns) == 1:
+        return next(iter(matched_patterns))
+    return "test_*.py"
+
+
 def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = False, review_base: Optional[str] = None, cwd: Optional[Path] = None):
+    _import_index.cache_clear()
     cwd = (cwd or Path.cwd()).resolve()
     exec_env = dict(os.environ if env is None else env)
     exec_env["TRIAD_GATE_ACTIVE"] = "1"
     in_worktree = getattr(args, "_in_worktree", False) or in_worktree
     review_base = getattr(args, "_review_base", None) or review_base
+
+    # Reject combination of --apply-verified with targeted test execution up front
+    _check_apply_verified_safety(args, exec_env)
 
     ret_head, initial_head_commit, _ = run_subprocess_tree_safe(["git", "rev-parse", "--verify", "HEAD"], cwd=cwd, env=exec_env)
     initial_head_commit = initial_head_commit.strip() if ret_head == 0 else "UNBORN"
@@ -3186,6 +3431,7 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
     attempt = 0
     candidate_tree = None
     while attempt <= max_retries:
+        _import_index.cache_clear()
         # Capture candidate tree snapshot before running validation checks
         ret, candidate_tree, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=cwd, env=exec_env)
         if ret != 0 or not candidate_tree.strip():
@@ -3318,16 +3564,68 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                     print(f"\n❌ [Triad Gate: Step 2 FAILED] Error executing Node test runner: {e}")
                     sys.exit(1)
 
-            # Python test discovery: run all configured suites
+            # Python test discovery: run all configured suites (supports targeted test patterns)
             py_test_targets = []
             if (cwd / "triad" / "tests").exists():
                 py_test_targets.append("triad/tests")
             if (cwd / "tests").exists():
                 py_test_targets.append("tests")
 
-            for py_test_target in py_test_targets:
+            raw_target_arg = getattr(args, "target", "") or exec_env.get("TRIAD_TEST_TARGET", "")
+            norm_target = _normalize_target(raw_target_arg)
+            explicit_target = norm_target != "test_*.py"
+            target_source = ""
+            if attempt > 0:
+                # Post-heal retry verification: always execute full test suite to guarantee zero side regressions
+                test_pattern = "test_*.py"
+            elif _is_ci(exec_env):
+                if explicit_target:
+                    print("[Triad Gate Notice] CI environment detected; running full test suite 'test_*.py'.")
+                test_pattern = "test_*.py"
+            elif explicit_target:
+                test_pattern = norm_target
+            elif getattr(args, "targeted", False) or exec_env.get("TRIAD_TARGETED_TESTS") == "1":
+                target_source = "--targeted" if getattr(args, "targeted", False) else "TRIAD_TARGETED_TESTS"
+                test_pattern = _resolve_targeted_test_pattern(changed_files, cwd)
+            else:
+                test_pattern = "test_*.py"
+
+            setattr(args, "_active_test_pattern", test_pattern)
+            all_py_test_targets = list(py_test_targets)
+            is_targeted = test_pattern != "test_*.py"
+            explicit_target = explicit_target and is_targeted
+            if is_targeted:
+                banner_source = "explicit --target" if explicit_target else f"auto-resolved via {target_source}"
+                print(f"[Step 2/3] [TARGETED GATE] Running test pattern '{test_pattern}' ({banner_source})...")
+
+                # Filter target directories to only those containing matching test files
+                active_targets = []
+                for target_dir in py_test_targets:
+                    if any((cwd / target_dir).rglob(test_pattern)):
+                        active_targets.append(target_dir)
+
+                if not active_targets and py_test_targets:
+                    if explicit_target:
+                        print(
+                            f"\n[Triad Gate: Step 2 FAILED] Targeted test pattern '{test_pattern}' matched 0 test files in {py_test_targets}.",
+                            file=sys.stderr,
+                        )
+                        sys.exit(5)
+                    else:
+                        print(f"[Step 2/3] Targeted test pattern '{test_pattern}' matched 0 test files in {py_test_targets}; falling back to full test suite.")
+                        test_pattern = "test_*.py"
+                        setattr(args, "_active_test_pattern", test_pattern)
+                        is_targeted = False
+                        active_targets = py_test_targets
+                py_test_targets = active_targets
+
+            target_idx = 0
+            while target_idx < len(py_test_targets):
+                py_test_target = py_test_targets[target_idx]
+                target_idx += 1
                 ran_any_tests = True
-                print(f"[Step 2/3] Running Python unit test suite ({py_test_target})...")
+                pattern_desc = f", pattern: {test_pattern}" if is_targeted else ""
+                print(f"[Step 2/3] Running Python unit test suite ({py_test_target}{pattern_desc})...")
                 py_test_env = dict(exec_env if exec_env is not None else os.environ)
                 py_test_env["PYTHONDONTWRITEBYTECODE"] = "1"
                 py_test_env["TRIAD_GATE_ACTIVE"] = "1"
@@ -3392,14 +3690,30 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                     py_test_env["PYTHONPATH"] = os.pathsep.join(sanitized_pp_parts)
 
                 if in_worktree:
-                    isolation_script = _build_python_isolation_script(cwd, py_test_target, excluded_roots)
+                    isolation_script = _build_python_isolation_script(cwd, py_test_target, excluded_roots, pattern=test_pattern)
                     test_cmd = [sys.executable, "-c", isolation_script]
                 else:
-                    test_cmd = [sys.executable, "-m", "unittest", "discover", "-s", py_test_target, "-p", "test_*.py"]
+                    test_cmd = [sys.executable, "-m", "unittest", "discover", "-s", py_test_target, "-p", test_pattern]
                 ret, out, err = run_subprocess_tree_safe(test_cmd, cwd=cwd, timeout=test_timeout, env=py_test_env)
 
                 diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
                 is_empty_suite = ("Ran 0 tests" in diag_output) or ("collected 0 items" in diag_output) or (ret == 5)
+                if is_empty_suite:
+                    if explicit_target:
+                        print(
+                            f"\n[Triad Gate: Step 2 FAILED] Explicit test target '{test_pattern}' matched 0 test cases.\n{diag_output}",
+                            file=sys.stderr,
+                        )
+                        sys.exit(5)
+                    elif is_targeted:
+                        print(f"[Step 2/3] Targeted test pattern '{test_pattern}' matched 0 test cases; falling back to full test suite.")
+                        test_pattern = "test_*.py"
+                        setattr(args, "_active_test_pattern", test_pattern)
+                        is_targeted = False
+                        py_test_targets = list(all_py_test_targets)
+                        target_idx = 0
+                        continue
+
                 if ret != 0 or is_empty_suite:
                     step2_failed = True
                     reason = "discovering 0 tests" if is_empty_suite else "failures"
@@ -3418,6 +3732,7 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
 
             if not ran_any_tests:
                 print("[Step 2/3] No test runner found (package.json / Python tests). Skipping.")
+                setattr(args, "_active_test_pattern", None)
 
         # Check for uncommitted source dependencies created during validation
         _check_no_uncommitted_source_dependencies(cwd, exec_env, in_worktree=in_worktree, stage_name="post-validation")
@@ -3603,6 +3918,8 @@ def cmd_auto(args, env: Optional[Dict[str, str]] = None):
     if getattr(args, "classify_only", False):
         _print_classification_only(args)
         return
+
+    _check_apply_verified_safety(args, env)
 
     if getattr(args, "worktree", False):
         try:
@@ -5108,18 +5425,7 @@ def is_plausible_natural_language(first_arg: str, total_args: int, known_command
     return True
 
 
-def main():
-    # Top-level intuitive auto-dispatch: if first arg is not a known command or flag and looks like natural language, route through auto
-    known_commands = {
-        "doctor", "review", "consult", "debug", "gate",
-        "bench", "worktree", "auto", "intent", "run",
-        "listen", "serve", "hook",
-        "-h", "--help"
-    }
-    if len(sys.argv) > 1 and sys.argv[1] not in known_commands and not sys.argv[1].startswith("-"):
-        if is_plausible_natural_language(sys.argv[1], len(sys.argv), known_commands):
-            sys.argv.insert(1, "auto")
-
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="triad", description="Autonomous Multi-Agent Triad Orchestrator")
     subparsers = parser.add_subparsers(dest="command", help="Triad command to execute")
 
@@ -5138,6 +5444,8 @@ def main():
     p_auto.add_argument("--ref", default="HEAD", help="Git ref/branch/commit to base ephemeral worktree on (default: HEAD)")
     p_auto.add_argument("--apply-verified", action="store_true", help="Apply passing self-healing patches back to parent working tree")
     p_auto.add_argument("--test-timeout", type=int, default=300, help="Test runner timeout in seconds (default 300)")
+    p_auto.add_argument("--target", default="", help="Targeted test pattern (e.g. test_circuit.py)")
+    p_auto.add_argument("--targeted", action="store_true", help="Auto-resolve targeted test pattern from changed files")
     p_auto.add_argument("--classify-only", action="store_true", help="Print the intent classification as JSON and exit without executing")
 
     # doctor
@@ -5181,6 +5489,8 @@ def main():
     p_gate.add_argument("--max-retries", type=int, default=1, help="Max self-healing retries for tsc/tests (default 1)")
     p_gate.add_argument("--timeout", type=int, default=240, help="Advisor signoff timeout in seconds (default 240)")
     p_gate.add_argument("--test-timeout", type=int, default=300, help="Test runner timeout in seconds (default 300)")
+    p_gate.add_argument("--target", default="", help="Targeted test pattern (e.g. test_circuit.py)")
+    p_gate.add_argument("--targeted", action="store_true", help="Auto-resolve targeted test pattern from changed files")
     p_gate.add_argument("--worktree", "-w", action="store_true", help="Execute pre-commit gate in an isolated ephemeral git worktree")
     p_gate.add_argument("--ref", default="HEAD", help="Git ref/branch/commit to base ephemeral worktree on (default: HEAD)")
     p_gate.add_argument("--apply-verified", action="store_true", help="Apply passing self-healing patches back to parent working tree")
@@ -5220,6 +5530,22 @@ def main():
     p_listen.add_argument("--port", type=int, default=8789, help="HTTP daemon port (default 8789)")
     p_listen.add_argument("--host", default="127.0.0.1", help="HTTP daemon host (default 127.0.0.1)")
 
+    return parser
+
+
+def main():
+    # Top-level intuitive auto-dispatch: if first arg is not a known command or flag and looks like natural language, route through auto
+    known_commands = {
+        "doctor", "review", "consult", "debug", "gate",
+        "bench", "worktree", "auto", "intent", "run",
+        "listen", "serve", "hook",
+        "-h", "--help"
+    }
+    if len(sys.argv) > 1 and sys.argv[1] not in known_commands and not sys.argv[1].startswith("-"):
+        if is_plausible_natural_language(sys.argv[1], len(sys.argv), known_commands):
+            sys.argv.insert(1, "auto")
+
+    parser = build_parser()
     args = parser.parse_args()
 
     if not args.command:

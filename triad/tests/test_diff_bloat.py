@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Unit tests for diff bloat stripping, marker anchoring, idempotency, and code/doc classification."""
 
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from triad.procutil import (
@@ -13,7 +17,17 @@ from triad.procutil import (
     DOC_EXTENSIONS,
     ASSET_EXTENSIONS,
 )
-from triad.triad_engine import _affects_typescript, _affects_code
+from triad.triad_engine import (
+    _affects_typescript,
+    _affects_code,
+    _resolve_targeted_test_pattern,
+    _build_python_isolation_script,
+    _has_importers,
+    _import_index,
+    _normalize_target,
+    _check_apply_verified_safety,
+    build_parser,
+)
 
 
 class TestDiffBloatStripper(unittest.TestCase):
@@ -216,6 +230,401 @@ class TestDocOrAssetClassification(unittest.TestCase):
         self.assertFalse(_affects_typescript(["README.md"]))
         self.assertFalse(_affects_typescript(["triad/triad_engine.py"]))
         self.assertFalse(_affects_typescript(["pyproject.toml"]))
+
+
+class TestTargetedTestResolution(unittest.TestCase):
+    def setUp(self):
+        self.cwd = Path(__file__).resolve().parent.parent.parent
+        _import_index.cache_clear()
+        self.addCleanup(_import_index.cache_clear)
+
+    def test_empty_or_none(self):
+        self.assertEqual(_resolve_targeted_test_pattern([], self.cwd), "test_*.py")
+
+    def test_test_file_itself(self):
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["triad/tests/test_circuit.py"], self.cwd),
+            "test_circuit.py"
+        )
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["tests/test_diff_bloat.py"], self.cwd),
+            "test_diff_bloat.py"
+        )
+
+    def test_hermetic_module_resolution(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            tests_dir = repo / "triad" / "tests"
+            tests_dir.mkdir(parents=True)
+            (tests_dir / "test_widget.py").write_text("# test widget", encoding="utf-8")
+
+            # Direct mapping
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/widget.py"], repo),
+                "test_widget.py"
+            )
+            # Windows backslash path
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad\\widget.py"], repo),
+                "test_widget.py"
+            )
+            # Mixed doc + code changes
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["README.md", "triad/widget.py", "docs/info.txt"], repo),
+                "test_widget.py"
+            )
+            # Nonexistent module falls back to test_*.py
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/unknown.py"], repo),
+                "test_*.py"
+            )
+
+    def test_shared_module_with_importers_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            tests_dir = triad_dir / "tests"
+            tests_dir.mkdir()
+            (triad_dir / "procutil.py").write_text("class Util: pass\n", encoding="utf-8")
+            (triad_dir / "triad_engine.py").write_text("from triad.procutil import Util\n", encoding="utf-8")
+            (tests_dir / "test_procutil.py").write_text("# test\n", encoding="utf-8")
+            self.assertTrue(_has_importers("procutil", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/procutil.py"], repo),
+                "test_*.py"
+            )
+
+    def test_core_engine_modules_fall_back_to_all(self):
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["triad/triad_engine.py"], self.cwd),
+            "test_*.py"
+        )
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["triad/worktree.py"], self.cwd),
+            "test_*.py"
+        )
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["triad/competition.py"], self.cwd),
+            "test_*.py"
+        )
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["triad/circuit.py"], self.cwd),
+            "test_*.py"
+        )
+
+    def test_mixed_build_manifest_and_test_falls_back_to_all(self):
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["pyproject.toml", "triad/tests/test_circuit.py"], self.cwd),
+            "test_*.py"
+        )
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["package.json", "triad/tests/test_circuit.py"], self.cwd),
+            "test_*.py"
+        )
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["requirements-dev.txt"], self.cwd),
+            "test_*.py"
+        )
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["setup.cfg"], self.cwd),
+            "test_*.py"
+        )
+        self.assertEqual(
+            _resolve_targeted_test_pattern(["conftest.py"], self.cwd),
+            "test_*.py"
+        )
+
+    def test_hermetic_importer_detection(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            tests_dir = triad_dir / "tests"
+            tests_dir.mkdir()
+
+            (triad_dir / "service.py").write_text("class Service:\n    pass\n", encoding="utf-8")
+            (triad_dir / "consumer.py").write_text("from triad.service import Service\n", encoding="utf-8")
+            (tests_dir / "test_service.py").write_text("# test\n", encoding="utf-8")
+            (tests_dir / "test_consumer.py").write_text("# test\n", encoding="utf-8")
+
+            # service is imported by consumer -> must fall back to test_*.py
+            self.assertTrue(_has_importers("service", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/service.py"], repo),
+                "test_*.py"
+            )
+
+            # consumer is not imported by any module -> resolves to test_consumer.py
+            self.assertFalse(_has_importers("consumer", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/consumer.py"], repo),
+                "test_consumer.py"
+            )
+
+    def test_non_python_file_matching_test_name_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            tests_dir = repo / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "test_config.py").write_text("# test\n", encoding="utf-8")
+            # config.yaml must NOT map to test_config.py
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["config.yaml"], repo),
+                "test_*.py"
+            )
+
+    def test_syntax_error_in_code_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            tests_dir = triad_dir / "tests"
+            tests_dir.mkdir()
+            # Broken syntax referencing leaf causes leaf to be marked as imported -> test_*.py
+            (triad_dir / "broken.py").write_text("def broken(:\n    leaf.do_something()\n", encoding="utf-8")
+            (triad_dir / "leaf.py").write_text("x = 1\n", encoding="utf-8")
+            (tests_dir / "test_leaf.py").write_text("# test\n", encoding="utf-8")
+            self.assertTrue(_has_importers("leaf", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/leaf.py"], repo),
+                "test_*.py"
+            )
+
+            # Unrelated broken syntax does not prevent targeting leaf
+            (triad_dir / "broken.py").write_text("def broken(:\n    something_else()\n", encoding="utf-8")
+            _import_index.cache_clear()
+            self.assertFalse(_has_importers("leaf", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/leaf.py"], repo),
+                "test_leaf.py"
+            )
+
+    def test_imported_by_external_test_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            tests_dir = triad_dir / "tests"
+            tests_dir.mkdir()
+            (triad_dir / "fixture.py").write_text("VAL = 42\n", encoding="utf-8")
+            (tests_dir / "test_fixture.py").write_text("# test fixture\n", encoding="utf-8")
+            # External test file imports fixture
+            (tests_dir / "test_other.py").write_text("import triad.fixture\n", encoding="utf-8")
+            self.assertTrue(_has_importers("fixture", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/fixture.py"], repo),
+                "test_*.py"
+            )
+
+    def test_cli_parser_targeted_flags(self):
+        parser = build_parser()
+
+        args_gate_target = parser.parse_args(["gate", "--target", "test_circuit.py"])
+        self.assertEqual(args_gate_target.target, "test_circuit.py")
+        self.assertFalse(args_gate_target.targeted)
+
+        args_gate_targeted = parser.parse_args(["gate", "--targeted"])
+        self.assertTrue(args_gate_targeted.targeted)
+
+        args_auto_target = parser.parse_args(["auto", "--target", "test_circuit.py"])
+        self.assertEqual(args_auto_target.target, "test_circuit.py")
+        self.assertFalse(args_auto_target.targeted)
+
+        args_auto_targeted = parser.parse_args(["auto", "--targeted"])
+        self.assertTrue(args_auto_targeted.targeted)
+
+    def test_isolation_script_zero_matched_tests_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            tests_dir = repo / "tests"
+            tests_dir.mkdir()
+            # Directory contains no test files matching test_nonexistent.py
+            script = _build_python_isolation_script(repo, "tests", [], pattern="test_nonexistent.py")
+            res = subprocess.run([sys.executable, "-c", script], cwd=str(repo), capture_output=True, text=True, timeout=30)
+            self.assertEqual(res.returncode, 5)
+
+    def test_dynamic_import_string_constant_indexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            tests_dir = triad_dir / "tests"
+            tests_dir.mkdir()
+            (triad_dir / "service.py").write_text("def run(): pass\n", encoding="utf-8")
+            (tests_dir / "test_service.py").write_text("# test service\n", encoding="utf-8")
+            # External test uses string reference in mock.patch
+            (tests_dir / "test_unrelated.py").write_text('mock.patch("triad.service.run")\n', encoding="utf-8")
+            self.assertTrue(_has_importers("service", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/service.py"], repo),
+                "test_*.py"
+            )
+
+    def test_same_stem_importer_not_bypassed(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            other_dir = repo / "other"
+            other_dir.mkdir(parents=True)
+            (triad_dir / "service.py").write_text("class Service: pass\n", encoding="utf-8")
+            # other/service.py has the same stem ("service"), but imports triad.service
+            (other_dir / "service.py").write_text("import triad.service\n", encoding="utf-8")
+            self.assertTrue(_has_importers("service", repo))
+
+    def test_dot_triad_importer_not_bypassed(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            dot_triad_dir = repo / ".triad"
+            dot_triad_dir.mkdir(parents=True)
+            (triad_dir / "service.py").write_text("class Service: pass\n", encoding="utf-8")
+            # .triad/service.py must not be stripped to triad/service.py
+            (dot_triad_dir / "service.py").write_text("import triad.service\n", encoding="utf-8")
+            self.assertTrue(_has_importers("service", repo))
+
+    def test_check_apply_verified_safety_rejects_targeted_combinations(self):
+        import argparse
+        # 1. --apply-verified with explicit --target
+        args_target = argparse.Namespace(apply_verified=True, target="test_circuit.py", targeted=False)
+        with self.assertRaises(SystemExit) as ctx:
+            _check_apply_verified_safety(args_target, {})
+        self.assertEqual(ctx.exception.code, 1)
+
+        # 2. --apply-verified with --targeted flag
+        args_targeted = argparse.Namespace(apply_verified=True, target="", targeted=True)
+        with self.assertRaises(SystemExit) as ctx:
+            _check_apply_verified_safety(args_targeted, {})
+        self.assertEqual(ctx.exception.code, 1)
+
+        # 3. --apply-verified with TRIAD_TARGETED_TESTS="1" in env
+        args_env = argparse.Namespace(apply_verified=True, target="", targeted=False)
+        with self.assertRaises(SystemExit) as ctx:
+            _check_apply_verified_safety(args_env, {"TRIAD_TARGETED_TESTS": "1"})
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_check_apply_verified_safety_allows_full_suite(self):
+        import argparse
+        # Default full suite execution allowed with --apply-verified
+        args_safe = argparse.Namespace(apply_verified=True, target="", targeted=False)
+        try:
+            _check_apply_verified_safety(args_safe, {})
+        except SystemExit:
+            self.fail("_check_apply_verified_safety unexpectedly exited on valid full suite configuration")
+
+    def test_cmd_auto_rejects_apply_verified_with_targeted(self):
+        from triad.triad_engine import cmd_auto
+        import argparse
+        args = argparse.Namespace(
+            apply_verified=True, target="test_foo.py", targeted=False,
+            classify_only=False, worktree=False
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            cmd_auto(args, {})
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_normalize_target(self):
+        self.assertEqual(_normalize_target("tests/test_*.py"), "test_*.py")
+        self.assertEqual(_normalize_target("test_*.py"), "test_*.py")
+        self.assertEqual(_normalize_target(""), "test_*.py")
+        self.assertEqual(_normalize_target("circuit"), "test_circuit.py")
+        self.assertEqual(_normalize_target("triad/competition.py"), "test_competition.py")
+        self.assertEqual(_normalize_target("test_competition.py"), "test_competition.py")
+        self.assertEqual(_normalize_target("test_circuit"), "test_circuit.py")
+        self.assertEqual(_normalize_target("triad/tests"), "test_*.py")
+        self.assertEqual(_normalize_target("tests/"), "test_*.py")
+        self.assertEqual(_normalize_target("*.py"), "test_*.py")
+
+    def test_apply_verified_allows_explicit_full_suite(self):
+        import argparse
+        args1 = argparse.Namespace(apply_verified=True, target="test_*.py", targeted=False)
+        try:
+            _check_apply_verified_safety(args1, {})
+        except SystemExit:
+            self.fail("_check_apply_verified_safety rejected explicit test_*.py")
+
+        args2 = argparse.Namespace(apply_verified=True, target="tests/test_*.py", targeted=False)
+        try:
+            _check_apply_verified_safety(args2, {})
+        except SystemExit:
+            self.fail("_check_apply_verified_safety rejected explicit tests/test_*.py")
+
+    def test_asset_file_rules(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            tests_dir = triad_dir / "tests"
+            tests_dir.mkdir()
+            prompts_dir = repo / "prompts"
+            prompts_dir.mkdir()
+
+            (prompts_dir / "system.md").write_text("prompt\n", encoding="utf-8")
+            (triad_dir / "service.py").write_text('Path("prompts/system.md").read_text()\n', encoding="utf-8")
+            (tests_dir / "test_service.py").write_text("# test\n", encoding="utf-8")
+
+            # Document referenced as string in Python code triggers full suite
+            self.assertTrue(_has_importers("system.md", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["prompts/system.md"], repo),
+                "test_*.py"
+            )
+
+            # Non-doc asset (e.g. data.json) triggers full suite
+            (repo / "data.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["data.json"], repo),
+                "test_*.py"
+            )
+
+    def test_skip_import_dirs_preserves_nested_worktrees(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            pkg_worktrees = repo / "mypkg" / "worktrees"
+            pkg_worktrees.mkdir(parents=True)
+            (pkg_worktrees / "manager.py").write_text("class Manager: pass\n", encoding="utf-8")
+            (repo / "app.py").write_text("from mypkg.worktrees.manager import Manager\n", encoding="utf-8")
+
+            idx = _import_index(repo)
+            self.assertIsNotNone(idx)
+            self.assertIn("manager", idx)
+            self.assertIn("app.py", idx["manager"])
+
+    def test_dynamic_import_fstring(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            tests_dir = triad_dir / "tests"
+            tests_dir.mkdir()
+            (triad_dir / "service.py").write_text("class Service: pass\n", encoding="utf-8")
+            (tests_dir / "test_service.py").write_text("# test\n", encoding="utf-8")
+            # Dynamic import using JoinedStr (f-string)
+            (triad_dir / "runner.py").write_text('mod = "service"\nimportlib.import_module(f"triad.{mod}")\n', encoding="utf-8")
+            self.assertTrue(_has_importers("service", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/service.py"], repo),
+                "test_*.py"
+            )
+
+    def test_manifest_mentions_module_treated_as_imported(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            tests_dir = triad_dir / "tests"
+            tests_dir.mkdir()
+            (triad_dir / "cli.py").write_text("def run(): pass\n", encoding="utf-8")
+            (tests_dir / "test_cli.py").write_text("# test\n", encoding="utf-8")
+            # pyproject.toml defines script entry point pointing to cli
+            (repo / "pyproject.toml").write_text('[project.scripts]\nmycmd = "triad.cli:run"\n', encoding="utf-8")
+            self.assertTrue(_has_importers("cli", repo))
+            self.assertEqual(
+                _resolve_targeted_test_pattern(["triad/cli.py"], repo),
+                "test_*.py"
+            )
 
 
 if __name__ == "__main__":
