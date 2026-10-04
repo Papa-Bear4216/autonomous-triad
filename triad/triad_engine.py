@@ -2341,8 +2341,8 @@ def _is_ci(env: Optional[Dict[str, str]] = None) -> bool:
     return str(exec_env.get("CI", "")).strip().lower() in ("1", "true", "yes")
 
 
-def _normalize_target(raw: str) -> str:
-    """Normalize a target test pattern or file path into a test pattern (e.g. 'test_*.py')."""
+def _normalize_single_target(raw: str) -> str:
+    """Normalize a single target test pattern or file path into a test pattern (e.g. 'test_*.py')."""
     s = (raw or "").strip().replace("\\", "/")
     base = os.path.basename(s)
     if not base or base == "test_*.py":
@@ -2359,6 +2359,19 @@ def _normalize_target(raw: str) -> str:
     elif not base.endswith(".py"):
         base = f"{base}.py"
     return base
+
+
+def _normalize_target(raw: str) -> str:
+    """Normalize target test pattern(s) or file paths into test pattern(s) (e.g. 'test_*.py' or 'test_a.py,test_b.py')."""
+    if not raw or not raw.strip():
+        return "test_*.py"
+    raw_str = raw.strip()
+    if "," in raw_str:
+        parts = [_normalize_single_target(p) for p in raw_str.split(",") if p.strip()]
+        if any(p == "test_*.py" for p in parts) or not parts:
+            return "test_*.py"
+        return ",".join(sorted(set(parts)))
+    return _normalize_single_target(raw_str)
 
 
 def _check_apply_verified_safety(args, env: Optional[Dict[str, str]] = None) -> None:
@@ -2671,12 +2684,61 @@ def cmd_gate(args, env: Optional[Dict[str, str]] = None):
     notify_event("Pre-Commit Gate Passed", f"Type safety, test suites{pat_detail}, and Advisory Council review approved.", status="success", timeout=1.5, async_dispatch=True)
 
 
-def _build_python_isolation_script(cwd: Path, py_test_target: str, excluded_roots: List[Path], pattern: str = "test_*.py") -> str:
+def _render_unittest_suite_runner(target_repr: str, patterns_repr: str, pattern_desc_repr: str) -> str:
+    """Generate shared unittest discovery, test ID deduplication, and runner execution block."""
+    return (
+        "import unittest\n"
+        "loader = unittest.defaultTestLoader\n"
+        "suite = unittest.TestSuite()\n\n"
+        "def _iter_tests(suite_or_case):\n"
+        "    if hasattr(suite_or_case, '__iter__'):\n"
+        "        for _s in suite_or_case:\n"
+        "            yield from _iter_tests(_s)\n"
+        "    else:\n"
+        "        yield suite_or_case\n\n"
+        "seen_ids = set()\n"
+        "unmatched = []\n"
+        f"for _pat in {patterns_repr}:\n"
+        f"    _sub = loader.discover(start_dir={target_repr}, pattern=_pat)\n"
+        "    _matched = False\n"
+        "    for _case in _iter_tests(_sub):\n"
+        "        _tid = getattr(_case, 'id', lambda: str(_case))()\n"
+        "        if _tid not in seen_ids:\n"
+        "            seen_ids.add(_tid)\n"
+        "            suite.addTest(_case)\n"
+        "            _matched = True\n"
+        "    if not _matched:\n"
+        "        unmatched.append(_pat)\n\n"
+        "if suite.countTestCases() == 0:\n"
+        f"    print('[Triad Test Error] No tests matched pattern(s) ' + {pattern_desc_repr} + ' in ' + {target_repr}, file=sys.stderr)\n"
+        "    sys.exit(5)\n"
+        "if unmatched:\n"
+        f"    print('[Triad Test Warning] Pattern(s) with 0 matches in ' + {target_repr} + ': ' + ', '.join(unmatched), file=sys.stderr)\n\n"
+        "runner = unittest.TextTestRunner(verbosity=2)\n"
+        "result = runner.run(suite)\n"
+        "sys.exit(0 if result.wasSuccessful() else 1)\n"
+    )
+
+
+def _build_python_isolation_script(cwd: Path, py_test_target: str, excluded_roots: List[Path], pattern: Union[str, List[str], Set[str]] = "test_*.py") -> str:
     """Generate isolation script for running Python tests in worktree without leaking parent or originating checkouts."""
+    if isinstance(pattern, str):
+        if "," in pattern:
+            patterns = [p.strip() for p in pattern.split(",") if p.strip()]
+        else:
+            patterns = [pattern.strip()]
+    elif isinstance(pattern, (list, tuple, set)):
+        patterns = [str(p).strip() for p in pattern if str(p).strip()]
+    else:
+        patterns = ["test_*.py"]
+    if not patterns:
+        patterns = ["test_*.py"]
+
     excluded_roots_repr = repr([str(r.resolve()) for r in excluded_roots])
     cwd_root_repr = repr(str(cwd.resolve()))
     test_target_repr = repr(py_test_target)
-    test_pattern_repr = repr(pattern or "test_*.py")
+    patterns_repr = repr(patterns)
+    pattern_desc_repr = repr(", ".join(patterns))
     return (
         "import sys\n\n"
         f"_ex_roots_raw = tuple({excluded_roots_repr})\n"
@@ -2865,16 +2927,15 @@ def _build_python_isolation_script(cwd: Path, py_test_target: str, excluded_root
         "    def __getattr__(self, name):\n"
         "        return getattr(self._orig, name)\n\n"
         "sys.meta_path = [_IsolatingFinder(f) for f in sys.meta_path if not isinstance(f, _IsolatingFinder)]\n\n"
-        "import unittest\n"
-        "loader = unittest.defaultTestLoader\n"
-        f"suite = loader.discover(start_dir={test_target_repr}, pattern={test_pattern_repr})\n"
-        "if suite.countTestCases() == 0:\n"
-        f"    print('[Triad Test Error] No tests matched pattern ' + {test_pattern_repr} + ' in ' + {test_target_repr}, file=sys.stderr)\n"
-        "    sys.exit(5)\n"
-        "runner = unittest.TextTestRunner(verbosity=2)\n"
-        "result = runner.run(suite)\n"
-        "sys.exit(0 if result.wasSuccessful() else 1)\n"
-    )
+    ) + _render_unittest_suite_runner(test_target_repr, patterns_repr, pattern_desc_repr)
+
+
+def _build_python_multi_pattern_script(cwd: Path, py_test_target: str, patterns: List[str]) -> str:
+    """Generate simple multi-pattern discovery script for local non-worktree test execution."""
+    patterns_repr = repr(patterns)
+    target_repr = repr(py_test_target)
+    pattern_desc_repr = repr(", ".join(patterns))
+    return "import sys\n" + _render_unittest_suite_runner(target_repr, patterns_repr, pattern_desc_repr)
 
 
 IGNORED_SOURCE_DEPENDENCY_DIR_NAMES = {
@@ -3210,11 +3271,20 @@ SKIP_IMPORT_INDEX_DIRS = {
 }
 
 
+_FILE_IMPORT_CACHE: Dict[str, Tuple[int, int, Set[str]]] = {}
+
+
+def _clear_import_index_caches() -> None:
+    """Clear both the repository aggregate cache and file-level AST token cache."""
+    _import_index.cache_clear()
+    _FILE_IMPORT_CACHE.clear()
+
+
 @lru_cache(maxsize=8)
 def _import_index(cwd_resolved: Path) -> Optional[Dict[str, Set[str]]]:
     """
     Build index mapping imported module name to set of importing file relative paths across repository.
-    Scans repository via AST parsing (conservative fallback on parse or read error).
+    Scans repository via AST parsing with per-file mtime invalidation (conservative fallback on parse or read error).
     """
     imported_to_callers: Dict[str, Set[str]] = {}
     for root, dirs, files in os.walk(str(cwd_resolved)):
@@ -3235,46 +3305,64 @@ def _import_index(cwd_resolved: Path) -> Optional[Dict[str, Set[str]]]:
             except ValueError:
                 rel = p
             rel_str = str(rel).replace("\\", "/")
+
+            p_str = str(p)
             try:
-                content = p.read_text(encoding="utf-8", errors="ignore")
-                tree = ast.parse(content)
-            except (SyntaxError, ValueError, RecursionError):
-                for tok in set(re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", content)):
-                    for part in tok.split("."):
-                        imported_to_callers.setdefault(part, set()).add(rel_str)
-                continue
+                st = p.stat()
+                mtime_ns = st.st_mtime_ns
+                size = st.st_size
             except OSError:
                 return None  # conservative fallback -> caller treats as "has importers"
 
-            for n in ast.walk(tree):
-                if isinstance(n, ast.Import):
-                    for a in n.names:
-                        for part in a.name.split("."):
-                            imported_to_callers.setdefault(part, set()).add(rel_str)
-                elif isinstance(n, ast.ImportFrom):
-                    if n.module:
-                        for part in n.module.split("."):
-                            imported_to_callers.setdefault(part, set()).add(rel_str)
-                    for a in n.names:
-                        imported_to_callers.setdefault(a.name, set()).add(rel_str)
-                elif isinstance(n, ast.Call):
-                    func_id = ""
-                    if isinstance(n.func, ast.Name):
-                        func_id = n.func.id
-                    elif isinstance(n.func, ast.Attribute):
-                        func_id = n.func.attr
-                    if func_id in ("import_module", "__import__") and n.args:
-                        for c in ast.walk(n.args[0]):
-                            if isinstance(c, ast.Constant) and isinstance(c.value, str):
-                                for part in re.findall(r"[A-Za-z_]\w*", c.value):
-                                    imported_to_callers.setdefault(part, set()).add(rel_str)
-                elif isinstance(n, ast.Constant) and isinstance(n.value, str) and 0 < len(n.value) < 200:
-                    v = n.value.replace("\\", "/")
-                    imported_to_callers.setdefault(v, set()).add(rel_str)
-                    imported_to_callers.setdefault(v.rsplit("/", 1)[-1], set()).add(rel_str)
-                    for match in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b", n.value):
-                        for part in match.split("."):
-                            imported_to_callers.setdefault(part, set()).add(rel_str)
+            cached = _FILE_IMPORT_CACHE.get(p_str)
+            if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+                file_tokens = cached[2]
+            else:
+                try:
+                    content = p.read_text(encoding="utf-8", errors="ignore")
+                    tree = ast.parse(content)
+                    file_tokens = set()
+                    for n in ast.walk(tree):
+                        if isinstance(n, ast.Import):
+                            for a in n.names:
+                                for part in a.name.split("."):
+                                    file_tokens.add(part)
+                        elif isinstance(n, ast.ImportFrom):
+                            if n.module:
+                                for part in n.module.split("."):
+                                    file_tokens.add(part)
+                            for a in n.names:
+                                file_tokens.add(a.name)
+                        elif isinstance(n, ast.Call):
+                            func_id = ""
+                            if isinstance(n.func, ast.Name):
+                                func_id = n.func.id
+                            elif isinstance(n.func, ast.Attribute):
+                                func_id = n.func.attr
+                            if func_id in ("import_module", "__import__") and n.args:
+                                for c in ast.walk(n.args[0]):
+                                    if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                                        for part in re.findall(r"[A-Za-z_]\w*", c.value):
+                                            file_tokens.add(part)
+                        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and 0 < len(n.value) < 200:
+                            v = n.value.replace("\\", "/")
+                            file_tokens.add(v)
+                            file_tokens.add(v.rsplit("/", 1)[-1])
+                            for match in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b", n.value):
+                                for part in match.split("."):
+                                    file_tokens.add(part)
+                    _FILE_IMPORT_CACHE[p_str] = (mtime_ns, size, file_tokens)
+                except (SyntaxError, ValueError, RecursionError):
+                    file_tokens = set()
+                    for tok in set(re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", content)):
+                        for part in tok.split("."):
+                            file_tokens.add(part)
+                    _FILE_IMPORT_CACHE[p_str] = (mtime_ns, size, file_tokens)
+                except OSError:
+                    return None
+
+            for tok in file_tokens:
+                imported_to_callers.setdefault(tok, set()).add(rel_str)
 
     return imported_to_callers
 
@@ -3360,12 +3448,47 @@ def _resolve_targeted_test_pattern(changed_files: List[str], cwd: Path) -> str:
         else:
             return "test_*.py"
 
-    if len(matched_patterns) == 1:
-        return next(iter(matched_patterns))
+    if matched_patterns:
+        return ",".join(sorted(matched_patterns))
     return "test_*.py"
 
 
+def _resolve_pytest_xdist_cmd(target: str, cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None) -> Optional[List[str]]:
+    """Determine if pytest with xdist is available in current python environment or uv."""
+    try:
+        ret, _, _ = run_subprocess_tree_safe([sys.executable, "-c", "import pytest, xdist"], cwd=cwd, env=env, timeout=5)
+        if ret == 0:
+            return [sys.executable, "-m", "pytest", "-n", "auto", "--dist=loadfile", "-p", "no:cacheprovider", target]
+    except Exception:
+        pass
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        try:
+            ret, _, _ = run_subprocess_tree_safe([uv_bin, "run", "--no-sync", "python", "-c", "import pytest, xdist"], cwd=cwd, env=env, timeout=10)
+            if ret == 0:
+                return [uv_bin, "run", "--no-sync", "pytest", "-n", "auto", "--dist=loadfile", "-p", "no:cacheprovider", target]
+        except Exception:
+            pass
+    return None
+
+
 def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = False, review_base: Optional[str] = None, cwd: Optional[Path] = None):
+    exec_env = dict(os.environ if env is None else env)
+    gate_pycache_dir: Optional[Path] = None
+    if "PYTHONDONTWRITEBYTECODE" not in exec_env:
+        try:
+            gate_pycache_dir = Path(tempfile.mkdtemp(prefix="triad_gate_pycache_"))
+        except Exception:
+            gate_pycache_dir = None
+
+    try:
+        return _run_gate_impl(args, env=env, in_worktree=in_worktree, review_base=review_base, cwd=cwd, gate_pycache_dir=gate_pycache_dir)
+    finally:
+        if gate_pycache_dir and gate_pycache_dir.exists():
+            shutil.rmtree(str(gate_pycache_dir), ignore_errors=True)
+
+
+def _run_gate_impl(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = False, review_base: Optional[str] = None, cwd: Optional[Path] = None, gate_pycache_dir: Optional[Path] = None):
     _import_index.cache_clear()
     cwd = (cwd or Path.cwd()).resolve()
     exec_env = dict(os.environ if env is None else env)
@@ -3432,6 +3555,9 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
     candidate_tree = None
     while attempt <= max_retries:
         _import_index.cache_clear()
+        if attempt > 0 and gate_pycache_dir and gate_pycache_dir.exists():
+            shutil.rmtree(str(gate_pycache_dir), ignore_errors=True)
+            gate_pycache_dir.mkdir(parents=True, exist_ok=True)
         # Capture candidate tree snapshot before running validation checks
         ret, candidate_tree, err = run_subprocess_tree_safe(["git", "write-tree"], cwd=cwd, env=exec_env)
         if ret != 0 or not candidate_tree.strip():
@@ -3594,14 +3720,16 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
             all_py_test_targets = list(py_test_targets)
             is_targeted = test_pattern != "test_*.py"
             explicit_target = explicit_target and is_targeted
+            active_patterns = [p.strip() for p in test_pattern.split(",") if p.strip()]
             if is_targeted:
                 banner_source = "explicit --target" if explicit_target else f"auto-resolved via {target_source}"
-                print(f"[Step 2/3] [TARGETED GATE] Running test pattern '{test_pattern}' ({banner_source})...")
+                print(f"[Step 2/3] [TARGETED GATE] Running test pattern(s) '{test_pattern}' ({banner_source})...")
 
                 # Filter target directories to only those containing matching test files
                 active_targets = []
                 for target_dir in py_test_targets:
-                    if any((cwd / target_dir).rglob(test_pattern)):
+                    td_path = cwd / target_dir
+                    if any(any(td_path.rglob(pat)) for pat in active_patterns):
                         active_targets.append(target_dir)
 
                 if not active_targets and py_test_targets:
@@ -3616,6 +3744,7 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                         test_pattern = "test_*.py"
                         setattr(args, "_active_test_pattern", test_pattern)
                         is_targeted = False
+                        active_patterns = [test_pattern]
                         active_targets = py_test_targets
                 py_test_targets = active_targets
 
@@ -3627,7 +3756,11 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                 pattern_desc = f", pattern: {test_pattern}" if is_targeted else ""
                 print(f"[Step 2/3] Running Python unit test suite ({py_test_target}{pattern_desc})...")
                 py_test_env = dict(exec_env if exec_env is not None else os.environ)
-                py_test_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                if gate_pycache_dir and gate_pycache_dir.exists():
+                    py_test_env["PYTHONPYCACHEPREFIX"] = str(gate_pycache_dir)
+                    py_test_env.pop("PYTHONDONTWRITEBYTECODE", None)
+                else:
+                    py_test_env["PYTHONDONTWRITEBYTECODE"] = "1"
                 py_test_env["TRIAD_GATE_ACTIVE"] = "1"
                 if in_worktree:
                     py_test_env["TRIAD_ISOLATED_WORKTREE"] = "1"
@@ -3689,11 +3822,32 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                                 pass
                     py_test_env["PYTHONPATH"] = os.pathsep.join(sanitized_pp_parts)
 
+                is_parallel_requested = bool(getattr(args, "parallel", False) or py_test_env.get("TRIAD_PARALLEL_TESTS") == "1")
+                target_patterns = [pat for pat in active_patterns if any((cwd / py_test_target).rglob(pat))] if is_targeted else active_patterns
                 if in_worktree:
-                    isolation_script = _build_python_isolation_script(cwd, py_test_target, excluded_roots, pattern=test_pattern)
+                    if is_parallel_requested:
+                        print("[Step 2/3] [Notice] --parallel is bypassed in isolated worktree mode (worktree runner manages process isolation).")
+                    isolation_script = _build_python_isolation_script(cwd, py_test_target, excluded_roots, pattern=target_patterns)
                     test_cmd = [sys.executable, "-c", isolation_script]
                 else:
-                    test_cmd = [sys.executable, "-m", "unittest", "discover", "-s", py_test_target, "-p", test_pattern]
+                    if is_targeted:
+                        if is_parallel_requested:
+                            print("[Step 2/3] [Notice] --parallel is bypassed for targeted test pattern(s).")
+                        if len(target_patterns) > 1:
+                            multi_script = _build_python_multi_pattern_script(cwd, py_test_target, target_patterns)
+                            test_cmd = [sys.executable, "-c", multi_script]
+                        else:
+                            test_cmd = [sys.executable, "-m", "unittest", "discover", "-s", py_test_target, "-p", target_patterns[0]]
+                    elif is_parallel_requested:
+                        xdist_cmd = _resolve_pytest_xdist_cmd(py_test_target, cwd=cwd, env=py_test_env)
+                        if xdist_cmd:
+                            print("[Step 2/3] [PARALLEL] Executing test suite via pytest-xdist across CPU cores...")
+                            test_cmd = xdist_cmd
+                        else:
+                            print("[Step 2/3] [Notice] pytest-xdist not detected; executing sequentially via unittest.")
+                            test_cmd = [sys.executable, "-m", "unittest", "discover", "-s", py_test_target, "-p", test_pattern]
+                    else:
+                        test_cmd = [sys.executable, "-m", "unittest", "discover", "-s", py_test_target, "-p", test_pattern]
                 ret, out, err = run_subprocess_tree_safe(test_cmd, cwd=cwd, timeout=test_timeout, env=py_test_env)
 
                 diag_output = f"STDOUT:\n{out}\nSTDERR:\n{err}".strip()
@@ -3710,6 +3864,7 @@ def _run_gate(args, env: Optional[Dict[str, str]] = None, in_worktree: bool = Fa
                         test_pattern = "test_*.py"
                         setattr(args, "_active_test_pattern", test_pattern)
                         is_targeted = False
+                        active_patterns = [test_pattern]
                         py_test_targets = list(all_py_test_targets)
                         target_idx = 0
                         continue
@@ -5446,6 +5601,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_auto.add_argument("--test-timeout", type=int, default=300, help="Test runner timeout in seconds (default 300)")
     p_auto.add_argument("--target", default="", help="Targeted test pattern (e.g. test_circuit.py)")
     p_auto.add_argument("--targeted", action="store_true", help="Auto-resolve targeted test pattern from changed files")
+    p_auto.add_argument("--parallel", action="store_true", help="Execute test suite in parallel using pytest-xdist when available")
     p_auto.add_argument("--classify-only", action="store_true", help="Print the intent classification as JSON and exit without executing")
 
     # doctor
@@ -5491,6 +5647,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument("--test-timeout", type=int, default=300, help="Test runner timeout in seconds (default 300)")
     p_gate.add_argument("--target", default="", help="Targeted test pattern (e.g. test_circuit.py)")
     p_gate.add_argument("--targeted", action="store_true", help="Auto-resolve targeted test pattern from changed files")
+    p_gate.add_argument("--parallel", action="store_true", help="Execute test suite in parallel using pytest-xdist when available")
     p_gate.add_argument("--worktree", "-w", action="store_true", help="Execute pre-commit gate in an isolated ephemeral git worktree")
     p_gate.add_argument("--ref", default="HEAD", help="Git ref/branch/commit to base ephemeral worktree on (default: HEAD)")
     p_gate.add_argument("--apply-verified", action="store_true", help="Apply passing self-healing patches back to parent working tree")

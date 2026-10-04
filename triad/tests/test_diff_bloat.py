@@ -2,9 +2,11 @@
 """Unit tests for diff bloat stripping, marker anchoring, idempotency, and code/doc classification."""
 
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from triad.procutil import (
@@ -22,8 +24,12 @@ from triad.triad_engine import (
     _affects_code,
     _resolve_targeted_test_pattern,
     _build_python_isolation_script,
+    _build_python_multi_pattern_script,
+    _resolve_pytest_xdist_cmd,
     _has_importers,
     _import_index,
+    _clear_import_index_caches,
+    _FILE_IMPORT_CACHE,
     _normalize_target,
     _check_apply_verified_safety,
     build_parser,
@@ -625,6 +631,109 @@ class TestTargetedTestResolution(unittest.TestCase):
                 _resolve_targeted_test_pattern(["triad/cli.py"], repo),
                 "test_*.py"
             )
+
+    def test_normalize_target_multi_pattern(self):
+        self.assertEqual(
+            _normalize_target("triad/diff_bloat.py,competition.py"),
+            "test_competition.py,test_diff_bloat.py"
+        )
+        self.assertEqual(
+            _normalize_target("test_a.py,test_b.py"),
+            "test_a.py,test_b.py"
+        )
+        self.assertEqual(
+            _normalize_target("test_a.py,tests/"),
+            "test_*.py"
+        )
+
+    def test_resolve_targeted_multi_pattern_union(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            triad_dir = repo / "triad"
+            triad_dir.mkdir(parents=True)
+            tests_dir = triad_dir / "tests"
+            tests_dir.mkdir()
+            (triad_dir / "leaf1.py").write_text("class Leaf1: pass\n", encoding="utf-8")
+            (triad_dir / "leaf2.py").write_text("class Leaf2: pass\n", encoding="utf-8")
+            (tests_dir / "test_leaf1.py").write_text("# test leaf 1\n", encoding="utf-8")
+            (tests_dir / "test_leaf2.py").write_text("# test leaf 2\n", encoding="utf-8")
+            # Both leaf files modified
+            resolved = _resolve_targeted_test_pattern(["triad/leaf1.py", "triad/leaf2.py"], repo)
+            self.assertEqual(resolved, "test_leaf1.py,test_leaf2.py")
+
+    def test_build_python_isolation_script_multi_patterns(self):
+        script = _build_python_isolation_script(
+            Path("."), "triad/tests", [], pattern="test_a.py,test_b.py"
+        )
+        self.assertIn("test_a.py", script)
+        self.assertIn("test_b.py", script)
+        self.assertIn("suite.addTest", script)
+        self.assertIn("sys.meta_path", script)
+
+    def test_build_python_multi_pattern_script(self):
+        script = _build_python_multi_pattern_script(
+            Path("."), "triad/tests", ["test_a.py", "test_b.py"]
+        )
+        self.assertIn("test_a.py", script)
+        self.assertIn("test_b.py", script)
+        self.assertIn("suite.addTest", script)
+        self.assertIn("unittest.TestSuite()", script)
+
+    def test_import_index_mtime_caching(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self.addCleanup(_clear_import_index_caches)
+            _clear_import_index_caches()
+            f1 = repo / "mod1.py"
+            # Equal byte length: "import json   \n"
+            f1.write_text("import json   \n", encoding="utf-8")
+            f1_str = str(f1)
+
+            # Initial index population
+            idx1 = _import_index(repo)
+            self.assertIn("json", idx1)
+            self.assertIn(f1_str, _FILE_IMPORT_CACHE)
+            cached_entry = _FILE_IMPORT_CACHE[f1_str]
+            self.assertIn("json", cached_entry[2])
+
+            # Repeat indexing with unchanged file hits cache
+            idx2 = _import_index(repo)
+            self.assertIn("json", idx2)
+            self.assertIs(_FILE_IMPORT_CACHE[f1_str], cached_entry)
+
+            # Modifying file with identical byte length but updated mtime via os.utime
+            f1.write_text("import math   \n", encoding="utf-8")
+            new_time = time.time() + 5.0
+            os.utime(str(f1), (new_time, new_time))
+            _import_index.cache_clear()
+            idx3 = _import_index(repo)
+            self.assertIn("math", idx3)
+            self.assertNotIn("json", idx3)
+
+            _clear_import_index_caches()
+            self.assertEqual(len(_FILE_IMPORT_CACHE), 0)
+
+    def test_parallel_arg_registered(self):
+        parser = build_parser()
+        gate_args = parser.parse_args(["gate", "--parallel"])
+        self.assertTrue(gate_args.parallel)
+        auto_args = parser.parse_args(["auto", "doctor", "--parallel"])
+        self.assertTrue(auto_args.parallel)
+
+    def test_resolve_pytest_xdist_cmd(self):
+        from unittest.mock import patch
+        with patch("triad.triad_engine.run_subprocess_tree_safe", return_value=(0, "", "")):
+            cmd = _resolve_pytest_xdist_cmd("triad/tests")
+            self.assertIsNotNone(cmd)
+            self.assertIn("-n", cmd)
+            self.assertIn("auto", cmd)
+            self.assertIn("--dist=loadfile", cmd)
+            self.assertIn("no:cacheprovider", " ".join(cmd))
+
+        with patch("triad.triad_engine.run_subprocess_tree_safe", return_value=(1, "", "")):
+            with patch("shutil.which", return_value=None):
+                cmd_none = _resolve_pytest_xdist_cmd("triad/tests")
+                self.assertIsNone(cmd_none)
 
 
 if __name__ == "__main__":
