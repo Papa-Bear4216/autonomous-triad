@@ -50,3 +50,25 @@
 
 ## 4. Operational Status
 - As of merge commit `98787ac`, both `origin/master` and `origin/port/master-fixes` are pushed and in sync.
+
+---
+
+## 5. Performance & Execution Speed Optimizations (Commit `73e68c5`)
+- **Status:** **VERIFIED, APPROVED BY ADVISORY COUNCIL, AND PUSHED TO MASTER**
+- **Key Enhancements:**
+  1. **Diff Bloat Sanitization (`triad/procutil.py`):**
+     - Implemented `strip_diff_bloat` which automatically strips lockfiles (`uv.lock`, `package-lock.json`, `pnpm-lock.yaml`, `bun.lockb`, `go.sum`, etc.), minified bundles (`.min.js`, `.min.css`, `.map`), and binary assets from diff payloads sent to Advisory Council LLMs (`claude`, `codex`, `nous`).
+     - Truncates oversized single-file hunks past 500 lines to prevent LLM context exhaustion.
+     - Strictly idempotent (`strip_diff_bloat(strip_diff_bloat(x)) == strip_diff_bloat(x)`) with anchored marker checks (`_MARKER_RE`).
+  2. **Fast-Path Pre-Commit Verification Gate (`triad/triad_engine.py`):**
+     - Detects changed files between baseline and candidate tree using NUL-delimited tree diffing.
+     - Automatically skips `tsc` (Step 1) and test runners (Step 2) when changes only touch documentation or non-code assets (`not affects_code`).
+     - Automatically skips `tsc` (Step 1) when no TypeScript/JavaScript files or TS configs are touched (`not affects_ts`), dropping verification time from minutes to seconds on docs/python changes.
+     - Preserves immutable working-tree stability checks (`_verify_final_stability`) both pre- and post-council review.
+  3. **Parallel Test Runner Support (`pyproject.toml`):**
+     - Configured `[tool.pytest.ini_options]` with `testpaths = ["triad/tests"]` and support for `pytest-xdist` parallel execution (`pytest -n auto --dist=loadfile`).
+  4. **Verification:**
+     - 16 new comprehensive unit tests in `triad/tests/test_diff_bloat.py` covering lockfiles, minification, binary assets, anchored markers, multi-chunk idempotency, and doc/asset classification.
+     - Full 302-test suite passing cleanly.
+     - Advisory Council pre-commit gate signoff: **VERDICT: APPROVED**.
+
