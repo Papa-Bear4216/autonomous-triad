@@ -283,7 +283,7 @@ def strip_diff_bloat(diff_text: Optional[str], max_lines_per_file: int = 500) ->
             continue
 
         lines = chunk_clean.splitlines()
-        first_line = lines[0] if lines else ""
+        first_line = lines[0][:2048] if lines else ""  # bound input to the header regexes below
 
         # Robustly extract file path preferring +++ b/ or --- a/ over diff --git (supports spaces & quotes)
         file_path = ""

@@ -116,9 +116,9 @@ def _safe_patch_path(p: str) -> Optional[Path]:
         return None
     try:
         resolved = Path(p).resolve()
+        resolved.relative_to(PATCHES_DIR.resolve())  # containment first, before touching the filesystem
         if not resolved.is_file():
             return None
-        resolved.relative_to(PATCHES_DIR.resolve())
         return resolved
     except (ValueError, Exception):
         return None
@@ -266,7 +266,7 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
 
     def _send_cors_headers(self):
         origin = (self.headers.get("Origin") or "").strip()
-        if _is_allowed_origin(origin):
+        if "\r" not in origin and "\n" not in origin and _is_allowed_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-webhook-token")
