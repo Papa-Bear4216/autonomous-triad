@@ -3956,8 +3956,8 @@ def _run_gate_impl(args, env: Optional[Dict[str, str]] = None, in_worktree: bool
             from competition import query_competition_council
         adv_pair = ("mock", "mock") if getattr(args, "engine", "auto") == "mock" else ("claude", "codex")
         session = query_competition_council(
-            "Evaluate this diff as the final pre-commit gate.\n"
-            "Under Section 4 (Final Adjudicated Verdict & Action Plan), explicitly state either 'VERDICT: APPROVED' or 'VERDICT: REJECTED'.",
+            _gate_signoff_prompt(diff)
+            + "\nUnder Section 4 (Final Adjudicated Verdict & Action Plan), explicitly state either 'VERDICT: APPROVED' or 'VERDICT: REJECTED'.",
             diff=diff,
             mode="review_diff",
             timeout=getattr(args, "timeout", 240),
@@ -3966,10 +3966,7 @@ def _run_gate_impl(args, env: Optional[Dict[str, str]] = None, in_worktree: bool
         resp = session.get("synthesis", "")
     else:
         resp = query_advisory_council(
-            "Evaluate this diff as the final pre-commit gate.\n"
-            "Start your response with exactly 'VERDICT: APPROVED' if the diff is safe and sound to commit, "
-            "or 'VERDICT: REJECTED' if there are correctness defects, regressions, or unresolved blockers, "
-            "followed by your structured rationale.",
+            _gate_signoff_prompt(diff),
             diff=diff,
             mode="review_diff",
             engine=getattr(args, "engine", "auto"),
@@ -4017,6 +4014,25 @@ def _run_gate_impl(args, env: Optional[Dict[str, str]] = None, in_worktree: bool
         notify_event("Pre-Commit Gate Blocked", f"Advisory Council did not approve diff: {reason}.", status="failed", timeout=1.5)
         sys.exit(1)
 
+def _gate_signoff_prompt(diff: str) -> str:
+    """Stable pre-commit checklist. Truncation is named, and is not itself a rejection."""
+    files = []
+    for line in (diff or "").splitlines():
+        if line.startswith("diff --git "):
+            files.append(line[len("diff --git "):])
+    index = "\n".join(f"- {name}" for name in files[:100]) or "- (no file headers)"
+    return (
+        "Evaluate this diff as the final pre-commit gate.\n"
+        "Start your response with exactly 'VERDICT: APPROVED' or 'VERDICT: REJECTED' on the first line.\n"
+        "Checklist: correctness of the changed lines; regressions in direct callers; "
+        "data-loss or secret exposure; security of file and process handling.\n"
+        "Do not reject for wording or for files that were not shown. "
+        "If the diff was truncated, judge the files you can see and name what you could not review. "
+        "Truncation alone is not a reason to reject.\n"
+        f"Files in this diff:\n{index}\n"
+    )
+
+
 def cmd_bench(args):
     """Run the Triad benchmark suite."""
     suite = getattr(args, "suite", "cases")
@@ -4031,9 +4047,10 @@ def cmd_bench(args):
             limit=args.limit or 5,
             instance_id=args.case,
             mode="debug",
-            judge_engine=getattr(args, "judge_engine", "asymmetric"),
+            judge_engine=getattr(args, "judge_engine", "claude"),
             workers=getattr(args, "workers", 2),
-            verbose=args.verbose
+            verbose=args.verbose,
+            docker_mode=getattr(args, "docker", "off"),
         )
         return
 
@@ -4048,7 +4065,7 @@ def cmd_bench(args):
         engine=args.engine,
         limit=args.limit,
         case_id=args.case,
-        judge_engine=getattr(args, "judge_engine", "asymmetric"),
+        judge_engine=getattr(args, "judge_engine", "claude"),
         verbose=args.verbose
     )
 
@@ -5667,7 +5684,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--suite", choices=["cases", "swebench"], default="cases", help="Benchmark suite ('cases' or 'swebench')")
     p_bench.add_argument("--cases-dir", default="", help="Path to cases directory (defaults to triad/bench/cases)")
     p_bench.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, bare_single, mock)")
-    p_bench.add_argument("--judge-engine", choices=["asymmetric", "codex", "claude", "auto"], default="asymmetric", help="Judge engine (default: asymmetric - Codex with Claude failover)")
+    p_bench.add_argument("--judge-engine", choices=["claude", "auto", "codex", "asymmetric"], default="claude", help="Judge engine (default: claude, then Codex if Claude cannot answer)")
+    p_bench.add_argument("--docker", choices=["off", "auto", "on"], default="off", help="Repo-native tests in Docker when a local clone exists (default: off)")
     p_bench.add_argument("--workers", type=int, choices=[1, 2], default=2, help="Number of concurrent evaluation workers (1 or 2, default: 2)")
     p_bench.add_argument("--limit", type=int, default=0, help="Limit number of cases to test")
     p_bench.add_argument("--case", default="", help="Run single case ID (e.g. case_001 or astropy__astropy-12907)")

@@ -54,6 +54,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 from triad_engine import query_advisory_council, query_claude, query_codex
+from triad.bench.run_bench import _keep_claude_as_judge
 from triad.worktree import isolated_worktree, list_worktrees, get_repo_root, WarmWorktreePool
 
 DEFAULT_INSTANCES_FILE = Path(__file__).resolve().parent / "swebench_instances.json"
@@ -497,10 +498,10 @@ def ensure_base_file(repo: str, base_commit: str, rel_path: str) -> Tuple[Option
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. Hermetic local extraction from cached bare git repository
-    bare_name = repo.split("/")[-1] + ".git"
-    bare_repo = CACHE_DIR / "repos" / bare_name
-    if bare_repo.exists():
+    # 1. Hermetic local extraction. Prefer owner__repo.git; keep older repo.git clones.
+    from triad.bench.docker_harness import resolve_bare_repo
+    bare_repo = resolve_bare_repo(CACHE_DIR / "repos", repo)
+    if bare_repo is not None:
         cmd = ["git", f"--git-dir={bare_repo}", "show", f"{base_commit}:{clean_rel.as_posix()}"]
         try:
             res = subprocess.run(cmd, capture_output=True, timeout=15)
@@ -559,9 +560,9 @@ def verify_semantic_resolution(
     """
     Semantic resolution check using Model-as-a-Judge against gold patch and SWE-bench test criteria.
 
-    ``engine`` is the legacy judge selector. ``"auto"`` and ``"claude"`` stay Claude-first.
-    Pass ``judge_engine`` to override. ``"asymmetric"`` is the 2026-10-05 Codex-first baseline
-    and is not comparable to earlier Claude-first scores.
+    ``engine`` is the legacy judge selector. Claude is the primary judge.
+    Codex answers only when Claude cannot. ``"asymmetric"`` and ``"codex"``
+    are explicit Codex-first overrides.
     """
     active_judge = judge_engine if judge_engine is not None else engine
     gold_patch = instance.get("patch", "")
@@ -604,14 +605,19 @@ def verify_semantic_resolution(
         # Session slots are taken inside each advisor call. Wrapping this block
         # would hold one of the two slots for the whole failover and deadlock
         # the second worker.
-        if active_judge in ("asymmetric", "codex"):
-            judge_verdict = query_codex(judge_prompt, mode="general", timeout=40)
-            if not judge_verdict or "[error" in judge_verdict.lower() or "limit" in judge_verdict.lower():
-                judge_verdict = query_claude(judge_prompt, mode="general", timeout=40)
-        else:
-            judge_verdict = query_claude(judge_prompt, mode="general", timeout=40)
-            if not judge_verdict or "[error" in judge_verdict.lower() or "limit" in judge_verdict.lower():
-                judge_verdict = query_codex(judge_prompt, mode="general", timeout=40)
+        primary = "codex" if active_judge in ("asymmetric", "codex") else "claude"
+        ask = query_codex if primary == "codex" else query_claude
+        fallback_name = "claude" if primary == "codex" else "codex"
+        fallback = query_claude if primary == "codex" else query_codex
+        judge_verdict = ask(judge_prompt, mode="general", timeout=40)
+        judged_by = primary
+        if not judge_verdict or "[error" in judge_verdict.lower() or "limit" in judge_verdict.lower():
+            judge_verdict = fallback(judge_prompt, mode="general", timeout=40)
+            judged_by = fallback_name
+            print(
+                f"[Triad] Judge failover: {primary} could not answer; {judged_by} judged this instance.",
+                file=sys.stderr,
+            )
 
         raw_verdict = (judge_verdict or "").strip()
         if not raw_verdict or "[error" in raw_verdict.lower() or "timeout" in raw_verdict.lower():
@@ -625,9 +631,9 @@ def verify_semantic_resolution(
         is_unresolved = bool(re.search(r"\bVERDICT:\s*UNRESOLVED\b", first_line, re.IGNORECASE))
 
         if is_resolved and not is_unresolved:
-            return True, f"Verified: {rationale}"
+            return True, f"Verified by {judged_by}: {rationale}"
         else:
-            return False, f"Unresolved: {rationale}"
+            return False, f"Unresolved by {judged_by}: {rationale}"
     except Exception as e:
         return False, f"Judge exception ({e})"
 
@@ -639,8 +645,9 @@ def evaluate_in_worktree(
     repo_root: Path,
     engine: str = "auto",
     *,
-    judge_engine: str = "asymmetric",
-    existing_worktree: Optional[Path] = None
+    judge_engine: str = "claude",
+    existing_worktree: Optional[Path] = None,
+    use_docker: bool = False,
 ) -> Dict[str, Any]:
     """
     Evaluates instance patch inside an isolated git worktree via triad.worktree.isolated_worktree
@@ -822,8 +829,25 @@ def evaluate_in_worktree(
                     patch_applied = True
                     exec_msg = f"Git apply succeeded in isolated worktree ({apply_method})"
 
+                    # Repo-native Docker tests when a local clone exists. Host pytest remains the fallback.
+                    if fail_to_pass and test_patch_applied and use_docker:
+                        from triad.bench.docker_harness import try_native_docker_tests
+                        docker_result = try_native_docker_tests(
+                            repo,
+                            base_commit,
+                            candidate_patch_text,
+                            test_patch,
+                            list(fail_to_pass),
+                            repos_dir=CACHE_DIR / "repos",
+                        )
+                        if docker_result.get("executed"):
+                            tests_executed = True
+                            tests_passed = bool(docker_result.get("passed"))
+                            resolution_method = str(docker_result.get("method") or "DOCKER_NATIVE")
+                            exec_msg = str(docker_result.get("message") or exec_msg)
+
                     # Attempt real test execution if tests are specified and test_patch applied cleanly
-                    if fail_to_pass and test_patch_applied:
+                    if fail_to_pass and test_patch_applied and not tests_executed:
                         # Dynamically discover test runner
                         uv_bin = shutil.which("uv") or shutil.which("uv.exe") or os.environ.get("UV_PATH")
 
@@ -995,9 +1019,10 @@ def run_swebench(
     instance_id: str = "",
     mode: str = "debug",
     *,
-    judge_engine: str = "asymmetric",
+    judge_engine: str = "claude",
     workers: int = 2,
-    verbose: bool = False
+    verbose: bool = False,
+    docker_mode: str = "off",
 ) -> Tuple[int, int, List[Dict[str, Any]]]:
     """
     Executes the SWE-bench runner across instances.
@@ -1024,9 +1049,22 @@ def run_swebench(
     if total <= 1:
         effective_workers = 1
 
+    judge_engine = _keep_claude_as_judge(engine, judge_engine)
+    from triad.bench.docker_harness import docker_is_running
+    docker_choice = (docker_mode or "off").strip().lower()
+    if docker_choice == "on":
+        use_docker = True
+    elif docker_choice == "off":
+        use_docker = False
+    else:
+        use_docker = docker_is_running()
+
     print("================================================================================")
     print("TRIAD SWE-BENCH VERIFIED RUNNER (Warm Worktree Pool & Controlled Concurrency)")
-    print(f"Engine: {engine} | Judge: {judge_engine} | Workers: {effective_workers} | Mode: {mode} | Instances: {total}")
+    print(
+        f"Engine: {engine} | Judge: {judge_engine} | Workers: {effective_workers} | "
+        f"Mode: {mode} | Docker native: {'on' if use_docker else 'off'} | Instances: {total}"
+    )
     print(f"Dataset: {instances_file.resolve()}")
     print("Zero-Incremental-Cost Policy: Active ($0 token billing)")
     print("Worktree Isolation: Enabled (WarmWorktreePool)")
@@ -1114,7 +1152,8 @@ def run_swebench(
                     repo_root=repo_root,
                     engine=engine,
                     judge_engine=judge_engine,
-                    existing_worktree=wt
+                    existing_worktree=wt,
+                    use_docker=use_docker,
                 )
 
             is_res = eval_result["resolved"]
@@ -1226,7 +1265,10 @@ def run_swebench(
 
     print("================================================================================")
     print("SWE-BENCH VERIFIED RESULT:")
-    print("  - Judge prompt baseline: 2026-10-05 (not comparable to earlier scores)")
+    if judge_engine in ("asymmetric", "codex"):
+        print("  - Judge:                  Codex first (explicit override)")
+    else:
+        print("  - Judge:                  Claude primary, Codex failover")
     if limit_hit:
         print(f"  - Sweep aborted early:    {attempted}/{total} instances attempted (session/rate limit hit)")
     print(f"  - Real Test-Verified:     {resolved_count}/{attempted} ({pct_res:.1f}%)")
@@ -1256,9 +1298,15 @@ def main():
     )
     parser.add_argument(
         "--judge-engine",
-        choices=["asymmetric", "codex", "claude", "auto"],
-        default="asymmetric",
-        help="Engine to use for judging (default: asymmetric - routes to Codex then Claude)"
+        choices=["claude", "auto", "codex", "asymmetric"],
+        default="claude",
+        help="Engine to use for judging (default: claude, then Codex if Claude cannot answer)"
+    )
+    parser.add_argument(
+        "--docker",
+        choices=["auto", "on", "off"],
+        default="off",
+        help="Repo-native tests in Docker when a local clone exists (default: off; auto tries when Docker is up)"
     )
     parser.add_argument(
         "--workers",
@@ -1306,7 +1354,8 @@ def main():
         mode=args.mode,
         judge_engine=args.judge_engine,
         workers=args.workers,
-        verbose=args.verbose
+        verbose=args.verbose,
+        docker_mode=args.docker,
     )
 
     if args.output:

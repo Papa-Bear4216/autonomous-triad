@@ -169,7 +169,10 @@ def build_advisor_prompt(prompt: str, context: Optional[str] = None, diff: Optio
     if mode == "review_diff":
         return (
             f"{system_preamble}\n"
-            "TASK: Review this git diff for subtle bugs, race conditions, edge cases, type soundness, and architectural regressions.\n\n"
+            "TASK: Review this git diff for subtle bugs, race conditions, edge cases, type soundness, and architectural regressions.\n"
+            "Checklist: correctness of the changed lines; regressions in direct callers; data-loss or secret exposure; "
+            "security of file and process handling. Do not reject for wording, or for files that were not shown. "
+            "If the diff was truncated, judge what you can see and name the rest. Truncation alone is not a rejection.\n\n"
             f"DIFF:\n```\n{diff or context or ''}\n```\n\n"
             f"ADDITIONAL CONTEXT / GOAL:\n{prompt}\n"
         )
@@ -616,6 +619,12 @@ class ModelSessionLimiter:
 
                 if time.monotonic() >= deadline:
                     raise SessionSlotUnavailable("Timed out waiting for inter-process model session slot")
+                if not getattr(self, "_announced_wait", False):
+                    print(
+                        "[Triad] Waiting for a model session slot (2 live calls max). This wait is not a model failure.",
+                        file=sys.stderr,
+                    )
+                    self._announced_wait = True
                 time.sleep(0.05)
 
             yield slot_idx

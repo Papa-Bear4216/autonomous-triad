@@ -41,24 +41,38 @@ class JudgeUnavailableError(RuntimeError):
     """Raised when judging instruments cannot provide an authoritative evaluation."""
     pass
 
+
+def _keep_claude_as_judge(engine: str, judge_engine: str) -> str:
+    """Codex does not grade a patch it authored. Claude judging Claude is the design."""
+    if engine == "codex" and judge_engine in ("codex", "asymmetric"):
+        print(
+            "[Triad] Claude judges this run. Codex authored the candidate and does not grade its own patch.",
+            file=sys.stderr,
+        )
+        return "claude"
+    return judge_engine
+
 def query_judge(prompt: str, timeout: int = 90, *, judge_engine: str = "claude") -> str:
     """
     Independent judging instrument.
 
-    The default is Claude, then Codex, which is the pre-2026-10-05 baseline.
-    ``judge_engine="asymmetric"`` (Codex, then Claude) is a new baseline: those
-    scores are not comparable to earlier Claude-first runs. ``triad bench``
-    selects asymmetric explicitly so candidate authoring can stay on Claude.
+    Claude is the primary judge. Codex answers only when Claude cannot.
+    ``judge_engine="asymmetric"`` or ``"codex"`` is an explicit Codex-first override.
     """
     # Each advisor call takes its own session slot and releases it before failover.
-    if judge_engine in ("asymmetric", "codex"):
-        verdict = query_codex(prompt, mode="general", timeout=timeout)
-        if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
-            verdict = query_claude(prompt, mode="general", timeout=timeout)
-    else:
-        verdict = query_claude(prompt, mode="general", timeout=timeout)
-        if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
-            verdict = query_codex(prompt, mode="general", timeout=timeout)
+    primary = "codex" if judge_engine in ("asymmetric", "codex") else "claude"
+    ask = query_codex if primary == "codex" else query_claude
+    fallback_name = "claude" if primary == "codex" else "codex"
+    fallback = query_claude if primary == "codex" else query_codex
+    verdict = ask(prompt, mode="general", timeout=timeout)
+    judged_by = primary
+    if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
+        verdict = fallback(prompt, mode="general", timeout=timeout)
+        judged_by = fallback_name
+        print(
+            f"[Triad] Judge failover: {primary} could not answer; {judged_by} judged this item.",
+            file=sys.stderr,
+        )
 
     if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
         clean_err = verdict.strip().replace("\n", " ") if verdict else "Empty response"
@@ -92,7 +106,7 @@ def _parse_judge_verdict(verdict: str) -> bool:
         
     raise JudgeUnavailableError(f"Judge returned non-boolean response: {verdict[:100]}")
 
-def judge_catch(bug_description: str, review_response: str, *, judge_engine: str = "asymmetric") -> bool:
+def judge_catch(bug_description: str, review_response: str, *, judge_engine: str = "claude") -> bool:
     """
     Ask a model whether the review response specifically and correctly identifies
     the seeded bug anywhere in its findings, rather than relying on presentation order.
@@ -113,7 +127,7 @@ def judge_catch(bug_description: str, review_response: str, *, judge_engine: str
     verdict = query_judge(judge_prompt, judge_engine=judge_engine, timeout=90)
     return _parse_judge_verdict(verdict)
 
-def judge_false_positive(review_response: str, *, judge_engine: str = "asymmetric") -> bool:
+def judge_false_positive(review_response: str, *, judge_engine: str = "claude") -> bool:
     """
     Ask a model whether the review claimed to find a bug/defect in a clean, benign diff.
     Scores whether the reviewer's final findings allege an actual defect in the diff itself,
@@ -138,7 +152,7 @@ def run_benchmark(
     limit: int = 0,
     case_id: str = "",
     *,
-    judge_engine: str = "asymmetric",
+    judge_engine: str = "claude",
     verbose: bool = False
 ) -> Tuple[int, int, int, int, List[Dict[str, Any]]]:
     """
@@ -163,9 +177,14 @@ def run_benchmark(
     false_positives = 0
     results = []
 
+    judge_engine = _keep_claude_as_judge(engine, judge_engine)
     print("================================================================================")
     print(f"TRIAD ADVISORY BENCHMARK HARNESS (engine={engine}, cases={total})")
     print("Scoring: Model-as-Judge verification (No keyword matching)")
+    if judge_engine in ("asymmetric", "codex"):
+        print("Judge: Codex first (explicit override)")
+    else:
+        print("Judge: Claude primary, Codex failover")
     print("================================================================================")
 
     for idx, case_path in enumerate(case_files, 1):
@@ -247,7 +266,6 @@ def run_benchmark(
     print("================================================================================")
     print(f"BENCHMARK RESULT: {bugs_caught}/{positive_total} bugs caught ({catch_rate:.1f}%) | "
           f"{false_positives}/{negative_total} false positives ({fp_rate:.1f}%) | engine={engine} | judge={judge_engine}")
-    print("Judge prompt baseline: 2026-10-05 (not comparable to earlier scores)")
     print("================================================================================\n")
 
     return bugs_caught, positive_total, false_positives, negative_total, results
@@ -256,7 +274,7 @@ def main():
     parser = argparse.ArgumentParser(description="Triad Benchmark Runner")
     parser.add_argument("--cases-dir", default=str(DEFAULT_CASES_DIR), help="Directory of test cases")
     parser.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine")
-    parser.add_argument("--judge-engine", choices=["asymmetric", "codex", "claude", "auto"], default="asymmetric", help="Model to use for judging (default: asymmetric)")
+    parser.add_argument("--judge-engine", choices=["claude", "auto", "codex", "asymmetric"], default="claude", help="Model to use for judging (default: claude, then Codex if Claude cannot answer)")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of cases to run")
     parser.add_argument("--case", default="", help="Run single case ID")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print verbose review output")

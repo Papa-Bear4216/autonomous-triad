@@ -1081,6 +1081,31 @@ def isolated_worktree(
             remove_worktree(wt_path, force=True, repo_path=root, env=env)
 
 
+def require_git_toplevel(wt: Path, env: Optional[Dict[str, str]] = None) -> None:
+    """Refuse reset/clean unless this directory is its own git root.
+
+    If ``.git`` is missing, ``git -C`` walks up and can clean a parent repo.
+    """
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{wt} git toplevel probe timed out; refusing reset/clean") from exc
+    if probe.returncode != 0 or not probe.stdout.strip():
+        raise RuntimeError(f"{wt} is not a git worktree; refusing reset/clean")
+    top = Path(probe.stdout.strip()).resolve()
+    here = Path(wt).resolve()
+    if os.path.normcase(str(top)) != os.path.normcase(str(here)):
+        raise RuntimeError(f"{wt} is not its own git toplevel ({top}); refusing reset/clean")
+
+
 class WarmWorktreePool:
     """
     Managed pool of recycled git worktrees for high-throughput batch evaluation.
@@ -1239,6 +1264,7 @@ class WarmWorktreePool:
         # so the pool quarantines this tree instead of cleaning through a link.
         deprovision_worktree_dependencies(wt)
         run_env = clean_git_env(base_env=self.env) if self.env is not None else clean_git_env()
+        require_git_toplevel(wt, env=run_env)
         r0 = subprocess.run(["git", "-C", str(wt), "reset", "--hard", "-q"], capture_output=True, env=run_env, timeout=20)
         if r0.returncode != 0:
             raise RuntimeError(f"git reset --hard failed on {wt}: {r0.stderr.decode('utf-8', errors='replace').strip()}")

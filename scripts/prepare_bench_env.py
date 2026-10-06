@@ -16,6 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from triad.bench.docker_harness import destination_bare_repo
+
 INSTANCES = REPO_ROOT / "triad" / "bench" / "swebench_instances.json"
 CACHE = REPO_ROOT / "triad" / "bench" / ".cache"
 REPOS = CACHE / "repos"
@@ -55,7 +60,7 @@ def sha256_file(path: Path) -> str:
 
 
 def ensure_repo(name: str, url: str) -> Path:
-    dest = REPOS / (name.split("/")[-1] + ".git")
+    dest = destination_bare_repo(REPOS, name)
     if not (dest / "HEAD").exists():
         dest.parent.mkdir(parents=True, exist_ok=True)
         print(f"cloning {name} -> {dest}")
@@ -111,8 +116,10 @@ def main() -> None:
         by_repo.setdefault(item["repo"], []).append(item["base_commit"])
 
     commit_status = []
+    repo_paths: dict[str, str] = {}
     for repo_name, commits in by_repo.items():
         repo_dir = ensure_repo(repo_name, REMOTE[repo_name])
+        repo_paths[repo_name] = str(repo_dir)
         for commit in commits:
             state = ensure_commit(repo_dir, commit)
             commit_status.append({"repo": repo_name, "base_commit": commit, "state": state})
@@ -128,7 +135,7 @@ def main() -> None:
         "dataset": str(INSTANCES),
         "dataset_sha256": dataset_hash,
         "instance_count": len(instances),
-        "repos": {name: str(REPOS / (name.split("/")[-1] + ".git")) for name in by_repo},
+        "repos": repo_paths,
         "commits_verified": len(commit_status),
         "python311": py311,
         "git": run(["git", "--version"]).stdout.strip(),

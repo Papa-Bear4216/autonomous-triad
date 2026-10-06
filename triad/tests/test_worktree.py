@@ -701,6 +701,25 @@ class TestGitWorktreeIsolation(unittest.TestCase):
             import shutil
             shutil.rmtree(slot_dir, ignore_errors=True)
 
+    def test_require_git_toplevel_refuses_parent_walk(self):
+        """A directory that is not its own git root must not be reset or cleaned."""
+        from triad.worktree import require_git_toplevel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = Path(tmp) / "not-a-repo"
+            nested.mkdir()
+            with self.assertRaises(RuntimeError):
+                require_git_toplevel(nested)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+            require_git_toplevel(root)
+            child = root / "child"
+            child.mkdir()
+            with self.assertRaises(RuntimeError):
+                require_git_toplevel(child)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
