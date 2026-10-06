@@ -5475,7 +5475,8 @@ exit 0
         from triad.advisor_manager import query_configured_advisor
 
         prose_response = "VERDICT: REJECTED\n\nYou must enforce a rate limit on the /api/login endpoint to prevent brute force."
-        with patch("triad.advisor_manager.is_circuit_open", return_value=False):
+        with patch("triad.advisor_manager.is_circuit_open", return_value=False), \
+             patch("triad.advisor_manager.advisor_is_ready", return_value=(True, "")):
             with patch("triad.advisor_manager._execute_single_advisor", return_value=prose_response) as mock_exec:
                 res = query_configured_advisor("auto", "Review PR", mode="review_diff")
                 self.assertIn("VERDICT: REJECTED", res)
