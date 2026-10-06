@@ -627,7 +627,7 @@ def verify_semantic_resolution(
                 )
 
         raw_verdict = (judge_verdict or "").strip()
-        if not raw_verdict or "[error" in raw_verdict.lower() or "timeout" in raw_verdict.lower():
+        if not raw_verdict or _judge_response_failed(raw_verdict) or "timeout" in raw_verdict.lower():
             return False, f"Judge error: {raw_verdict or 'No response'}"
 
         lines = raw_verdict.splitlines()

@@ -155,6 +155,24 @@ class TestClaudeJudgesCodex(unittest.TestCase):
         self.assertTrue(_codex_may_grade("claude", "codex"))
         self.assertFalse(_judge_response_failed("The limit field is unchanged. YES"))
         self.assertTrue(_judge_response_failed("[Error: Claude session limit hit]"))
+        self.assertTrue(_judge_response_failed("Claude session limit reached"))
+        self.assertTrue(_judge_response_failed(""))
+
+    def test_session_limit_prose_is_a_judge_error(self):
+        from unittest.mock import patch
+        from triad.bench.swebench_runner import verify_semantic_resolution
+
+        with patch("triad.bench.swebench_runner.query_claude", return_value="Claude session limit reached"):
+            ok, msg = verify_semantic_resolution(
+                {"patch": "", "FAIL_TO_PASS": [], "problem_statement": "x"},
+                "",
+                "",
+                judge_engine="claude",
+                author_engine="codex",
+            )
+        self.assertFalse(ok)
+        self.assertIn("Judge error", msg)
+        self.assertNotIn("Unresolved", msg)
 
 
 if __name__ == "__main__":
