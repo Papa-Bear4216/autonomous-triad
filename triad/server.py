@@ -78,16 +78,54 @@ def _get_repo_lock(repo_dir: Path) -> threading.Lock:
         return _REPO_LOCKS[key]
 
 
-def _resolve_repo_path(repo_arg: Optional[str]) -> Optional[Path]:
-    target = Path(repo_arg).resolve() if repo_arg else Path.cwd().resolve()
-    if not target.is_dir():
-        return None
+class RepoNotAllowed(Exception):
+    """Raised when a requested repo path falls outside the allowed repo roots."""
+
+    def __init__(self, repo_path: str):
+        super().__init__(repo_path)
+        self.repo_path = repo_path
+
+
+def _git_toplevel(directory: str) -> Optional[Path]:
     try:
-        ret = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=str(target), env=clean_git_env(), capture_output=True, text=True, timeout=5)
+        ret = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=directory, env=clean_git_env(), capture_output=True, text=True, timeout=5)
         if ret.returncode == 0 and ret.stdout.strip():
             return Path(ret.stdout.strip()).resolve()
     except Exception:
         pass
+    return None
+
+
+def _allowed_repo_roots() -> List[str]:
+    """Allowed repo roots as real, case-normalized strings (TRIAD_ALLOWED_REPOS, else this repo only)."""
+    raw = os.environ.get("TRIAD_ALLOWED_REPOS", "").strip()
+    if raw:
+        roots = [p for p in raw.split(os.pathsep) if p.strip()]
+    else:
+        # Default-deny: only the server's own repository root when TRIAD_ALLOWED_REPOS is unset
+        own = _git_toplevel(str(Path(__file__).resolve().parent.parent))
+        roots = [str(own)] if own else []
+    return [os.path.normcase(os.path.realpath(r)) for r in roots]
+
+
+def _within_roots(path: str, roots: List[str]) -> bool:
+    norm = os.path.normcase(path)
+    return any(norm == r or norm.startswith(r + os.sep) for r in roots)
+
+
+def _resolve_repo_path(repo_arg: Optional[str]) -> Optional[Path]:
+    """Resolve repo_arg to its git toplevel. Raises RepoNotAllowed outside the allowed roots; None if not a repo."""
+    roots = _allowed_repo_roots()
+    target = os.path.realpath(repo_arg) if repo_arg else os.path.realpath(os.getcwd())
+    # Containment first, before touching the filesystem.
+    if not _within_roots(target, roots):
+        raise RepoNotAllowed(target)
+    if not os.path.isdir(target):
+        return None
+    top = _git_toplevel(target)
+    if top is not None and not _within_roots(str(top), roots):
+        raise RepoNotAllowed(str(top))
+    return top
 def _public_advisors() -> List[Dict[str, Any]]:
     """Return public, sanitized advisor list stripped of sensitive env vars and local paths."""
     return [
@@ -483,26 +521,18 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
         repo_arg = body.get("repo_path", "")
         reason = body.get("reason", "Approved via Mobile 1-Tap Bridge")
 
-        repo_dir = _resolve_repo_path(repo_arg)
+        try:
+            repo_dir = _resolve_repo_path(repo_arg)
+        except RepoNotAllowed as denied:
+            self._send_json(403, {
+                "error": "repo not in TRIAD_ALLOWED_REPOS",
+                "repo_path": denied.repo_path
+            })
+            return
         if not repo_dir:
             self._send_json(400, {
                 "error": "Target repository path is not a valid git repository",
                 "repo_path": repo_arg or str(Path.cwd())
-            })
-            return
-
-        allowed_repos_raw = os.environ.get("TRIAD_ALLOWED_REPOS", "").strip()
-        if allowed_repos_raw:
-            allowed_repos = [Path(p).resolve() for p in allowed_repos_raw.split(os.pathsep) if p.strip()]
-        else:
-            # Default-deny: only allow the server's own repository root when TRIAD_ALLOWED_REPOS is unset
-            server_repo = _resolve_repo_path(str(Path(__file__).resolve().parent.parent))
-            allowed_repos = [server_repo] if server_repo else []
-
-        if not any(repo_dir == r or r in repo_dir.parents for r in allowed_repos):
-            self._send_json(403, {
-                "error": "repo not in TRIAD_ALLOWED_REPOS",
-                "repo_path": str(repo_dir)
             })
             return
 

@@ -311,5 +311,29 @@ class TestTriadServer(unittest.TestCase):
             self.assertIn("name", adv)
 
 
+class TestResolveRepoPathContainment(unittest.TestCase):
+    def test_allowlist_enforced_inside_resolver(self):
+        import os
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from triad.server import RepoNotAllowed, _resolve_repo_path
+
+        with tempfile.TemporaryDirectory() as td:
+            allowed = Path(td) / "repo"
+            sibling = Path(td) / "repo_evil"
+            for d in (allowed, sibling):
+                d.mkdir()
+                subprocess.run(["git", "init", "-q", str(d)], check=True)
+            with patch.dict(os.environ, {"TRIAD_ALLOWED_REPOS": str(allowed)}):
+                self.assertEqual(_resolve_repo_path(str(allowed)).resolve(), allowed.resolve())
+                with self.assertRaises(RepoNotAllowed):
+                    _resolve_repo_path(str(sibling))  # shares a name prefix, must not pass
+                with self.assertRaises(RepoNotAllowed):
+                    _resolve_repo_path(str(allowed / ".." / "repo_evil"))
+                self.assertIsNone(_resolve_repo_path(str(allowed / "missing_dir")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
