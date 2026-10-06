@@ -22,6 +22,7 @@ from triad.worktree import (
     list_worktrees,
     get_repo_root,
     prune_worktrees,
+    WarmWorktreePool,
 )
 
 REPO_ROOT = get_repo_root(Path(__file__).resolve())
@@ -222,8 +223,11 @@ class TestGitWorktreeIsolation(unittest.TestCase):
 
             # Parent node_modules links to workspace packages
             (repo_root / "node_modules").mkdir()
-            os.symlink(str(repo_root / "packages" / "foo"), str(repo_root / "node_modules" / "foo"), target_is_directory=True)
-            os.symlink(str(repo_root / "packages" / "bar"), str(repo_root / "node_modules" / "bar"), target_is_directory=True)
+            try:
+                os.symlink(str(repo_root / "packages" / "foo"), str(repo_root / "node_modules" / "foo"), target_is_directory=True)
+                os.symlink(str(repo_root / "packages" / "bar"), str(repo_root / "node_modules" / "bar"), target_is_directory=True)
+            except OSError:
+                self.skipTest("Symlinks not permitted in this environment")
 
             # Candidate worktree ONLY has packages/bar (packages/foo is deleted in candidate!)
             (wt_root / "packages" / "bar").mkdir(parents=True)
@@ -400,6 +404,304 @@ class TestGitWorktreeIsolation(unittest.TestCase):
             deprovision_worktree_dependencies(wt)
             subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)], check=True, capture_output=True)
 
+    def test_warm_worktree_pool_recycling_and_concurrency_bound(self):
+        """Verify WarmWorktreePool bounds concurrency <= 2, recycles dirty state, and leaves 0 leaks."""
+        # Non-negotiable #2: Bounded concurrency <= 2
+        pool = WarmWorktreePool(REPO_ROOT, max_workers=5, prefix="triad-test-warm")
+        self.assertEqual(pool.max_workers, 2, "WarmWorktreePool failed to cap max_workers at 2")
+
+        with pool:
+            # First acquisition: dirty the worktree with an untracked file and committed file
+            with pool.acquire() as wt1:
+                self.assertTrue(wt1.exists())
+                dirty_file = wt1 / "dirty_test_file.txt"
+                dirty_file.write_text("temporary dirty data", encoding="utf-8")
+                subprocess.run(["git", "-C", str(wt1), "add", str(dirty_file)], capture_output=True)
+                subprocess.run(
+                    ["git", "-C", str(wt1), "-c", "user.name=Test", "-c", "user.email=test@test.local", "commit", "-m", "Temp commit"],
+                    capture_output=True
+                )
+                untracked_file = wt1 / "untracked.log"
+                untracked_file.write_text("untracked", encoding="utf-8")
+
+            # Second acquisition of the recycled worktree: must be 100% clean
+            with pool.acquire() as wt2:
+                self.assertFalse((wt2 / "dirty_test_file.txt").exists(), "Recycled worktree retained committed file")
+                self.assertFalse((wt2 / "untracked.log").exists(), "Recycled worktree retained untracked file")
+
+        # After pool context exits, worktrees must be pruned
+        prune_worktrees(REPO_ROOT)
+        current_wts = list_worktrees(REPO_ROOT)
+        self.assertEqual(len(current_wts), self.initial_count, "WarmWorktreePool leaked worktrees after exit")
+
+    def test_warm_worktree_pool_unique_paths_across_pools(self):
+        """Verify multiple pools in the same process have distinct pool_ids and worktree paths."""
+        pool1 = WarmWorktreePool(REPO_ROOT, max_workers=1, prefix="triad-test-p1")
+        pool2 = WarmWorktreePool(REPO_ROOT, max_workers=1, prefix="triad-test-p2")
+        self.assertNotEqual(pool1._pool_id, pool2._pool_id)
+
+        try:
+            with pool1.acquire() as wt1:
+                with pool2.acquire() as wt2:
+                    self.assertNotEqual(wt1, wt2)
+                    self.assertTrue(wt1.exists())
+                    self.assertTrue(wt2.exists())
+        finally:
+            pool1.close()
+            pool2.close()
+            prune_worktrees(REPO_ROOT)
+
+    def test_warm_worktree_pool_quarantine_corrupted_worktree(self):
+        """Verify corrupted worktrees that fail git reset are quarantined and replaced."""
+        pool = WarmWorktreePool(REPO_ROOT, max_workers=1, prefix="triad-test-quarantine")
+        with pool:
+            with pool.acquire() as wt:
+                corrupted_wt = wt
+                # Break the git repository metadata inside worktree to force reset failure
+                git_ref = wt / ".git"
+                if git_ref.is_file():
+                    if os.name == "nt":
+                        subprocess.run(["attrib", "-h", "-r", str(git_ref)], capture_output=True)
+                    git_ref.write_text("gitdir: /nonexistent/path/that/does/not/exist", encoding="utf-8")
+
+            # Acquiring again must quarantine the broken worktree and return a healthy replacement
+            with pool.acquire() as replacement_wt:
+                self.assertTrue(replacement_wt.exists())
+                self.assertNotEqual(str(corrupted_wt), str(replacement_wt))
+                # Healthy replacement can run git status
+                res = subprocess.run(["git", "-C", str(replacement_wt), "status"], capture_output=True)
+                self.assertEqual(res.returncode, 0)
+
+    def test_warm_worktree_pool_lease_drain_on_close(self):
+        """Verify close() unblocks waiters and handles active leases cleanly."""
+        import threading
+        import time
+
+        pool = WarmWorktreePool(REPO_ROOT, max_workers=1, prefix="triad-test-lease")
+        pool.prewarm()
+
+        acquired_event = threading.Event()
+        finish_event = threading.Event()
+        worker_error = []
+
+        def worker():
+            try:
+                with pool.acquire():
+                    acquired_event.set()
+                    finish_event.wait(timeout=5)
+            except Exception as e:
+                worker_error.append(e)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        acquired_event.wait(timeout=5)
+
+        # Worker holds the single worktree in pool; now call close() in another thread
+        close_done = threading.Event()
+        def closer():
+            pool.close(timeout=5)
+            close_done.set()
+
+        t_close = threading.Thread(target=closer)
+        t_close.start()
+
+        # Release worker lease
+        time.sleep(0.1)
+        finish_event.set()
+
+        t.join(timeout=5)
+        t_close.join(timeout=5)
+        self.assertTrue(close_done.is_set())
+        self.assertEqual(worker_error, [])
+        self.assertTrue(pool._closed)
+
+    def test_warm_worktree_pool_deferred_lease_teardown(self):
+        """Verify worktrees still leased during close timeout are preserved until lease exit."""
+        import threading
+
+        pool = WarmWorktreePool(REPO_ROOT, max_workers=1, prefix="triad-test-defer")
+        pool.prewarm()
+
+        acquired_event = threading.Event()
+        finish_event = threading.Event()
+        saved_wt = []
+        worker_error = []
+
+        def worker():
+            try:
+                with pool.acquire() as wt:
+                    saved_wt.append(wt)
+                    acquired_event.set()
+                    finish_event.wait(timeout=5)
+                    if not wt.exists():
+                        worker_error.append("Worktree deleted prematurely during active lease")
+            except Exception as exc:
+                worker_error.append(repr(exc))
+                acquired_event.set()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        acquired_event.wait(timeout=5)
+
+        # Close pool with short timeout while worker is actively inside lease
+        pool.close(timeout=0.1)
+        self.assertTrue(pool._closed)
+        wt = saved_wt[0]
+        # Active worktree was NOT deleted by close() because it was leased!
+        self.assertTrue(wt.exists())
+
+        # Now finish the lease
+        finish_event.set()
+        t.join(timeout=5)
+
+        # After lease releases, the deferred teardown unlinks the worktree
+        self.assertEqual(worker_error, [])
+        self.assertFalse(wt.exists(), "Worktree was not unlinked on deferred lease exit!")
+
+    def test_extract_base_files_needed_with_spaces_quotes_and_renames(self):
+        """Verify extract_base_files_needed correctly handles spaces, C-quotes, deletions, and renames."""
+        from triad.bench.swebench_runner import extract_base_files_needed, extract_files_from_diff
+
+        # 1. Diff with spaces and timestamps
+        diff_spaces = (
+            "--- a/path with spaces/source file.py\t2026-10-04 02:00:00\n"
+            "+++ b/path with spaces/source file.py\t2026-10-04 02:05:00\n"
+            "@@ -1,3 +1,3 @@\n"
+            "-old line\n"
+            "+new line\n"
+        )
+        base = extract_base_files_needed(diff_spaces)
+        self.assertEqual(base, ["path with spaces/source file.py"])
+        all_files = extract_files_from_diff(diff_spaces)
+        self.assertEqual(all_files, ["path with spaces/source file.py"])
+
+        # 2. Diff with Git C-style quotes
+        diff_quotes = (
+            '--- "a/folder with \\"quotes\\"/module.py"\n'
+            '+++ "b/folder with \\"quotes\\"/module.py"\n'
+            "@@ -10,2 +10,2 @@\n"
+            "-print(1)\n"
+            "+print(2)\n"
+        )
+        base_quotes = extract_base_files_needed(diff_quotes)
+        self.assertEqual(base_quotes, ['folder with "quotes"/module.py'])
+
+        # 3. Rename with spaces
+        diff_rename = (
+            "diff --git a/old name with spaces.py b/new name with spaces.py\n"
+            "similarity index 95%\n"
+            "rename from old name with spaces.py\n"
+            "rename to new name with spaces.py\n"
+            "--- a/old name with spaces.py\n"
+            "+++ b/new name with spaces.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-a\n"
+            "+b\n"
+        )
+        base_rename = extract_base_files_needed(diff_rename)
+        self.assertEqual(base_rename, ["old name with spaces.py"])
+        all_rename = extract_files_from_diff(diff_rename)
+        self.assertEqual(all_rename, ["new name with spaces.py", "old name with spaces.py"])
+
+        # 4. Newly created file (/dev/null -> destination)
+        diff_new = (
+            "--- /dev/null\n"
+            "+++ b/created file.py\n"
+            "@@ -0,0 +1,5 @@\n"
+            "+def hello(): pass\n"
+        )
+        base_new = extract_base_files_needed(diff_new)
+        self.assertEqual(base_new, [], "/dev/null should not be in needed base files")
+
+        # 5. Deletion (source removed, destination /dev/null)
+        diff_del = (
+            "--- a/removed file.py\n"
+            "+++ /dev/null\n"
+            "@@ -1,1 +0,0 @@\n"
+            "-gone\n"
+        )
+        self.assertEqual(extract_base_files_needed(diff_del), ["removed file.py"])
+        self.assertEqual(extract_files_from_diff(diff_del), ["removed file.py"])
+
+        # 6. Git C-quoted non-ASCII (octal UTF-8 bytes, not unicode code points)
+        diff_cafe = (
+            "--- \"a/caf\\303\\251.py\"\n"
+            "+++ \"b/caf\\303\\251.py\"\n"
+            "@@ -1 +1 @@\n"
+            "-a\n"
+            "+b\n"
+        )
+        self.assertEqual(extract_base_files_needed(diff_cafe), ["café.py"])
+
+        # 7. Hunk body lines that look like ---/+++ headers are not file paths
+        diff_hunk = (
+            "--- a/real.py\n"
+            "+++ b/real.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "--- not a header\n"
+            "+++ also not a header\n"
+        )
+        self.assertEqual(extract_base_files_needed(diff_hunk), ["real.py"])
+        self.assertEqual(extract_files_from_diff(diff_hunk), ["real.py"])
+
+        # 8. Over-long hunk counts must not hide the next file header
+        diff_overcount = (
+            "--- a/first.py\n"
+            "+++ b/first.py\n"
+            "@@ -1,5 +1,5 @@\n"
+            "-old\n"
+            "--- a/second.py\n"
+            "+++ b/second.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-x\n"
+            "+y\n"
+        )
+        self.assertEqual(extract_base_files_needed(diff_overcount), ["first.py", "second.py"])
+        self.assertEqual(extract_files_from_diff(diff_overcount), ["first.py", "second.py"])
+
+    def test_model_session_limiter_bounds_concurrency(self):
+        """Verify ModelSessionLimiter strictly bounds concurrent executions to max_concurrent."""
+        import tempfile
+        import threading
+        import time
+        from triad.advisor_manager import ModelSessionLimiter
+
+        slot_dir = tempfile.mkdtemp(prefix="triad-session-slots-")
+        try:
+            limiter = ModelSessionLimiter(max_concurrent=2, timeout=5.0, slot_dir=slot_dir)
+            active_count = 0
+            peak_count = 0
+            lock = threading.Lock()
+            barrier = threading.Barrier(2)
+
+            def worker():
+                nonlocal active_count, peak_count
+                with limiter.acquire(timeout=5.0):
+                    with lock:
+                        active_count += 1
+                        if active_count > peak_count:
+                            peak_count = active_count
+                    try:
+                        barrier.wait(timeout=2.0)
+                    except threading.BrokenBarrierError:
+                        pass
+                    time.sleep(0.05)
+                    with lock:
+                        active_count -= 1
+
+            threads = [threading.Thread(target=worker) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10.0)
+                self.assertFalse(t.is_alive(), "session worker did not finish")
+
+            self.assertEqual(peak_count, 2, f"Expected the two allowed sessions to overlap, peak was {peak_count}")
+        finally:
+            import shutil
+            shutil.rmtree(slot_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

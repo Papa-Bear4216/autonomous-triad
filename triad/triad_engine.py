@@ -4031,6 +4031,8 @@ def cmd_bench(args):
             limit=args.limit or 5,
             instance_id=args.case,
             mode="debug",
+            judge_engine=getattr(args, "judge_engine", "asymmetric"),
+            workers=getattr(args, "workers", 2),
             verbose=args.verbose
         )
         return
@@ -4046,6 +4048,7 @@ def cmd_bench(args):
         engine=args.engine,
         limit=args.limit,
         case_id=args.case,
+        judge_engine=getattr(args, "judge_engine", "asymmetric"),
         verbose=args.verbose
     )
 
@@ -5664,6 +5667,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--suite", choices=["cases", "swebench"], default="cases", help="Benchmark suite ('cases' or 'swebench')")
     p_bench.add_argument("--cases-dir", default="", help="Path to cases directory (defaults to triad/bench/cases)")
     p_bench.add_argument("--engine", default="auto", help="Advisor engine override (e.g. auto, claude, codex, bare_single, mock)")
+    p_bench.add_argument("--judge-engine", choices=["asymmetric", "codex", "claude", "auto"], default="asymmetric", help="Judge engine (default: asymmetric - Codex with Claude failover)")
+    p_bench.add_argument("--workers", type=int, choices=[1, 2], default=2, help="Number of concurrent evaluation workers (1 or 2, default: 2)")
     p_bench.add_argument("--limit", type=int, default=0, help="Limit number of cases to test")
     p_bench.add_argument("--case", default="", help="Run single case ID (e.g. case_001 or astropy__astropy-12907)")
     p_bench.add_argument("--verbose", "-v", action="store_true", help="Print verbose review output")

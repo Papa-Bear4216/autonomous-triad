@@ -15,8 +15,10 @@ import json
 import time
 import tempfile
 import shutil
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Union, Tuple
+from typing import Dict, List, Optional, Any, Union, Tuple, Generator
 
 try:
     from triad.procutil import (
@@ -516,6 +518,135 @@ def _execute_single_advisor_raw(
                 pass
 
 
+class SessionSlotUnavailable(TimeoutError):
+    """A live model session slot could not be acquired. This is not an advisor failure."""
+
+
+class ModelSessionLimiter:
+    """
+    Global concurrency gate for LLM advisory model sessions (Non-negotiable #2: never exceed 2 concurrent sessions).
+    Enforces concurrency bounds both intra-process (BoundedSemaphore) and inter-process (slot file locks).
+
+    Take slots with ``acquire()``. One advisor call takes one slot. Do not wrap a call that
+    already acquires internally; that consumes both slots and stalls the second worker.
+    """
+    def __init__(self, max_concurrent: int = 2, timeout: float = 300.0, slot_dir: Optional[Union[str, Path]] = None):
+        self.max_concurrent = max(1, min(int(max_concurrent), 2))
+        self.timeout = timeout
+        self._thread_semaphore = threading.BoundedSemaphore(self.max_concurrent)
+        self._slot_dir = Path(slot_dir) if slot_dir is not None else Path(tempfile.gettempdir()) / "triad_session_slots"
+        self._ctx_local = threading.local()
+
+    def _lock_slot(self, fd: int) -> None:
+        if os.name == "nt":
+            import msvcrt
+            # msvcrt.locking fails on an empty file because the locked byte is past EOF.
+            if os.lseek(fd, 0, os.SEEK_END) < 1:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_slot(self, fd: int) -> None:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    @contextmanager
+    def acquire(self, timeout: Optional[float] = None) -> Generator[int, None, None]:
+        wait_timeout = timeout if timeout is not None else self.timeout
+        start_time = time.monotonic()
+
+        # 1. Intra-process acquisition
+        acquired_sem = self._thread_semaphore.acquire(timeout=wait_timeout)
+        if not acquired_sem:
+            raise SessionSlotUnavailable("Timed out waiting for intra-process model session slot")
+
+        slot_fd = None
+        slot_idx = -1
+        try:
+            try:
+                self._slot_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise SessionSlotUnavailable(
+                    f"Could not create session slot dir {self._slot_dir}: {exc}"
+                ) from exc
+            deadline = start_time + wait_timeout
+
+            # 2. Inter-process slot acquisition
+            while slot_fd is None:
+                open_failures = 0
+                lock_failures = 0
+                open_error: Optional[BaseException] = None
+                for idx in range(self.max_concurrent):
+                    slot_path = self._slot_dir / f"slot_{idx}.lock"
+                    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                    try:
+                        fd = os.open(str(slot_path), flags, 0o600)
+                    except OSError as exc:
+                        open_failures += 1
+                        open_error = exc
+                        continue
+
+                    try:
+                        self._lock_slot(fd)
+                        slot_fd = fd
+                        slot_idx = idx
+                        break
+                    except (OSError, IOError):
+                        lock_failures += 1
+                        try:
+                            os.close(fd)
+                        except Exception:
+                            pass
+
+                if slot_fd is not None:
+                    break
+
+                if open_failures == self.max_concurrent and lock_failures == 0:
+                    raise SessionSlotUnavailable(
+                        f"Could not open model session slots in {self._slot_dir}: {open_error}"
+                    )
+
+                if time.monotonic() >= deadline:
+                    raise SessionSlotUnavailable("Timed out waiting for inter-process model session slot")
+                time.sleep(0.05)
+
+            yield slot_idx
+
+        finally:
+            if slot_fd is not None:
+                try:
+                    self._unlock_slot(slot_fd)
+                except Exception:
+                    pass
+                try:
+                    os.close(slot_fd)
+                except Exception:
+                    pass
+            self._thread_semaphore.release()
+
+    def __enter__(self):
+        ctx = self.acquire()
+        self._ctx_local.ctx = ctx
+        return ctx.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        ctx = getattr(self._ctx_local, "ctx", None)
+        if ctx is not None:
+            self._ctx_local.ctx = None
+            return ctx.__exit__(exc_type, exc_val, exc_tb)
+
+
+GLOBAL_MODEL_SESSION_LIMITER = ModelSessionLimiter(max_concurrent=2)
+
+
 def _execute_single_advisor(
     advisor: Dict[str, Any],
     prompt: str,
@@ -525,10 +656,33 @@ def _execute_single_advisor(
     timeout: int = 120,
     track_circuit: bool = True,
 ) -> str:
-    start_time = time.time()
-    result = _execute_single_advisor_raw(
-        advisor, prompt, context=context, diff=diff, mode=mode, timeout=timeout
+    # Mock/test advisors are hermetic and must not consume the two live session slots.
+    is_test_advisor = (
+        str(advisor.get("role", "")).lower() == "test"
+        or str(advisor.get("name", "")).lower() == "mock"
     )
+    if is_test_advisor:
+        start_time = time.time()
+        result = _execute_single_advisor_raw(
+            advisor, prompt, context=context, diff=diff, mode=mode, timeout=timeout
+        )
+    else:
+        try:
+            # Two workers can each run a pair of advisors, so a request may wait
+            # through two full holds before a slot frees.
+            slot_budget = (2 * float(timeout)) + 30.0
+        except (TypeError, ValueError):
+            slot_budget = 270.0
+        try:
+            with GLOBAL_MODEL_SESSION_LIMITER.acquire(timeout=slot_budget):
+                # Start the clock after the slot is held so queue time is not an advisor failure.
+                start_time = time.time()
+                result = _execute_single_advisor_raw(
+                    advisor, prompt, context=context, diff=diff, mode=mode, timeout=timeout
+                )
+        except SessionSlotUnavailable as exc:
+            # Do not record a circuit outcome. Slot contention is not an advisor failure.
+            return f"[Error: session slot unavailable: {exc}]"
     try:
         _record_circuit_outcome(advisor, result, track_circuit=track_circuit, call_start_time=start_time)
     except Exception:

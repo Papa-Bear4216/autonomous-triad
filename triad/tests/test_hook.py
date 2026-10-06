@@ -3732,6 +3732,12 @@ class TestPhase3AdvisoryCouncilRefinements(unittest.TestCase):
         from triad.triad_engine import _restore_entry
         with tempfile.TemporaryDirectory() as td:
             target_dir = Path(td)
+            probe = target_dir / "_symlink_probe"
+            try:
+                os.symlink("target_file.txt", probe)
+                os.unlink(probe)
+            except OSError:
+                self.skipTest("OS does not permit symlink creation")
             item_path = target_dir / "converted_link"
             # Patch converted symlink into a regular file
             item_path.write_bytes(b"regular file data from patch\n")
@@ -5469,11 +5475,12 @@ exit 0
         from triad.advisor_manager import query_configured_advisor
 
         prose_response = "VERDICT: REJECTED\n\nYou must enforce a rate limit on the /api/login endpoint to prevent brute force."
-        with patch("triad.advisor_manager._execute_single_advisor", return_value=prose_response) as mock_exec:
-            res = query_configured_advisor("auto", "Review PR", mode="review_diff")
-            self.assertIn("VERDICT: REJECTED", res)
-            self.assertNotIn("Auto-Failover", res)
-            mock_exec.assert_called_once()
+        with patch("triad.advisor_manager.is_circuit_open", return_value=False):
+            with patch("triad.advisor_manager._execute_single_advisor", return_value=prose_response) as mock_exec:
+                res = query_configured_advisor("auto", "Review PR", mode="review_diff")
+                self.assertIn("VERDICT: REJECTED", res)
+                self.assertNotIn("Auto-Failover", res)
+                mock_exec.assert_called_once()
 
     def test_symlink_atomic_restore_failure_preserves_artifacts(self):
         """Verify that if atomic swap fails during symlink restoration, backup and sidecar are preserved."""

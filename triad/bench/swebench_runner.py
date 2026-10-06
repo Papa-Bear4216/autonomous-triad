@@ -34,6 +34,9 @@ import subprocess
 import urllib.request
 import urllib.error
 import shutil
+import threading
+import concurrent.futures
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -51,7 +54,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 from triad_engine import query_advisory_council, query_claude, query_codex
-from triad.worktree import isolated_worktree, list_worktrees, get_repo_root
+from triad.worktree import isolated_worktree, list_worktrees, get_repo_root, WarmWorktreePool
 
 DEFAULT_INSTANCES_FILE = Path(__file__).resolve().parent / "swebench_instances.json"
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
@@ -74,27 +77,257 @@ def load_instances(file_path: Path) -> List[Dict[str, Any]]:
         return json.load(f)
 
 
+def _unquote_git_path(p: str) -> str:
+    """Decode a Git C-quoted path (core.quotePath).
+
+    Git quotes bytes, not Unicode code points: ``\\303\\251`` is the UTF-8
+    sequence for é, and ``\\"`` is a literal quote. ``unicode_escape`` treats
+    those octals as code points and would turn café into cafÃ©.
+    """
+    p = p.strip()
+    if len(p) < 2 or not (p.startswith('"') and p.endswith('"')):
+        return p
+    inner = p[1:-1]
+    out = bytearray()
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch != "\\" or i + 1 >= n:
+            encoded = ch.encode("utf-8", errors="surrogateescape")
+            out.extend(encoded)
+            i += 1
+            continue
+        nxt = inner[i + 1]
+        simple = {"n": 10, "t": 9, "b": 8, "r": 13, "a": 7, "v": 11, "f": 12}
+        if nxt in simple:
+            out.append(simple[nxt])
+            i += 2
+        elif nxt in ('"', "\\"):
+            out.append(ord(nxt))
+            i += 2
+        elif nxt in "01234567":
+            octal = nxt
+            i += 2
+            for _ in range(2):
+                if i < n and inner[i] in "01234567":
+                    octal += inner[i]
+                    i += 1
+                else:
+                    break
+            out.append(int(octal, 8) & 0xFF)
+        else:
+            out.extend(nxt.encode("utf-8", errors="surrogateescape"))
+            i += 2
+    return out.decode("utf-8", errors="surrogateescape")
+
+
+def _clean_git_diff_path(raw: str) -> Optional[str]:
+    """Cleans a raw file path from a diff header, stripping prefixes, tabs/timestamps, and quotes."""
+    if not raw:
+        return None
+    raw = raw.split("\t")[0].strip()
+    unquoted = _unquote_git_path(raw)
+    if unquoted in ("/dev/null", "dev/null"):
+        return None
+    if unquoted.startswith(("a/", "b/")):
+        unquoted = unquoted[2:]
+    elif unquoted.startswith(("./",)):
+        unquoted = unquoted[2:]
+    unquoted = unquoted.strip()
+    return unquoted if unquoted else None
+
+
+def _split_git_diff_header(header_line: str) -> List[str]:
+    """
+    Parses 'diff --git <src> <dst>' supporting paths with spaces and C-quotes.
+    e.g. 'diff --git "a/path with space/f.py" "b/path with space/f.py"'
+    or 'diff --git a/src.py b/src.py'
+    """
+    raw = header_line.strip()
+    if not raw.startswith("diff --git "):
+        return []
+    rest = raw[len("diff --git "):].strip()
+    parts = []
+    current = []
+    in_quote = False
+    escape = False
+    for ch in rest:
+        if escape:
+            current.append(ch)
+            escape = False
+        elif ch == "\\":
+            current.append(ch)
+            escape = True
+        elif ch == '"':
+            in_quote = not in_quote
+            current.append(ch)
+        elif ch.isspace() and not in_quote:
+            if current:
+                parts.append("".join(current))
+                current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append("".join(current))
+
+    if len(parts) == 2:
+        return parts
+
+    m = re.match(r"^a/(.*?)\s+b/(.*)$", rest)
+    if m:
+        # Keep the a/ and b/ prefixes. _clean_git_diff_path strips exactly one.
+        return ["a/" + m.group(1), "b/" + m.group(2)]
+    return parts
+
+
+def _hunk_span(line: str) -> Optional[Tuple[int, int]]:
+    """Return (old_lines, new_lines) for a @@ hunk header, or None."""
+    m = re.match(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
+    if not m:
+        return None
+    old_n = int(m.group(1)) if m.group(1) is not None else 1
+    new_n = int(m.group(2)) if m.group(2) is not None else 1
+    return old_n, new_n
+
+
+def _looks_like_file_header(lines: List[str], index: int) -> bool:
+    """True when index starts a ---/+++/@@ file preamble, even if hunk counts ran long."""
+    return (
+        index + 2 < len(lines)
+        and lines[index].startswith("--- ")
+        and lines[index + 1].startswith("+++ ")
+        and lines[index + 2].startswith("@@")
+    )
+
+
+def _consume_hunk_line(line: str, old_left: int, new_left: int) -> Tuple[int, int, bool]:
+    """Apply one hunk body line. The bool is False when the line is not body text."""
+    if line == "":
+        # LLMs often drop the leading space on empty context lines.
+        return old_left - 1, new_left - 1, True
+    if line.startswith("\\"):
+        return old_left, new_left, True
+    if line.startswith("-"):
+        return old_left - 1, new_left, True
+    if line.startswith("+"):
+        return old_left, new_left - 1, True
+    if line.startswith(" "):
+        return old_left - 1, new_left - 1, True
+    return old_left, new_left, False
+
+
 def extract_files_from_diff(diff_text: str) -> List[str]:
-    """Extracts target file paths mentioned in a unified diff or patch."""
+    """Extracts target file paths mentioned in a unified diff or patch, handling spaces and quotes."""
     files = set()
-    for line in diff_text.splitlines():
-        m_git = re.match(r"^diff\s+--git\s+[a-z]/(.*?)\s+[a-z]/(.*)", line)
-        if m_git:
-            f1, f2 = m_git.group(1), m_git.group(2)
-            if not f1.endswith("dev/null"):
-                files.add(f1)
-            if not f2.endswith("dev/null"):
-                files.add(f2)
+    if not diff_text:
+        return []
+
+    lines = diff_text.splitlines()
+    i = 0
+    in_hunk = False
+    old_left = 0
+    new_left = 0
+    while i < len(lines):
+        line = lines[i]
+        if in_hunk:
+            # A deleted line "-- foo" is stored as "--- foo". Only preamble headers count.
+            # Over-long @@ counts must not swallow the next file's ---/+++/@@ header.
+            if _looks_like_file_header(lines, i):
+                in_hunk = False
+                continue
+            old_left, new_left, consumed = _consume_hunk_line(line, old_left, new_left)
+            if not consumed:
+                in_hunk = False
+                continue
+            if old_left <= 0 and new_left <= 0:
+                in_hunk = False
+            i += 1
             continue
-        m_minus = re.match(r"^---\s+(?:[a-z]/)?(\S+)", line)
-        if m_minus and not m_minus.group(1).endswith("dev/null"):
-            files.add(m_minus.group(1))
+        if line.startswith("@@"):
+            span = _hunk_span(line)
+            if span:
+                old_left, new_left = span
+                in_hunk = old_left > 0 or new_left > 0
+            i += 1
             continue
-        m_plus = re.match(r"^\+\+\+\s+(?:[a-z]/)?(\S+)", line)
-        if m_plus and not m_plus.group(1).endswith("dev/null"):
-            files.add(m_plus.group(1))
+        if line.startswith("diff --git "):
+            parts = _split_git_diff_header(line)
+            for p in parts:
+                cleaned = _clean_git_diff_path(p)
+                if cleaned:
+                    files.add(cleaned)
+        elif line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+            c1 = _clean_git_diff_path(line[4:])
+            c2 = _clean_git_diff_path(lines[i + 1][4:])
+            if c1:
+                files.add(c1)
+            if c2:
+                files.add(c2)
+            i += 2
             continue
+        elif line.startswith("rename from ") or line.startswith("rename to "):
+            prefix_len = len("rename from ") if line.startswith("rename from ") else len("rename to ")
+            c = _clean_git_diff_path(line[prefix_len:])
+            if c:
+                files.add(c)
+        i += 1
     return sorted(list(files))
+
+
+def extract_base_files_needed(diff_text: str) -> List[str]:
+    """
+    Extracts only pre-existing source files that must be present at base_commit.
+    Handles filenames with spaces, tabs, and git C-style quoting.
+    Matches paired '---' lines directly followed by '+++' lines, plus 'rename from' headers.
+    Ignores newly created files (/dev/null).
+    """
+    needed = set()
+    if not diff_text:
+        return []
+
+    lines = diff_text.splitlines()
+    i = 0
+    in_hunk = False
+    old_left = 0
+    new_left = 0
+    while i < len(lines):
+        line = lines[i]
+        if in_hunk:
+            if _looks_like_file_header(lines, i):
+                in_hunk = False
+                continue
+            old_left, new_left, consumed = _consume_hunk_line(line, old_left, new_left)
+            if not consumed:
+                in_hunk = False
+                continue
+            if old_left <= 0 and new_left <= 0:
+                in_hunk = False
+            i += 1
+            continue
+        if line.startswith("@@"):
+            span = _hunk_span(line)
+            if span:
+                old_left, new_left = span
+                in_hunk = old_left > 0 or new_left > 0
+            i += 1
+            continue
+        if line.startswith("--- "):
+            if i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+                raw_src = line[4:]
+                cleaned = _clean_git_diff_path(raw_src)
+                if cleaned:
+                    needed.add(cleaned)
+                i += 2
+                continue
+        elif line.startswith("rename from "):
+            raw_src = line[len("rename from "):]
+            cleaned = _clean_git_diff_path(raw_src)
+            if cleaned:
+                needed.add(cleaned)
+        i += 1
+
+    return sorted(list(needed))
 
 
 def normalize_unified_diff(patch_text: str) -> str:
@@ -263,6 +496,32 @@ def ensure_base_file(repo: str, base_commit: str, rel_path: str) -> Tuple[Option
         return cache_path, None
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Hermetic local extraction from cached bare git repository
+    bare_name = repo.split("/")[-1] + ".git"
+    bare_repo = CACHE_DIR / "repos" / bare_name
+    if bare_repo.exists():
+        cmd = ["git", f"--git-dir={bare_repo}", "show", f"{base_commit}:{clean_rel.as_posix()}"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, timeout=15)
+            if res.returncode == 0:
+                content = res.stdout.replace(b"\r\n", b"\n")
+                fd, tmp_path = tempfile.mkstemp(dir=str(cache_path.parent), prefix="tmp_cache_")
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(content)
+                    os.replace(tmp_path, str(cache_path))
+                    return cache_path, None
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    # 2. Fallback to network request if bare repo missing or object not found
     url = f"https://raw.githubusercontent.com/{repo}/{base_commit}/{rel_path}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "TriadBench/1.0"})
@@ -272,10 +531,17 @@ def ensure_base_file(repo: str, base_commit: str, rel_path: str) -> Tuple[Option
         with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310
             content = resp.read().replace(b"\r\n", b"\n")
             fd, tmp_path = tempfile.mkstemp(dir=str(cache_path.parent), prefix="tmp_cache_")
-            with os.fdopen(fd, "wb") as f:
-                f.write(content)
-            os.replace(tmp_path, str(cache_path))
-            return cache_path, None
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(content)
+                os.replace(tmp_path, str(cache_path))
+                return cache_path, None
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
     except urllib.error.HTTPError as e:
         return None, f"HTTP_{e.code}"
     except Exception as e:
@@ -286,17 +552,30 @@ def verify_semantic_resolution(
     instance: Dict[str, Any],
     proposed_patch: str,
     full_response: str,
-    engine: str = "auto"
+    engine: str = "auto",
+    *,
+    judge_engine: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
     Semantic resolution check using Model-as-a-Judge against gold patch and SWE-bench test criteria.
-    Enforces scoring of final proposed fix and allows bug identification anywhere in findings.
+
+    ``engine`` is the legacy judge selector. ``"auto"`` and ``"claude"`` stay Claude-first.
+    Pass ``judge_engine`` to override. ``"asymmetric"`` is the 2026-10-05 Codex-first baseline
+    and is not comparable to earlier Claude-first scores.
     """
+    active_judge = judge_engine if judge_engine is not None else engine
     gold_patch = instance.get("patch", "")
     fail_to_pass = instance.get("FAIL_TO_PASS", [])
     problem = instance.get("problem_statement", "")[:1200]
 
-    # Fast path: Check for direct token / logic containment with gold patch
+    # Fast path 1: Early exit if normalized candidate diff matches gold patch exactly
+    if proposed_patch and gold_patch:
+        norm_proposed = normalize_unified_diff(proposed_patch).strip()
+        norm_gold = normalize_unified_diff(gold_patch).strip()
+        if norm_proposed and norm_proposed == norm_gold:
+            return True, "Exact gold-patch match (normalized diff identical)"
+
+    # Fast path 2: Direct token / logic containment with gold patch key additions
     gold_additions = [l[1:].strip() for l in gold_patch.splitlines() if l.startswith("+") and not l.startswith("+++") and l.strip()[1:].strip()]
     if gold_additions:
         solution_blob = (proposed_patch + "\n" + full_response).lower()
@@ -322,8 +601,13 @@ def verify_semantic_resolution(
     )
 
     try:
-        if engine == "codex":
+        # Session slots are taken inside each advisor call. Wrapping this block
+        # would hold one of the two slots for the whole failover and deadlock
+        # the second worker.
+        if active_judge in ("asymmetric", "codex"):
             judge_verdict = query_codex(judge_prompt, mode="general", timeout=40)
+            if not judge_verdict or "[error" in judge_verdict.lower() or "limit" in judge_verdict.lower():
+                judge_verdict = query_claude(judge_prompt, mode="general", timeout=40)
         else:
             judge_verdict = query_claude(judge_prompt, mode="general", timeout=40)
             if not judge_verdict or "[error" in judge_verdict.lower() or "limit" in judge_verdict.lower():
@@ -353,10 +637,14 @@ def evaluate_in_worktree(
     extracted_patch: Dict[str, Any],
     full_response: str,
     repo_root: Path,
-    engine: str = "auto"
+    engine: str = "auto",
+    *,
+    judge_engine: str = "asymmetric",
+    existing_worktree: Optional[Path] = None
 ) -> Dict[str, Any]:
     """
-    Evaluates instance patch inside an isolated git worktree via triad.worktree.isolated_worktree.
+    Evaluates instance patch inside an isolated git worktree via triad.worktree.isolated_worktree
+    or a recycled warm worktree from WarmWorktreePool.
     Applies the actual patch with git apply, applies test_patch, and attempts real test execution.
     """
     cid = instance.get("instance_id", "instance")
@@ -376,11 +664,14 @@ def evaluate_in_worktree(
         fail_to_pass = []
 
     gold_files = extract_files_from_diff(gold_patch)
-    test_files = extract_files_from_diff(test_patch)
-    candidate_files = extracted_patch.get("target_files", [])
-    all_needed_files = sorted(list(set(gold_files + test_files + candidate_files)))
-
     candidate_patch_text = extracted_patch.get("patch_text", "").strip()
+
+    # Determine exact pre-existing base files that must be present at base_commit.
+    # Exclude rename destinations and newly created files which do not exist at base_commit.
+    gold_base = extract_base_files_needed(gold_patch)
+    test_base = extract_base_files_needed(test_patch)
+    cand_base = extract_base_files_needed(candidate_patch_text)
+    all_needed_files = sorted(list(set(gold_base + test_base + cand_base)))
 
     # 1. Syntax check
     is_valid_syntax, syntax_msg = verify_git_patch_syntax(candidate_patch_text)
@@ -404,6 +695,7 @@ def evaluate_in_worktree(
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", cid)[:16]
     worktree_isolated = False
     patch_applied = False
+    apply_method = "none"
     test_patch_applied = False
     tests_executed = False
     tests_passed = False
@@ -411,8 +703,9 @@ def evaluate_in_worktree(
     resolution_method = "UNKNOWN"
     exec_msg = ""
 
+    wt_ctx = nullcontext(existing_worktree) if existing_worktree is not None else isolated_worktree(repo_root, prefix=f"triad-wt-{safe_id}")
     try:
-        with isolated_worktree(repo_root, prefix=f"triad-wt-{safe_id}") as wt:
+        with wt_ctx as wt:
             worktree_isolated = True
 
             # Copy base files into worktree with path containment enforcement
@@ -429,7 +722,18 @@ def evaluate_in_worktree(
                     subprocess.run(["git", "-C", str(wt), "-c", "core.autocrlf=false", "add", "-f", rel], capture_output=True)
                     files_added_to_base += 1
                 elif err and not rel.endswith("dev/null"):
-                    infra_errors.append(f"{rel} ({err})")
+                    # Check if file is newly introduced from /dev/null by test_patch or candidate_patch
+                    is_new_file = False
+                    for patch_src in (test_patch, candidate_patch_text):
+                        if (
+                            f"--- /dev/null\n+++ b/{rel}" in patch_src
+                            or f"--- /dev/null\n+++ {rel}" in patch_src
+                            or f"--- a/dev/null\n+++ b/{rel}" in patch_src
+                        ):
+                            is_new_file = True
+                            break
+                    if not is_new_file:
+                        infra_errors.append(f"{rel} ({err})")
 
             if infra_errors:
                 exec_msg = f"Infrastructure error fetching base files: {', '.join(infra_errors[:3])}"
@@ -446,24 +750,54 @@ def evaluate_in_worktree(
                         "commit", "-m", "Initialize base files at base_commit"
                     ], capture_output=True)
 
-                # Apply candidate patch via git apply
-                cand_patch_file = wt / "candidate.patch"
-                cand_patch_file.write_bytes(normalize_unified_diff(candidate_patch_text).encode("utf-8"))
+                # Apply candidate patch via git apply using isolated temp directory outside worktree
+                with tempfile.TemporaryDirectory(prefix="triad-patch-") as patch_dir_str:
+                    patch_dir = Path(patch_dir_str)
+                    cand_patch_file = patch_dir / "candidate.patch"
+                    cand_patch_file.write_bytes(normalize_unified_diff(candidate_patch_text).encode("utf-8"))
 
-                res_apply = subprocess.run([
-                    "git", "-C", str(wt),
-                    "-c", "core.autocrlf=false",
-                    "apply",
-                    "--recount", "--ignore-space-change", "--ignore-whitespace",
-                    str(cand_patch_file)
-                ], capture_output=True, text=True)
+                    apply_method = "strict"
+                    res_apply = subprocess.run([
+                        "git", "-C", str(wt),
+                        "-c", "core.autocrlf=false",
+                        "apply",
+                        "--recount", "--ignore-space-change", "--ignore-whitespace",
+                        str(cand_patch_file)
+                    ], capture_output=True, text=True)
 
-                if res_apply.returncode == 0:
-                    patch_applied = True
-                    exec_msg = "Git apply succeeded in isolated worktree"
+                    if res_apply.returncode != 0:
+                        # Clean up index and conflict markers before 3-way retry
+                        subprocess.run(["git", "-C", str(wt), "reset", "--hard", "-q"], capture_output=True)
+                        subprocess.run(["git", "-C", str(wt), "clean", "-fd"], capture_output=True)
 
-                    if test_patch:
-                        tpatch_file = wt / "test.patch"
+                        res_apply = subprocess.run([
+                            "git", "-C", str(wt),
+                            "-c", "core.autocrlf=false",
+                            "apply",
+                            "--3way", "--recount", "--ignore-space-change", "--ignore-whitespace",
+                            str(cand_patch_file)
+                        ], capture_output=True, text=True)
+                        if res_apply.returncode == 0:
+                            apply_method = "3way"
+
+                    if res_apply.returncode != 0:
+                        # Clean up again before fuzzy retry
+                        subprocess.run(["git", "-C", str(wt), "reset", "--hard", "-q"], capture_output=True)
+                        subprocess.run(["git", "-C", str(wt), "clean", "-fd"], capture_output=True)
+
+                        try:
+                            try:
+                                from triad_engine import apply_patch_text
+                            except ImportError:
+                                from triad.triad_engine import apply_patch_text
+                            if apply_patch_text(candidate_patch_text, cwd=wt, allow_3way=True):
+                                res_apply = subprocess.CompletedProcess(args=[], returncode=0, stdout="applied via fuzzy fallback", stderr="")
+                                apply_method = "fuzzy"
+                        except Exception:
+                            pass
+
+                    if res_apply.returncode == 0 and test_patch:
+                        tpatch_file = patch_dir / "test.patch"
                         tpatch_file.write_bytes(normalize_unified_diff(test_patch).encode("utf-8"))
                         res_tpatch = subprocess.run([
                             "git", "-C", str(wt),
@@ -472,9 +806,21 @@ def evaluate_in_worktree(
                             "--recount", "--ignore-space-change", "--ignore-whitespace",
                             str(tpatch_file)
                         ], capture_output=True, text=True)
+                        if res_tpatch.returncode != 0:
+                            res_tpatch = subprocess.run([
+                                "git", "-C", str(wt),
+                                "-c", "core.autocrlf=false",
+                                "apply",
+                                "--3way", "--recount", "--ignore-space-change", "--ignore-whitespace",
+                                str(tpatch_file)
+                            ], capture_output=True, text=True)
                         test_patch_applied = (res_tpatch.returncode == 0)
-                    else:
+                    elif res_apply.returncode == 0:
                         test_patch_applied = True
+
+                if res_apply.returncode == 0:
+                    patch_applied = True
+                    exec_msg = f"Git apply succeeded in isolated worktree ({apply_method})"
 
                     # Attempt real test execution if tests are specified and test_patch applied cleanly
                     if fail_to_pass and test_patch_applied:
@@ -536,7 +882,7 @@ def evaluate_in_worktree(
                             instance=instance,
                             proposed_patch=candidate_patch_text,
                             full_response=full_response,
-                            engine=engine
+                            judge_engine=judge_engine
                         )
                         semantic_resolved = is_sem_res
                         if not exec_msg:
@@ -571,6 +917,7 @@ def evaluate_in_worktree(
         "semantic_resolved": semantic_resolved,
         "worktree_isolated": worktree_isolated,
         "patch_applied": patch_applied,
+        "apply_method": apply_method if patch_applied else None,
         "test_patch_applied": test_patch_applied,
         "tests_executed": tests_executed,
         "tests_passed": tests_passed,
@@ -647,6 +994,9 @@ def run_swebench(
     limit: int = 5,
     instance_id: str = "",
     mode: str = "debug",
+    *,
+    judge_engine: str = "asymmetric",
+    workers: int = 2,
     verbose: bool = False
 ) -> Tuple[int, int, List[Dict[str, Any]]]:
     """
@@ -669,29 +1019,45 @@ def run_swebench(
     resolved_count = 0
     results = []
 
+    # Non-negotiable #2: never exceed 2 concurrent sessions
+    effective_workers = max(1, min(int(workers), 2))
+    if total <= 1:
+        effective_workers = 1
+
     print("================================================================================")
-    print("TRIAD SWE-BENCH VERIFIED RUNNER (Worktree Isolation & Real Patch Execution)")
-    print(f"Engine: {engine} | Mode: {mode} | Instances: {total}")
+    print("TRIAD SWE-BENCH VERIFIED RUNNER (Warm Worktree Pool & Controlled Concurrency)")
+    print(f"Engine: {engine} | Judge: {judge_engine} | Workers: {effective_workers} | Mode: {mode} | Instances: {total}")
     print(f"Dataset: {instances_file.resolve()}")
     print("Zero-Incremental-Cost Policy: Active ($0 token billing)")
-    print("Worktree Isolation: Enabled (triad.worktree)")
+    print("Worktree Isolation: Enabled (WarmWorktreePool)")
     print("================================================================================")
 
     initial_wts = len(list_worktrees(repo_root))
     limit_hit = False
+    abort_event = threading.Event()
+    print_lock = threading.Lock()
 
-    for idx, inst in enumerate(instances, 1):
+    warm_pool = WarmWorktreePool(repo_root=repo_root, max_workers=effective_workers)
+
+    def process_instance(idx: int, inst: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        nonlocal limit_hit
+        if abort_event.is_set():
+            return None
+
         cid = inst.get("instance_id", f"case_{idx}")
         repo = inst.get("repo", "unknown")
         prob_first_line = (inst.get("problem_statement", "").strip().splitlines() or [""])[0][:55]
         gold_files = extract_files_from_diff(inst.get("patch", ""))
 
-        print(f"[{idx:02d}/{total:02d}] {cid} ({repo}): {prob_first_line}...", end=" ", flush=True)
+        if effective_workers == 1:
+            with print_lock:
+                print(f"[{idx:02d}/{total:02d}] {cid} ({repo}): {prob_first_line}...", end=" ", flush=True)
 
         advisor_prompt = build_swebench_prompt(inst, mode=mode)
 
         try:
-            # Query advisory council or single baseline model
+            # Query advisory council or single baseline model (Non-negotiable #1: Claude 3.7 Sonnet author).
+            # Concurrency is enforced inside the advisor call, not around it.
             if engine == "bare_single":
                 raw_response = query_claude(advisor_prompt, mode=mode, timeout=300)
             else:
@@ -699,36 +1065,32 @@ def run_swebench(
 
             # Check for error or empty responses
             if not raw_response or raw_response.startswith("[Error"):
-                print(f"✗ ERROR ({raw_response[:60]})")
-                results.append({
-                    "instance_id": cid,
-                    "repo": repo,
-                    "resolved": False,
-                    "error": raw_response
-                })
                 is_limit = raw_response and (
                     "session limit" in raw_response.lower() or "rate limit" in raw_response.lower()
                 )
                 if is_limit:
                     limit_hit = True
-                    remaining = total - idx
-                    print(
-                        f"\n[Aborting] {engine} hit a session/rate limit at instance {idx}/{total}. "
-                        f"Stopping sweep early — {remaining} remaining instance(s) were not evaluated "
-                        "(not counted as failures)."
-                    )
-                    break
-                continue
+                    abort_event.set()
+                with print_lock:
+                    if effective_workers > 1:
+                        print(f"[{idx:02d}/{total:02d}] {cid} ({repo}): {prob_first_line}... ✗ ERROR ({raw_response[:60]})")
+                    else:
+                        print(f"✗ ERROR ({raw_response[:60]})")
+                return {
+                    "_idx": idx,
+                    "instance_id": cid,
+                    "repo": repo,
+                    "resolved": False,
+                    "error": raw_response
+                }
 
             # Extract patch / solution
             extracted = extract_proposed_patch(raw_response, expected_files=gold_files)
 
-            # If the extracted patch fails basic syntax validation, retry once with a
-            # corrective prompt before giving up — model diff generation is non-deterministic
-            # and a single malformed attempt shouldn't sink an otherwise-solvable instance.
+            # Retry once if syntax fails
             retried = False
             syntax_ok, syntax_err = verify_git_patch_syntax(extracted.get("patch_text", ""))
-            if not syntax_ok:
+            if not syntax_ok and not abort_event.is_set():
                 retried = True
                 retry_prompt = build_retry_prompt(inst, mode=mode, prior_error=syntax_err)
                 if engine == "bare_single":
@@ -743,61 +1105,110 @@ def run_swebench(
                         raw_response = retry_response
                         extracted = retry_extracted
 
-            # Evaluate inside isolated git worktree
-            eval_result = evaluate_in_worktree(
-                instance=inst,
-                extracted_patch=extracted,
-                full_response=raw_response,
-                repo_root=repo_root,
-                engine=engine
-            )
+            # Evaluate inside recycled warm worktree
+            with warm_pool.acquire() as wt:
+                eval_result = evaluate_in_worktree(
+                    instance=inst,
+                    extracted_patch=extracted,
+                    full_response=raw_response,
+                    repo_root=repo_root,
+                    engine=engine,
+                    judge_engine=judge_engine,
+                    existing_worktree=wt
+                )
 
             is_res = eval_result["resolved"]
-            if is_res:
-                resolved_count += 1
-                status_str = "✓ RESOLVED"
-            else:
-                status_str = "✗ UNRESOLVED"
-
+            status_str = "✓ RESOLVED" if is_res else "✗ UNRESOLVED"
             details = []
             if retried:
                 details.append("retried: yes")
             if eval_result.get("worktree_isolated"):
                 details.append("worktree: isolated")
             if eval_result.get("patch_applied"):
-                details.append("patch: applied")
+                meth = eval_result.get("apply_method")
+                details.append(f"patch: applied ({meth})" if meth else "patch: applied")
             if eval_result.get("tests_passed"):
                 details.append("tests: pass")
             elif eval_result.get("semantic_resolved"):
                 details.append("semantic: match")
 
             tag = f" ({', '.join(details)})" if details else ""
-            print(f"{status_str}{tag}")
 
-            if verbose:
-                print(f"    - Method: {eval_result.get('resolution_method')}")
-                print(f"    - Message: {eval_result.get('message')}")
-                if extracted.get("target_files"):
-                    print(f"    - Target Files: {', '.join(extracted['target_files'])}")
-                print(f"    - Patch Preview: {extracted.get('patch_text', '')[:120] or 'No diff block'}...")
+            with print_lock:
+                if effective_workers > 1:
+                    print(f"[{idx:02d}/{total:02d}] {cid} ({repo}): {prob_first_line}... {status_str}{tag}")
+                else:
+                    print(f"{status_str}{tag}")
 
-            results.append({
+                if verbose:
+                    print(f"    - Method: {eval_result.get('resolution_method')}")
+                    print(f"    - Message: {eval_result.get('message')}")
+                    if extracted.get("target_files"):
+                        print(f"    - Target Files: {', '.join(extracted['target_files'])}")
+                    print(f"    - Patch Preview: {extracted.get('patch_text', '')[:120] or 'No diff block'}...")
+
+            return {
+                "_idx": idx,
                 "instance_id": cid,
                 "repo": repo,
                 "resolved": is_res,
                 "evaluation": eval_result,
                 "extracted_patch": extracted.get("patch_text", "")[:500],
                 "sample_response": raw_response[:300]
-            })
+            }
 
         except Exception as e:
-            print(f"✗ EXCEPTION ({e})")
-            results.append({
+            with print_lock:
+                if effective_workers > 1:
+                    print(f"[{idx:02d}/{total:02d}] {cid} ({repo}): {prob_first_line}... ✗ EXCEPTION ({e})")
+                else:
+                    print(f"✗ EXCEPTION ({e})")
+            return {
+                "_idx": idx,
                 "instance_id": cid,
                 "repo": repo,
                 "resolved": False,
                 "error": str(e)
-            })
+            }
+
+    try:
+        if effective_workers == 1:
+            for idx, inst in enumerate(instances, 1):
+                res = process_instance(idx, inst)
+                if res:
+                    results.append(res)
+                    if res.get("resolved"):
+                        resolved_count += 1
+                if limit_hit:
+                    remaining = total - idx
+                    print(
+                        f"\n[Aborting] {engine} hit a session/rate limit at instance {idx}/{total}. "
+                        f"Stopping sweep early — {remaining} remaining instance(s) were not evaluated "
+                        "(not counted as failures)."
+                    )
+                    break
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                future_map = {
+                    executor.submit(process_instance, idx, inst): (idx, inst)
+                    for idx, inst in enumerate(instances, 1)
+                }
+                for fut in concurrent.futures.as_completed(future_map):
+                    res = fut.result()
+                    if res:
+                        results.append(res)
+                        if res.get("resolved"):
+                            resolved_count += 1
+                    if limit_hit:
+                        break
+            results.sort(key=lambda r: r.get("_idx", 0))
+
+    finally:
+        warm_pool.close()
+
+    # Clean up any leftover temporary metadata keys
+    for r in results:
+        r.pop("_idx", None)
 
     # Verify zero lingering worktrees
     final_wts = len(list_worktrees(repo_root))
@@ -815,12 +1226,15 @@ def run_swebench(
 
     print("================================================================================")
     print("SWE-BENCH VERIFIED RESULT:")
+    print("  - Judge prompt baseline: 2026-10-05 (not comparable to earlier scores)")
     if limit_hit:
         print(f"  - Sweep aborted early:    {attempted}/{total} instances attempted (session/rate limit hit)")
     print(f"  - Real Test-Verified:     {resolved_count}/{attempted} ({pct_res:.1f}%)")
     print(f"  - Git Apply Succeeded:    {git_apply_count}/{attempted} ({pct_git:.1f}%)")
     print(f"  - Semantic Match (Diag):  {sem_count}/{attempted} ({pct_sem:.1f}%)")
     print(f"  - Advisory Engine:        {engine}")
+    print(f"  - Judge Engine:           {judge_engine}")
+    print(f"  - Concurrency Workers:    {effective_workers}")
     print("================================================================================\n")
 
     return resolved_count, attempted, results
@@ -839,6 +1253,19 @@ def main():
         choices=["auto", "claude", "codex", "bare_single"],
         default="auto",
         help="Advisory engine (auto, claude, codex, bare_single)"
+    )
+    parser.add_argument(
+        "--judge-engine",
+        choices=["asymmetric", "codex", "claude", "auto"],
+        default="asymmetric",
+        help="Engine to use for judging (default: asymmetric - routes to Codex then Claude)"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        choices=[1, 2],
+        help="Number of concurrent evaluation workers (1 or 2, default: 2)"
     )
     parser.add_argument(
         "--limit",
@@ -877,6 +1304,8 @@ def main():
         limit=args.limit,
         instance_id=args.instance,
         mode=args.mode,
+        judge_engine=args.judge_engine,
+        workers=args.workers,
         verbose=args.verbose
     )
 
@@ -888,6 +1317,8 @@ def main():
                 "total": total,
                 "percentage": (resolved / total * 100) if total > 0 else 0,
                 "engine": args.engine,
+                "judge_engine": args.judge_engine,
+                "workers": args.workers,
                 "mode": args.mode,
                 "results": results
             }, f, indent=2)
@@ -898,3 +1329,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

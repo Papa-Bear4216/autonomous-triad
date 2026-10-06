@@ -19,6 +19,7 @@ import time
 import gc
 import json
 import hashlib
+import threading
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional, Union, List, Dict, Any, Generator, Tuple
@@ -1078,3 +1079,248 @@ def isolated_worktree(
 
         if not keep_worktree:
             remove_worktree(wt_path, force=True, repo_path=root, env=env)
+
+
+class WarmWorktreePool:
+    """
+    Managed pool of recycled git worktrees for high-throughput batch evaluation.
+
+    Invariants:
+    1. Bounded concurrency: max_workers <= 2 (strictly enforcing triad operating limits).
+    2. Zero disk thrashing: worktrees are created ONCE and recycled via fast checkout/clean.
+    3. Thread-safe condition-variable resource management: supports arbitrary waiter count.
+    4. Safe cleanup: all pool worktrees are unlinked and pruned on close; leased worktrees
+       are retained until their active lease releases, preventing file-handle destruction.
+    """
+
+    def __init__(
+        self,
+        repo_path: Optional[Union[str, Path]] = None,
+        max_workers: int = 2,
+        prefix: str = "triad-warm-wt",
+        base_commit: str = "HEAD",
+        env: Optional[Dict[str, str]] = None,
+        *,
+        repo_root: Optional[Union[str, Path]] = None
+    ):
+        target_root = repo_root or repo_path or "."
+        self.repo_root = get_repo_root(target_root, env=env)
+        # Non-negotiable #2: never exceed 2 concurrent sessions
+        self.max_workers = max(1, min(int(max_workers), 2))
+        self.prefix = prefix
+        self.env = env
+        self._pool_id = uuid.uuid4().hex[:8]
+
+        # Determine exact commit SHA to reset to
+        res = subprocess.run(
+            ["git", "-C", str(self.repo_root), "rev-parse", base_commit],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            raise RuntimeError(f"Failed to resolve base_commit '{base_commit}' in {self.repo_root}: {res.stderr.strip()}")
+        self.base_sha = res.stdout.strip()
+
+        self._available: List[Path] = []
+        self._all_worktrees: List[Path] = []
+        self._leased_worktrees: set = set()
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._active_leases = 0
+        self._closed = False
+        self._created_count = 0
+
+    def _create_single_worktree(self) -> Path:
+        idx = self._created_count
+        self._created_count += 1
+        target_dir = Path(tempfile.gettempdir()) / f"{self.prefix}-{os.getpid()}-{self._pool_id}-{idx}"
+        if target_dir.exists():
+            remove_worktree(target_dir, force=True, repo_path=self.repo_root, env=self.env)
+        wt = create_worktree(
+            self.repo_root,
+            branch_or_commit=self.base_sha,
+            target_path=target_dir,
+            detach=True,
+            env=self.env
+        )
+        return wt
+
+    def prewarm(self) -> None:
+        """Pre-provisions up to max_workers worktrees."""
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("WarmWorktreePool is closed")
+            while len(self._all_worktrees) < self.max_workers:
+                wt = self._create_single_worktree()
+                self._all_worktrees.append(wt)
+                self._available.append(wt)
+            self._cv.notify_all()
+
+    @contextmanager
+    def acquire(self, timeout: Optional[float] = None) -> Generator[Path, None, None]:
+        """
+        Acquire a warm, clean worktree from the pool.
+        Automatically resets and returns the worktree on context exit.
+        """
+        start_time = time.monotonic()
+        with self._cv:
+            while True:
+                if self._closed:
+                    raise RuntimeError("WarmWorktreePool is closed")
+                if self._available:
+                    wt = self._available.pop()
+                    self._active_leases += 1
+                    self._leased_worktrees.add(wt)
+                    break
+                if len(self._all_worktrees) < self.max_workers:
+                    wt = self._create_single_worktree()
+                    self._all_worktrees.append(wt)
+                    self._active_leases += 1
+                    self._leased_worktrees.add(wt)
+                    break
+
+                if timeout is not None:
+                    elapsed = time.monotonic() - start_time
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        raise TimeoutError("Timed out waiting for available worktree from pool")
+                    if not self._cv.wait(timeout=remaining):
+                        raise TimeoutError("Timed out waiting for available worktree from pool")
+                else:
+                    self._cv.wait()
+
+        active_wt = wt
+        usable = False
+        try:
+            active_wt = self._safe_reset_or_replace(active_wt)
+            usable = True
+            yield active_wt
+        finally:
+            return_wt = None
+            try:
+                # A closed pool only needs the tree removed. Resetting here can
+                # raise and hide the caller's result.
+                if usable and not self._closed:
+                    return_wt = self._safe_reset_or_replace(active_wt)
+            finally:
+                with self._cv:
+                    self._active_leases -= 1
+                    # A failed return-reset replaces active_wt. Drop every path this lease owned,
+                    # otherwise the replacement stays marked leased while also sitting in _available.
+                    owned = {active_wt}
+                    if return_wt is not None:
+                        owned.add(return_wt)
+                    for path in owned:
+                        self._leased_worktrees.discard(path)
+                    if self._closed:
+                        for path in owned:
+                            try:
+                                remove_worktree(path, force=True, repo_path=self.repo_root, env=self.env)
+                            except Exception:
+                                pass
+                            if path in self._all_worktrees:
+                                self._all_worktrees.remove(path)
+                            if path in self._available:
+                                self._available.remove(path)
+                        if not self._leased_worktrees:
+                            self._available.clear()
+                            prune_worktrees(self.repo_root, env=self.env)
+                    elif return_wt is not None and return_wt in self._all_worktrees and return_wt not in self._available:
+                        self._available.append(return_wt)
+                    self._cv.notify_all()
+
+    def _reset_worktree(self, wt: Path) -> None:
+        """
+        Rapidly resets the warm worktree without filesystem deletion:
+        1. Discard uncommitted/staged changes and switch detached HEAD to base commit
+        2. Clean all untracked, untracked ignored files and directories (-ffdx)
+        Validates return codes of all commands and raises RuntimeError on any failure.
+        """
+        # Drop dependency junctions before git clean -ffdx. A failure must raise
+        # so the pool quarantines this tree instead of cleaning through a link.
+        deprovision_worktree_dependencies(wt)
+        run_env = clean_git_env(base_env=self.env) if self.env is not None else clean_git_env()
+        r0 = subprocess.run(["git", "-C", str(wt), "reset", "--hard", "-q"], capture_output=True, env=run_env, timeout=20)
+        if r0.returncode != 0:
+            raise RuntimeError(f"git reset --hard failed on {wt}: {r0.stderr.decode('utf-8', errors='replace').strip()}")
+
+        r1 = subprocess.run(
+            ["git", "-C", str(wt), "checkout", "-f", "--detach", self.base_sha],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=run_env, timeout=20
+        )
+        if r1.returncode != 0:
+            r1_fb = subprocess.run(["git", "-C", str(wt), "reset", "--hard", self.base_sha], capture_output=True, env=run_env, timeout=20)
+            if r1_fb.returncode != 0:
+                raise RuntimeError(f"git checkout/reset to {self.base_sha} failed on {wt}: {r1.stderr.strip()}")
+
+        r2 = subprocess.run(
+            ["git", "-C", str(wt), "clean", "-ffdx"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=run_env, timeout=20
+        )
+        if r2.returncode != 0:
+            raise RuntimeError(f"git clean -ffdx failed on {wt}: {r2.stderr.strip()[:200]}")
+
+    def _safe_reset_or_replace(self, wt: Path) -> Path:
+        """
+        Attempt to reset worktree. If reset fails or worktree is corrupted,
+        quarantine and remove it, creating a fresh replacement.
+        """
+        try:
+            self._reset_worktree(wt)
+            return wt
+        except Exception:
+            with self._cv:
+                try:
+                    remove_worktree(wt, force=True, repo_path=self.repo_root, env=self.env)
+                except Exception:
+                    pass
+                if wt in self._all_worktrees:
+                    self._all_worktrees.remove(wt)
+                self._leased_worktrees.discard(wt)
+
+                if not self._closed:
+                    replacement = self._create_single_worktree()
+                    self._all_worktrees.append(replacement)
+                    self._leased_worktrees.add(replacement)
+                    return replacement
+            raise
+
+    def close(self, timeout: float = 30.0) -> None:
+        """Tear down unleased warm worktrees and prune git metadata after active leases drain."""
+        with self._cv:
+            if self._closed:
+                return
+            self._closed = True
+            self._cv.notify_all()
+
+            # Wait for active leases to finish
+            start_time = time.monotonic()
+            while self._active_leases > 0:
+                remaining = timeout - (time.monotonic() - start_time)
+                if remaining <= 0:
+                    break
+                self._cv.wait(timeout=remaining)
+
+            # Clean up all unleased worktrees immediately
+            unleased = [w for w in list(self._all_worktrees) if w not in self._leased_worktrees]
+            for wt in unleased:
+                try:
+                    remove_worktree(wt, force=True, repo_path=self.repo_root, env=self.env)
+                except Exception:
+                    pass
+                if wt in self._all_worktrees:
+                    self._all_worktrees.remove(wt)
+                if wt in self._available:
+                    self._available.remove(wt)
+
+            if not self._leased_worktrees:
+                self._all_worktrees.clear()
+                self._available.clear()
+                prune_worktrees(self.repo_root, env=self.env)
+
+    def __enter__(self):
+        self.prewarm()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+

@@ -41,14 +41,25 @@ class JudgeUnavailableError(RuntimeError):
     """Raised when judging instruments cannot provide an authoritative evaluation."""
     pass
 
-def query_judge(prompt: str, timeout: int = 90) -> str:
+def query_judge(prompt: str, timeout: int = 90, *, judge_engine: str = "claude") -> str:
     """
-    Independent judging instrument with zero-downtime failover (Claude -> Codex).
-    Fixed across all reviewed engines to maintain measurement validity and score comparability.
+    Independent judging instrument.
+
+    The default is Claude, then Codex, which is the pre-2026-10-05 baseline.
+    ``judge_engine="asymmetric"`` (Codex, then Claude) is a new baseline: those
+    scores are not comparable to earlier Claude-first runs. ``triad bench``
+    selects asymmetric explicitly so candidate authoring can stay on Claude.
     """
-    verdict = query_claude(prompt, mode="general", timeout=timeout)
-    if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
+    # Each advisor call takes its own session slot and releases it before failover.
+    if judge_engine in ("asymmetric", "codex"):
         verdict = query_codex(prompt, mode="general", timeout=timeout)
+        if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
+            verdict = query_claude(prompt, mode="general", timeout=timeout)
+    else:
+        verdict = query_claude(prompt, mode="general", timeout=timeout)
+        if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
+            verdict = query_codex(prompt, mode="general", timeout=timeout)
+
     if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
         clean_err = verdict.strip().replace("\n", " ") if verdict else "Empty response"
         raise JudgeUnavailableError(f"Judge models unavailable (Claude and Codex rate-limited or offline): {clean_err[:120]}")
@@ -81,7 +92,7 @@ def _parse_judge_verdict(verdict: str) -> bool:
         
     raise JudgeUnavailableError(f"Judge returned non-boolean response: {verdict[:100]}")
 
-def judge_catch(bug_description: str, review_response: str) -> bool:
+def judge_catch(bug_description: str, review_response: str, *, judge_engine: str = "asymmetric") -> bool:
     """
     Ask a model whether the review response specifically and correctly identifies
     the seeded bug anywhere in its findings, rather than relying on presentation order.
@@ -99,23 +110,26 @@ def judge_catch(bug_description: str, review_response: str) -> bool:
         "Score the reviewer's final verdict, not exploratory or retracted hypotheses.\n"
         "Answer with exactly one word: YES or NO."
     )
-    verdict = query_judge(judge_prompt, timeout=90)
+    verdict = query_judge(judge_prompt, judge_engine=judge_engine, timeout=90)
     return _parse_judge_verdict(verdict)
 
-def judge_false_positive(review_response: str) -> bool:
+def judge_false_positive(review_response: str, *, judge_engine: str = "asymmetric") -> bool:
     """
     Ask a model whether the review claimed to find a bug/defect in a clean, benign diff.
+    Scores whether the reviewer's final findings allege an actual defect in the diff itself,
+    independent of whether merge approval prose is used.
     """
     judge_prompt = (
         "You are evaluating a code review of a completely correct, benign diff with no bugs.\n\n"
         f"THE REVIEW RESPONSE TO SCORE:\n{review_response}\n\n"
-        "Did this review assert or flag that the diff itself introduces an actual defect, logic bug, syntax error, or security vulnerability? "
-        "Score the reviewer's final verdict, not exploratory or retracted hypotheses that the reviewer subsequently disproved or dismissed. "
-        "Answer NO if the review considers the diff sound/clean, approves the change, states it is safe to merge, or only mentions style/docs or pre-existing code outside the diff. "
-        "Answer YES only if the review's final verdict asserts that the diff itself introduces an actual defect, bug, or vulnerability.\n"
+        "Did this review assert or find that the diff itself introduces an actual defect, logic bug, syntax error, regression, or security vulnerability? "
+        "Score whether the reviewer's final findings allege an actual defect in the changed code, rather than whether the reviewer explicitly used approval or blocking language. "
+        "Do NOT count stylistic notes, documentation observations, UX/a11y tips, or caveats about pre-existing code outside the diff as defect allegations. "
+        "Answer NO if the review concludes there are no defects in the diff or describes the diff as sound/correct. "
+        "Answer YES only if the reviewer's final findings allege that the changed code itself contains or introduces an actual defect, bug, or vulnerability.\n"
         "Answer with exactly one word: YES or NO."
     )
-    verdict = query_judge(judge_prompt, timeout=90)
+    verdict = query_judge(judge_prompt, judge_engine=judge_engine, timeout=90)
     return _parse_judge_verdict(verdict)
 
 def run_benchmark(
@@ -123,6 +137,8 @@ def run_benchmark(
     engine: str = "auto",
     limit: int = 0,
     case_id: str = "",
+    *,
+    judge_engine: str = "asymmetric",
     verbose: bool = False
 ) -> Tuple[int, int, int, int, List[Dict[str, Any]]]:
     """
@@ -181,7 +197,7 @@ def run_benchmark(
             # 2. Judge review response
             if expected:
                 positive_total += 1
-                is_caught = judge_catch(desc, review)
+                is_caught = judge_catch(desc, review, judge_engine=judge_engine)
                 if is_caught:
                     bugs_caught += 1
                     print("✓ CAUGHT")
@@ -197,7 +213,7 @@ def run_benchmark(
                 })
             else:
                 negative_total += 1
-                is_fp = judge_false_positive(review)
+                is_fp = judge_false_positive(review, judge_engine=judge_engine)
                 if is_fp:
                     false_positives += 1
                     print("✗ FALSE POSITIVE")
@@ -230,7 +246,8 @@ def run_benchmark(
 
     print("================================================================================")
     print(f"BENCHMARK RESULT: {bugs_caught}/{positive_total} bugs caught ({catch_rate:.1f}%) | "
-          f"{false_positives}/{negative_total} false positives ({fp_rate:.1f}%) | engine={engine}")
+          f"{false_positives}/{negative_total} false positives ({fp_rate:.1f}%) | engine={engine} | judge={judge_engine}")
+    print("Judge prompt baseline: 2026-10-05 (not comparable to earlier scores)")
     print("================================================================================\n")
 
     return bugs_caught, positive_total, false_positives, negative_total, results
@@ -239,6 +256,7 @@ def main():
     parser = argparse.ArgumentParser(description="Triad Benchmark Runner")
     parser.add_argument("--cases-dir", default=str(DEFAULT_CASES_DIR), help="Directory of test cases")
     parser.add_argument("--engine", choices=["auto", "claude", "codex"], default="auto", help="Advisor engine")
+    parser.add_argument("--judge-engine", choices=["asymmetric", "codex", "claude", "auto"], default="asymmetric", help="Model to use for judging (default: asymmetric)")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of cases to run")
     parser.add_argument("--case", default="", help="Run single case ID")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print verbose review output")
@@ -251,6 +269,7 @@ def main():
         engine=args.engine,
         limit=args.limit,
         case_id=args.case,
+        judge_engine=args.judge_engine,
         verbose=args.verbose
     )
 
