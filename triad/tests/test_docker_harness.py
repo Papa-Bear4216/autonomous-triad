@@ -12,6 +12,7 @@ from triad.bench.docker_harness import (
     checkout_argv,
     destination_bare_repo,
     django_test_labels,
+    docker_outcome,
     native_test_argv,
     resolve_bare_repo,
     runner_executed,
@@ -80,6 +81,18 @@ class TestDockerHarness(unittest.TestCase):
         )
         self.assertEqual(django_test_labels(["Named URLs should be reversible"]), [])
         self.assertIsNone(native_test_argv("django/django", ["Named URLs should be reversible"]))
+        self.assertIsNone(native_test_argv("django/django", [
+            "test_ascii_validator (auth_tests.test_validators.UsernameValidatorsTests)",
+            "Named URLs should be reversible",
+        ]))
+
+    def test_docker_outcome_trusts_only_a_clean_pass(self):
+        self.assertEqual(docker_outcome(0, "OK\nRan 1 test in 0.1s"), "pass")
+        self.assertEqual(docker_outcome(0, "OK (skipped=1)\nRan 1 test in 0.1s"), "fallback")
+        self.assertEqual(
+            docker_outcome(1, "FAILED (failures=1)\nRan 1 test in 0.1s"),
+            "fallback",
+        )
 
     def test_runner_executed_ignores_harness_failures(self):
         self.assertFalse(runner_executed(1, "ImportError: No module named django"))
@@ -134,6 +147,14 @@ class TestClaudeJudgesCodex(unittest.TestCase):
         self.assertEqual(_keep_claude_as_judge("codex", "asymmetric"), "claude")
         self.assertEqual(_keep_claude_as_judge("claude", "claude"), "claude")
         self.assertEqual(_keep_claude_as_judge("auto", "claude"), "claude")
+
+    def test_codex_does_not_grade_after_claude_fails(self):
+        from triad.bench.run_bench import _codex_may_grade, _judge_response_failed
+
+        self.assertFalse(_codex_may_grade("codex", "codex"))
+        self.assertTrue(_codex_may_grade("claude", "codex"))
+        self.assertFalse(_judge_response_failed("The limit field is unchanged. YES"))
+        self.assertTrue(_judge_response_failed("[Error: Claude session limit hit]"))
 
 
 if __name__ == "__main__":

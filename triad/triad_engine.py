@@ -3956,7 +3956,7 @@ def _run_gate_impl(args, env: Optional[Dict[str, str]] = None, in_worktree: bool
             from competition import query_competition_council
         adv_pair = ("mock", "mock") if getattr(args, "engine", "auto") == "mock" else ("claude", "codex")
         session = query_competition_council(
-            _gate_signoff_prompt(diff)
+            _gate_signoff_prompt(diff, first_line=False)
             + "\nUnder Section 4 (Final Adjudicated Verdict & Action Plan), explicitly state either 'VERDICT: APPROVED' or 'VERDICT: REJECTED'.",
             diff=diff,
             mode="review_diff",
@@ -4014,16 +4014,20 @@ def _run_gate_impl(args, env: Optional[Dict[str, str]] = None, in_worktree: bool
         notify_event("Pre-Commit Gate Blocked", f"Advisory Council did not approve diff: {reason}.", status="failed", timeout=1.5)
         sys.exit(1)
 
-def _gate_signoff_prompt(diff: str) -> str:
+def _gate_signoff_prompt(diff: str, *, first_line: bool = True) -> str:
     """Stable pre-commit checklist. Truncation is named, and is not itself a rejection."""
     files = []
     for line in (diff or "").splitlines():
         if line.startswith("diff --git "):
             files.append(line[len("diff --git "):])
     index = "\n".join(f"- {name}" for name in files[:100]) or "- (no file headers)"
+    verdict_line = (
+        "Start your response with exactly 'VERDICT: APPROVED' or 'VERDICT: REJECTED' on the first line.\n"
+        if first_line else ""
+    )
     return (
         "Evaluate this diff as the final pre-commit gate.\n"
-        "Start your response with exactly 'VERDICT: APPROVED' or 'VERDICT: REJECTED' on the first line.\n"
+        f"{verdict_line}"
         "Checklist: correctness of the changed lines; regressions in direct callers; "
         "data-loss or secret exposure; security of file and process handling.\n"
         "Do not reject for wording or for files that were not shown. "

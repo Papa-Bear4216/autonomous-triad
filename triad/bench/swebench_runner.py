@@ -54,7 +54,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 from triad_engine import query_advisory_council, query_claude, query_codex
-from triad.bench.run_bench import _keep_claude_as_judge
+from triad.bench.run_bench import _codex_may_grade, _judge_response_failed, _keep_claude_as_judge
 from triad.worktree import isolated_worktree, list_worktrees, get_repo_root, WarmWorktreePool
 
 DEFAULT_INSTANCES_FILE = Path(__file__).resolve().parent / "swebench_instances.json"
@@ -556,6 +556,7 @@ def verify_semantic_resolution(
     engine: str = "auto",
     *,
     judge_engine: Optional[str] = None,
+    author_engine: str = "",
 ) -> Tuple[bool, str]:
     """
     Semantic resolution check using Model-as-a-Judge against gold patch and SWE-bench test criteria.
@@ -611,13 +612,19 @@ def verify_semantic_resolution(
         fallback = query_claude if primary == "codex" else query_codex
         judge_verdict = ask(judge_prompt, mode="general", timeout=40)
         judged_by = primary
-        if not judge_verdict or "[error" in judge_verdict.lower() or "limit" in judge_verdict.lower():
-            judge_verdict = fallback(judge_prompt, mode="general", timeout=40)
-            judged_by = fallback_name
-            print(
-                f"[Triad] Judge failover: {primary} could not answer; {judged_by} judged this instance.",
-                file=sys.stderr,
-            )
+        if _judge_response_failed(judge_verdict):
+            if not _codex_may_grade(author_engine, fallback_name):
+                print(
+                    "[Triad] Claude could not judge this Codex-authored patch. Codex will not grade it.",
+                    file=sys.stderr,
+                )
+            else:
+                judge_verdict = fallback(judge_prompt, mode="general", timeout=40)
+                judged_by = fallback_name
+                print(
+                    f"[Triad] Judge failover: {primary} could not answer; {judged_by} judged this instance.",
+                    file=sys.stderr,
+                )
 
         raw_verdict = (judge_verdict or "").strip()
         if not raw_verdict or "[error" in raw_verdict.lower() or "timeout" in raw_verdict.lower():
@@ -906,7 +913,9 @@ def evaluate_in_worktree(
                             instance=instance,
                             proposed_patch=candidate_patch_text,
                             full_response=full_response,
-                            judge_engine=judge_engine
+                            engine=engine,
+                            judge_engine=judge_engine,
+                            author_engine=engine,
                         )
                         semantic_resolved = is_sem_res
                         if not exec_msg:
@@ -1269,6 +1278,7 @@ def run_swebench(
         print("  - Judge:                  Codex first (explicit override)")
     else:
         print("  - Judge:                  Claude primary, Codex failover")
+        print("  - Judge baseline:         Claude primary, same family as the 2026-10-04 scores")
     if limit_hit:
         print(f"  - Sweep aborted early:    {attempted}/{total} instances attempted (session/rate limit hit)")
     print(f"  - Real Test-Verified:     {resolved_count}/{attempted} ({pct_res:.1f}%)")

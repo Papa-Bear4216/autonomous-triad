@@ -75,8 +75,10 @@ def django_test_labels(tests: List[str]) -> List[str]:
 def native_test_argv(repo: str, tests: List[str]) -> Optional[List[str]]:
     """Repo-native command, or None when this repo has no harness here."""
     if repo == "django/django":
-        labels = django_test_labels(tests)
-        if not labels:
+        usable = [text.strip() for text in tests if (text or "").strip()]
+        labels = django_test_labels(usable)
+        # A partial label list would score a pass on the tests we could name.
+        if not usable or len(labels) != len(usable):
             return None
         return ["python", "tests/runtests.py", "--verbosity", "1", *labels]
     if repo == "astropy/astropy":
@@ -130,6 +132,20 @@ def runner_executed(returncode: int, output: str) -> bool:
     if harness:
         return False
     return "short test summary" in lower or bool(re.search(r"\b\d+ failed\b", lower))
+
+
+def docker_outcome(returncode: int, output: str) -> str:
+    """``pass`` only for a clean run. Skips and failures stay on the host path.
+
+    A bare ``python:3.11`` image can print ``OK (skipped=1)`` when a Django
+    dependency is missing, and an old Django tree can fail on 3.11 for reasons
+    that are not the patch. Neither one is a score.
+    """
+    if returncode != 0 or not runner_executed(returncode, output or ""):
+        return "fallback"
+    if re.search(r"skipped=\d+", output or "", re.IGNORECASE):
+        return "fallback"
+    return "pass"
 
 
 def docker_is_running() -> bool:
@@ -234,6 +250,7 @@ def try_native_docker_tests(
             )
             cmd = [
                 "docker", "run", "--rm", "--name", container,
+                "--memory", "4g", "--pids-limit", "512",
                 "-v", _docker_bind(checkout),
                 "-w", "/src",
                 image,
@@ -242,6 +259,7 @@ def try_native_docker_tests(
         else:
             cmd = [
                 "docker", "run", "--rm", "--name", container,
+                "--memory", "4g", "--pids-limit", "512",
                 "-v", _docker_bind(checkout),
                 "-w", "/src",
                 image,
@@ -250,34 +268,24 @@ def try_native_docker_tests(
         try:
             ran = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            subprocess.run(["docker", "kill", container], capture_output=True, timeout=30)
-            return {
-                "executed": True,
-                "passed": False,
-                "method": "DOCKER_TIMEOUT",
-                "message": f"Docker test run timed out after {timeout}s",
-            }
+            try:
+                subprocess.run(["docker", "kill", container], capture_output=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            skipped["message"] = f"Docker test run timed out after {timeout}s; keeping the host path"
+            return skipped
         except OSError as exc:
             skipped["message"] = f"Docker could not start: {exc}"
             return skipped
         output = f"{ran.stdout or ''}\n{ran.stderr or ''}"
-        if not runner_executed(ran.returncode, output):
-            skipped["message"] = "Docker could not run the tests; keeping the host path"
+        if docker_outcome(ran.returncode, output) != "pass":
+            skipped["message"] = "Docker did not produce a clean pass; keeping the host path"
             return skipped
-        if ran.returncode == 0:
-            return {
-                "executed": True,
-                "passed": True,
-                "method": "DOCKER_NATIVE",
-                "message": f"Repo-native tests passed in {image}",
-            }
-        tail = output.strip().splitlines()
-        detail = tail[-1][:200] if tail else f"exit {ran.returncode}"
         return {
             "executed": True,
-            "passed": False,
-            "method": "DOCKER_TESTS_FAILED",
-            "message": f"Repo-native tests failed in {image}: {detail}",
+            "passed": True,
+            "method": "DOCKER_NATIVE",
+            "message": f"Repo-native tests passed in {image}",
         }
     finally:
         shutil.rmtree(checkout_parent, ignore_errors=True)

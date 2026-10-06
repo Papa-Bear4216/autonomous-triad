@@ -52,7 +52,20 @@ def _keep_claude_as_judge(engine: str, judge_engine: str) -> str:
         return "claude"
     return judge_engine
 
-def query_judge(prompt: str, timeout: int = 90, *, judge_engine: str = "claude") -> str:
+def _judge_response_failed(text: str) -> bool:
+    """True when the judge did not answer. A rationale that merely says "limit" is still an answer."""
+    if not text or not str(text).strip():
+        return True
+    lower = str(text).lower()
+    return "[error" in lower or "rate limit" in lower or "session limit" in lower
+
+
+def _codex_may_grade(author_engine: str, fallback_name: str) -> bool:
+    """Codex does not grade a patch it authored, including after Claude fails."""
+    return not (author_engine == "codex" and fallback_name == "codex")
+
+
+def query_judge(prompt: str, timeout: int = 90, *, judge_engine: str = "claude", author_engine: str = "") -> str:
     """
     Independent judging instrument.
 
@@ -66,15 +79,21 @@ def query_judge(prompt: str, timeout: int = 90, *, judge_engine: str = "claude")
     fallback = query_claude if primary == "codex" else query_codex
     verdict = ask(prompt, mode="general", timeout=timeout)
     judged_by = primary
-    if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
-        verdict = fallback(prompt, mode="general", timeout=timeout)
-        judged_by = fallback_name
-        print(
-            f"[Triad] Judge failover: {primary} could not answer; {judged_by} judged this item.",
-            file=sys.stderr,
-        )
+    if _judge_response_failed(verdict):
+        if not _codex_may_grade(author_engine, fallback_name):
+            print(
+                "[Triad] Claude could not judge this Codex-authored patch. Codex will not grade it.",
+                file=sys.stderr,
+            )
+        else:
+            verdict = fallback(prompt, mode="general", timeout=timeout)
+            judged_by = fallback_name
+            print(
+                f"[Triad] Judge failover: {primary} could not answer; {judged_by} judged this item.",
+                file=sys.stderr,
+            )
 
-    if not verdict or "[error" in verdict.lower() or "limit" in verdict.lower():
+    if _judge_response_failed(verdict):
         clean_err = verdict.strip().replace("\n", " ") if verdict else "Empty response"
         raise JudgeUnavailableError(f"Judge models unavailable (Claude and Codex rate-limited or offline): {clean_err[:120]}")
     return verdict
@@ -106,7 +125,7 @@ def _parse_judge_verdict(verdict: str) -> bool:
         
     raise JudgeUnavailableError(f"Judge returned non-boolean response: {verdict[:100]}")
 
-def judge_catch(bug_description: str, review_response: str, *, judge_engine: str = "claude") -> bool:
+def judge_catch(bug_description: str, review_response: str, *, judge_engine: str = "claude", author_engine: str = "") -> bool:
     """
     Ask a model whether the review response specifically and correctly identifies
     the seeded bug anywhere in its findings, rather than relying on presentation order.
@@ -124,10 +143,10 @@ def judge_catch(bug_description: str, review_response: str, *, judge_engine: str
         "Score the reviewer's final verdict, not exploratory or retracted hypotheses.\n"
         "Answer with exactly one word: YES or NO."
     )
-    verdict = query_judge(judge_prompt, judge_engine=judge_engine, timeout=90)
+    verdict = query_judge(judge_prompt, judge_engine=judge_engine, author_engine=author_engine, timeout=90)
     return _parse_judge_verdict(verdict)
 
-def judge_false_positive(review_response: str, *, judge_engine: str = "claude") -> bool:
+def judge_false_positive(review_response: str, *, judge_engine: str = "claude", author_engine: str = "") -> bool:
     """
     Ask a model whether the review claimed to find a bug/defect in a clean, benign diff.
     Scores whether the reviewer's final findings allege an actual defect in the diff itself,
@@ -143,7 +162,7 @@ def judge_false_positive(review_response: str, *, judge_engine: str = "claude") 
         "Answer YES only if the reviewer's final findings allege that the changed code itself contains or introduces an actual defect, bug, or vulnerability.\n"
         "Answer with exactly one word: YES or NO."
     )
-    verdict = query_judge(judge_prompt, judge_engine=judge_engine, timeout=90)
+    verdict = query_judge(judge_prompt, judge_engine=judge_engine, author_engine=author_engine, timeout=90)
     return _parse_judge_verdict(verdict)
 
 def run_benchmark(
@@ -185,6 +204,7 @@ def run_benchmark(
         print("Judge: Codex first (explicit override)")
     else:
         print("Judge: Claude primary, Codex failover")
+        print("Judge baseline: Claude primary, same family as the 2026-10-04 scores. Docker scores are separate.")
     print("================================================================================")
 
     for idx, case_path in enumerate(case_files, 1):
@@ -216,7 +236,7 @@ def run_benchmark(
             # 2. Judge review response
             if expected:
                 positive_total += 1
-                is_caught = judge_catch(desc, review, judge_engine=judge_engine)
+                is_caught = judge_catch(desc, review, judge_engine=judge_engine, author_engine=engine)
                 if is_caught:
                     bugs_caught += 1
                     print("✓ CAUGHT")
@@ -232,7 +252,7 @@ def run_benchmark(
                 })
             else:
                 negative_total += 1
-                is_fp = judge_false_positive(review, judge_engine=judge_engine)
+                is_fp = judge_false_positive(review, judge_engine=judge_engine, author_engine=engine)
                 if is_fp:
                     false_positives += 1
                     print("✗ FALSE POSITIVE")
