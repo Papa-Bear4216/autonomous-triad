@@ -115,12 +115,15 @@ def _safe_patch_path(p: str) -> Optional[Path]:
     if not p:
         return None
     try:
-        resolved = Path(p).resolve()
-        resolved.relative_to(PATCHES_DIR.resolve())  # containment first, before touching the filesystem
-        if not resolved.is_file():
+        base = os.path.normcase(os.path.realpath(str(PATCHES_DIR)))
+        real = os.path.normcase(os.path.realpath(p))
+        # Containment first, before touching the filesystem; trailing sep blocks sibling dirs like "patches_evil".
+        if not real.startswith(base + os.sep):
             return None
-        return resolved
-    except (ValueError, Exception):
+        if not os.path.isfile(real):
+            return None
+        return Path(real)
+    except Exception:
         return None
 
 
@@ -267,7 +270,15 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
         origin = (self.headers.get("Origin") or "").strip()
         if "\r" not in origin and "\n" not in origin and _is_allowed_origin(origin):
-            self.send_header("Access-Control-Allow-Origin", origin)
+            try:
+                parts = urllib.parse.urlsplit(origin)
+                # Rebuild from constants + parsed parts so no raw request text is reflected.
+                host = {"127.0.0.1": "127.0.0.1", "localhost": "localhost", "::1": "[::1]"}[(parts.hostname or "").lower()]
+                port = f":{int(parts.port)}" if parts.port else ""
+                safe_origin = f"{parts.scheme}://{host}{port}"
+            except ValueError:
+                return
+            self.send_header("Access-Control-Allow-Origin", safe_origin)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-webhook-token")
             self.send_header("Vary", "Origin")

@@ -257,6 +257,32 @@ def is_doc_or_asset_file(path_str: str) -> bool:
     return False
 
 
+def _path_from_diff_git_header(first_line: str) -> str:
+    """Extract the file path from a ``diff --git`` header using string ops (no regex backtracking)."""
+    prefix = "diff --git"
+    if not first_line.startswith(prefix) or len(first_line) == len(prefix) or not first_line[len(prefix)].isspace():
+        return ""
+    rest = first_line[len(prefix):].strip()
+    # Quoted/prefixed form: a/<old> b/<new>, optionally with each side quoted.
+    unquoted = rest.lstrip('"')
+    if unquoted.startswith("a/"):
+        body = unquoted[2:]
+        cuts = [(body.find(sep), sep) for sep in (' "b/', " b/")]
+        cuts = [(i, sep) for i, sep in cuts if i >= 0]
+        if cuts:
+            idx, sep = min(cuts)
+            old, new = body[:idx], body[idx + len(sep):]
+            return new.rstrip('"') or old.rstrip('"')
+    # Fallback: split on the first whitespace run, dropping optional a/ b/ prefixes.
+    parts = rest.split(None, 1)
+    if len(parts) < 2:
+        return ""
+    old, new = parts
+    old = old.removeprefix("a/")
+    new = new.removeprefix("b/")
+    return new or old
+
+
 def strip_diff_bloat(diff_text: Optional[str], max_lines_per_file: int = 500) -> str:
     """
     Sanitize git diff text before passing to LLM advisors.
@@ -300,13 +326,7 @@ def strip_diff_bloat(diff_text: Optional[str], max_lines_per_file: int = 500) ->
                 file_path = line[4:].strip().strip("\"'")
 
         if not file_path:
-            m = re.match(r'^diff --git\s+(?:"?a/(.*?)"?)\s+(?:"?b/(.*?)"?)$', first_line)
-            if m:
-                file_path = m.group(2) or m.group(1)
-            else:
-                m2 = re.match(r"^diff --git\s+(?:a/)?(.*?)\s+(?:b/)?(.*)$", first_line)
-                if m2:
-                    file_path = m2.group(2) or m2.group(1)
+            file_path = _path_from_diff_git_header(first_line)
 
         clean_path = file_path.strip().strip("\"'")
         file_name = os.path.basename(clean_path).lower()
