@@ -119,9 +119,14 @@ PORT_TRIAD_SERVER = _safe_int_env("TRIAD_PORT", 8789)
 PORT_PIECES_OS = _safe_int_env("TRIAD_PORT_PIECES_OS", 39300)
 PORT_OLLAMA = _safe_int_env("TRIAD_PORT_OLLAMA", 11434)
 
+# --- Agent Mesh MCP -----------------------------------------------------------
+AGENT_MESH_DIR: Path = resolve_file_path("TRIAD_AGENT_MESH_DIR", HOME / "projects" / "agent-mesh-mcp")
+AGENT_MESH_SERVER: Path = resolve_file_path("TRIAD_AGENT_MESH_SERVER", AGENT_MESH_DIR / "dist" / "server.js")
+
 __all__ = [
     "HOME", "LOCAL_APPDATA", "expand_path", "resolve_binary_path", "resolve_file_path",
     "CLAUDE_PATH", "CODEX_PATH", "AGY_PATH", "HERMES_PATH", "OLLAMA_PATH",
     "CODEX_AUTH", "MEM0_SCRIPT", "ANDROID_RELAY_ENV",
+    "AGENT_MESH_DIR", "AGENT_MESH_SERVER",
     "PORT_HERMES_RELAY", "PORT_PIECES_PROXY", "PORT_TRIAD_SERVER", "PORT_PIECES_OS", "PORT_OLLAMA",
 ]

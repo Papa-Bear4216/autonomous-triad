@@ -128,6 +128,13 @@ MICRO_KEYWORDS = [
     "type hint", "sort imports", "generate doc", "ast parse", "regex for"
 ]
 
+MESH_KEYWORDS = [
+    "agent mesh", "agent-mesh", "mesh swarm", "peer channel", "peer channels",
+    "playbook run", "playbook orchestration", "sealed review packet",
+    "patch promotion", "instruction proposal", "mesh status", "mesh doctor",
+    "mesh tools", "swarm coordination"
+]
+
 _GATE_RE = _compile_keywords(GATE_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
 _DEVICE_RE = _compile_keywords(DEVICE_KEYWORDS, strict_boundary=True)
 _MEMORY_RE = _compile_keywords(MEMORY_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
@@ -137,6 +144,7 @@ _REVIEW_RE = _compile_keywords(REVIEW_KEYWORDS, strict_boundary=False, suffixes=
 _DEBUG_RE = _compile_keywords(DEBUG_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
 _HIGH_STAKES_RE = _compile_keywords(HIGH_STAKES_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
 _MICRO_RE = _compile_keywords(MICRO_KEYWORDS, strict_boundary=False, suffixes=r"(?:s|es|ed|ing)?")
+_MESH_RE = _compile_keywords(MESH_KEYWORDS, strict_boundary=True)
 
 
 def is_high_stakes(text: str) -> bool:
@@ -152,7 +160,8 @@ _SCORE_WEIGHTS = {
     "DEBUG": 6.0,
     "DOCTOR": 5.5,
     "MEMORY": 5.0,
-    "REVIEW": 3.5,
+    "REVIEW": 4.5,
+    "MESH": 3.4,
     "ARCHITECT": 3.2,
     "DEVICE": 2.5,
 }
@@ -161,6 +170,7 @@ _INTENT_CONFIDENCE = {
     "GATE": 0.95,
     "MEMORY": 0.93,
     "DEVICE": 0.92,
+    "MESH": 0.95,
     "REVIEW": 0.86,
     "DOCTOR": 0.94,
     "DEBUG": 0.88,
@@ -171,6 +181,7 @@ _INTENT_REASON = {
     "GATE": "Ground-truth verification gate keywords detected",
     "MEMORY": "Historical timeline, workstream query, or memory recall keywords detected",
     "DEVICE": "Mobile phone, SMS, or Android relay bridge keywords detected",
+    "MESH": "Agent Mesh MCP, swarm coordination, or playbook orchestration keywords detected",
     "REVIEW": "Code review requested (will extract current git diff)",
     "DOCTOR": "System health, platform audit, or doctor keywords detected",
     "DEBUG": "Runtime exception, compiler diagnostics, or debugging keywords detected",
@@ -181,6 +192,7 @@ _INTENT_MODE = {
     "GATE": "gate",
     "MEMORY": "memory",
     "DEVICE": "device",
+    "MESH": "mesh",
     "REVIEW": "review_diff",
     "DOCTOR": "doctor",
     "DEBUG": "debug",
@@ -192,6 +204,7 @@ _INTENT_ENGINE = {
     "MEMORY": "pieces",
     "DEVICE": "hermes",
     "DOCTOR": "auto",
+    "MESH": "mesh",
 }
 
 
@@ -268,6 +281,8 @@ def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[s
         scores["ARCHITECT"] = _SCORE_WEIGHTS["ARCHITECT"]
     if _DEVICE_RE.search(lowered_prompt):
         scores["DEVICE"] = _SCORE_WEIGHTS["DEVICE"]
+    if _MESH_RE.search(lowered_prompt):
+        scores["MESH"] = _SCORE_WEIGHTS["MESH"]
 
     if scores:
         winner = max(scores, key=lambda k: (scores[k], _SCORE_WEIGHTS.get(k, 0)))
@@ -280,7 +295,7 @@ def classify_intent(prompt: str, context: Optional[str] = None, diff: Optional[s
             reason=_INTENT_REASON.get(winner, "Scored intent match"),
             suggested_mode=_INTENT_MODE.get(winner, "general"),
             suggested_engine=_INTENT_ENGINE.get(winner, _council_engine(high_stakes)),
-            high_stakes=high_stakes if winner not in ("MEMORY", "DEVICE", "DOCTOR") else False,
+            high_stakes=high_stakes if winner not in ("MEMORY", "DEVICE", "DOCTOR", "MESH") else False,
             metadata=meta,
         )
 
@@ -322,6 +337,10 @@ def execute_intent(classification: IntentClassification, raw_prompt: str, args: 
         from triad import triad_engine
     except ImportError:
         import triad_engine
+
+    if intent == "MESH":
+        triad_engine.cmd_mesh(args)
+        return
 
     if intent == "DOCTOR":
         triad_engine.cmd_doctor(args)

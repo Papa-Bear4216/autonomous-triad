@@ -59,6 +59,13 @@ class TestIntentEngine(unittest.TestCase):
         self.assertEqual(res.suggested_engine, "pieces")
         self.assertGreaterEqual(res.confidence, 0.85)
 
+    def test_classify_mesh(self):
+        res = classify_intent("Check the agent mesh status and peer channels")
+        self.assertEqual(res.intent, "MESH")
+        self.assertEqual(res.suggested_mode, "mesh")
+        self.assertEqual(res.suggested_engine, "mesh")
+        self.assertGreaterEqual(res.confidence, 0.90)
+
     def test_classify_doctor(self):
         res = classify_intent("triad doctor check system health and subscriptions")
         self.assertEqual(res.intent, "DOCTOR")
