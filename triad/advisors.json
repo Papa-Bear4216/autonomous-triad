@@ -11,7 +11,12 @@
         "--tools=",
         "--strict-mcp-config",
         "--mcp-config",
-        "{empty_mcp}"
+        "{empty_mcp}",
+        "--setting-sources",
+        "",
+        "--system-prompt",
+        "You are a rigorous senior engineering advisor. Follow the instructions in the user message exactly.",
+        "--disable-slash-commands"
       ],
       "input_mode": "stdin",
       "output_mode": "stdout",
