@@ -18,10 +18,12 @@ import hashlib
 import json
 import time
 import urllib.parse
+import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 try:
     from triad import __version__ as TRIAD_VERSION
@@ -274,6 +276,235 @@ def get_telemetry_summary(limit: int = 50) -> Dict[str, Any]:
     }
 
 
+_MAX_SCAN_CHARS = 256 * 1024
+_SEG_SPLIT = re.compile(r"[;&|\n]+")
+_TOKEN = re.compile(r"[^\s\"'`()\[\]{}<>,]+")
+_GIT_VALUE_OPTS = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+
+_KEYWORD_DESTRUCTIVE = re.compile(
+    r"(?<![a-z0-9])(?:delet|drop|destroy|truncat|wip|purg|eras|uninstall|kill|rmdir|rmtree|unlink|mkfs|shred|rimraf)"
+    r"|(?:^|[^a-z0-9])(?:pkill|killall|wipefs|dd\s+(?:if|of)=)",
+    re.I,
+)
+
+_DEVICE_ACTUATION = re.compile(
+    r"(?<![a-z0-9])(?:tap|click|swipe|press|type|input|send|call|install|reset|reboot|restart|"
+    r"shutdown|power|set|enable|disable|unlock|lock|launch|open|pay|format|flash|push|pull)",
+    re.I,
+)
+
+_READONLY_DEVICE_PATTERN = re.compile(
+    r"\b(?:status|battery|list|show|get|read|check|screenshot|inspect|health)\b",
+    re.I,
+)
+
+
+_DASH_RE = re.compile(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]")
+_RM = {"rm", "remove-item", "del", "rd", "rmdir"}
+
+
+def _cmd(tok: str) -> str:
+    """Normalize command token: strip leading backslashes, path prefixes, and .exe extension."""
+    tok = tok.lstrip("\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return tok[:-4] if tok.endswith(".exe") else tok
+
+
+def _git_sub(rest: List[str]) -> Tuple[str, List[str]]:
+    """Extract git subcommand skipping global flags and flag values (like -C repo)."""
+    i = 0
+    while i < len(rest):
+        x = rest[i]
+        if x in _GIT_VALUE_OPTS:
+            i += 2
+            continue
+        if x.startswith("-"):
+            i += 1
+            continue
+        return x, rest[i + 1:]
+    return "", []
+
+
+def _git_sub_destructive(sub: str, args: List[str]) -> bool:
+    """Check if git subcommand and arguments constitute a destructive operation."""
+    flags = [x for x in args if x.startswith(("-", "+", ":"))]
+    if sub == "reset":
+        return "--hard" in flags or "--merge" in flags
+    if sub == "clean":
+        return any(f == "--force" or (f.startswith("-") and not f.startswith("--") and "f" in f) for f in flags)
+    if sub == "push":
+        return any(
+            f.startswith("--force")
+            or f.startswith("+")
+            or (f.startswith("-") and not f.startswith("--") and ("f" in f or "d" in f))
+            or f.startswith(":")
+            or f in ("--delete", "--mirror", "--prune")
+            for f in args
+        )
+    if sub == "switch":
+        return any(f in ("-f", "--force", "--discard-changes") for f in flags)
+    if sub == "branch":
+        return any(
+            f in ("-d", "--delete", "-f", "--force")
+            or (f.startswith("-") and not f.startswith("--") and ("d" in f or "f" in f))
+            for f in flags
+        )
+    if sub == "tag":
+        return any(f in ("-d", "--delete") for f in flags)
+    if sub == "stash":
+        return any(a in ("clear", "drop") for a in args)
+    if sub in ("rebase", "filter-branch"):
+        return True
+    if sub == "reflog":
+        return "expire" in args
+    if sub == "worktree":
+        return any(f in ("-f", "--force") for f in flags) and any(a in ("remove", "prune") for a in args)
+    if sub == "gc":
+        return any(a.startswith("--prune") for a in args)
+    if sub == "update-ref":
+        return any(f in ("-d", "--delete") for f in flags)
+    if sub == "restore":
+        # Only pure staged-only restore is non-destructive to worktree (e.g. unstage)
+        # Any restore touching worktree or restoring files directly discards worktree modifications
+        return set(flags) != {"--staged"}
+    if sub == "checkout":
+        if "--" in args or "." in args or any(f in ("-f", "--force", "--ours", "--theirs", "-p", "--patch") for f in flags):
+            return True
+        positionals = [a for a in args if not a.startswith("-")]
+        # e.g. `git checkout HEAD <file>` discards working-tree changes
+        return len(positionals) > 1 and "-b" not in flags
+    return False
+
+
+def _git_destructive(tokens: List[str]) -> bool:
+    """Check git invocations in linear time across whole token list."""
+    idxs = [i for i, t in enumerate(tokens) if _cmd(t) == "git"]
+    for n, i in enumerate(idxs):
+        end = idxs[n + 1] if n + 1 < len(idxs) else len(tokens)
+        sub, args = _git_sub(tokens[i + 1:end])
+        if _git_sub_destructive(sub, args):
+            return True
+    return False
+
+
+def _shell_destructive(tokens: List[str]) -> bool:
+    """Check rm, PowerShell, and cmd destructive file deletions in linear time."""
+    idxs = [i for i, t in enumerate(tokens) if _cmd(t) in _RM]
+    for n, i in enumerate(idxs):
+        end = idxs[n + 1] if n + 1 < len(idxs) else len(tokens)
+        cmd_name, args = _cmd(tokens[i]), tokens[i + 1:end]
+        if cmd_name == "rm":
+            if any(f == "--recursive" or (f.startswith("-") and not f.startswith("--") and "r" in f) for f in args):
+                return True
+        elif cmd_name in ("del", "rd", "rmdir"):
+            lowered = [a.lower() for a in args]
+            if any(a in ("/s", "/q", "/f", "/s/q", "/q/s") for a in lowered):
+                return True
+        elif cmd_name == "remove-item":
+            lowered = [a.lower() for a in args]
+            if any(a in ("-r", "-recurse", "-force") or a.startswith("-rec") for a in lowered):
+                return True
+    return False
+
+
+def _scan_for_destructive_commands(text: str) -> bool:
+    """Scan text across linear token segments and bounded keywords."""
+    if _KEYWORD_DESTRUCTIVE.search(text):
+        return True
+    segments = _SEG_SPLIT.split(text)
+    for seg in segments:
+        tokens = _TOKEN.findall(seg)
+        if not tokens:
+            continue
+        if _git_destructive(tokens) or _shell_destructive(tokens):
+            return True
+    return False
+
+
+def _normalize_text(*parts: Optional[str]) -> Tuple[str, bool]:
+    raw = "\n".join(p or "" for p in parts)
+    raw = raw.replace("\\\r\n", " ").replace("\\\n", " ")
+    oversized = len(raw) > _MAX_SCAN_CHARS
+    truncated = raw[:_MAX_SCAN_CHARS]
+    normalized = unicodedata.normalize("NFKC", truncated)
+    cleaned = _DASH_RE.sub("-", normalized)
+    if not cleaned.isascii():
+        cleaned = "".join(c for c in cleaned if unicodedata.category(c) != "Cf")
+    return re.sub(r"[^\S\n]+", " ", cleaned).casefold(), oversized
+
+
+def _evaluate_action_risk(
+    classification: Any,
+    text: Optional[str] = "",
+    context: Optional[str] = "",
+    diff: Optional[str] = ""
+) -> Tuple[str, bool, List[str]]:
+    """
+    Evaluate risk tier and 1-tap approval requirement for autonomous loop gating.
+    Fails closed: any error, missing required attribute, oversized input, or destructive command triggers ('high', True).
+    Returns (risk_level, approval_required, risk_reasons).
+    """
+    reasons: List[str] = []
+
+    try:
+        high_stakes = getattr(classification, "high_stakes", None)
+        if high_stakes is None:
+            raise AttributeError("classification object missing required high_stakes attribute")
+        if bool(high_stakes):
+            reasons.append("high_stakes_domain")
+
+        norm_prompt, prompt_oversized = _normalize_text(text)
+        if prompt_oversized:
+            reasons.append("oversized_input")
+
+        if _scan_for_destructive_commands(norm_prompt):
+            reasons.append("destructive_instruction")
+
+        if context:
+            norm_ctx, ctx_oversized = _normalize_text(context)
+            if ctx_oversized and "oversized_input" not in reasons:
+                reasons.append("oversized_input")
+            if _scan_for_destructive_commands(norm_ctx) and "destructive_instruction" not in reasons:
+                reasons.append("destructive_payload")
+
+        intent_raw = getattr(classification, "intent", "")
+        intent = str(getattr(intent_raw, "value", intent_raw) or "").upper()
+
+        if diff:
+            if intent in ("REVIEW", "GATE"):
+                diff_to_scan = "\n".join(
+                    line[1:] for line in diff.splitlines()
+                    if line.startswith("+") and not line.startswith("+++")
+                )
+            else:
+                diff_to_scan = diff
+
+            if diff_to_scan:
+                norm_diff, diff_oversized = _normalize_text(diff_to_scan)
+                if diff_oversized and "oversized_input" not in reasons:
+                    reasons.append("oversized_input")
+                if _scan_for_destructive_commands(norm_diff) and "destructive_payload" not in reasons:
+                    reasons.append("destructive_payload")
+
+        if reasons:
+            return "high", True, reasons
+
+        if intent in ("MEMORY", "DOCTOR", "MICRO", "ARCHITECT", "GENERAL", "GATE", "REVIEW"):
+            return "low", False, []
+
+        if intent == "DEVICE":
+            if _READONLY_DEVICE_PATTERN.search(norm_prompt) and not _DEVICE_ACTUATION.search(norm_prompt):
+                return "low", False, []
+            return "medium", True, ["device_actuation"]
+
+        if intent == "MESH":
+            return "medium", False, []
+
+        return "medium", True, ["unclassified_intent"]
+
+    except Exception as e:
+        return "high", True, [f"risk_eval_error:{type(e).__name__}"]
+
+
 class TriadRequestHandler(BaseHTTPRequestHandler):
     """Multi-threaded request handler for Triad Ambient HTTP Bridge."""
 
@@ -494,29 +725,73 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
         if body.get("v") != 1 or body.get("to") != "autonomous-triad":
             self._send_json(400, {"error": "envelope is not addressed to autonomous-triad"})
             return
-        action = body.get("action")
+        envelope_id = body.get("id", "")
+        sender = body.get("from", "")
+        action = body.get("action", "")
+        capability = body.get("capability", "")
+        payload = body.get("payload") or {}
+
         if action == "ping":
-            result = {"node": "autonomous-triad", "host": "lubuntu", "action": "ping"}
-        elif action == "classify":
-            text = body.get("payload", {}).get("text", "") if isinstance(body.get("payload"), dict) else ""
-            if not isinstance(text, str) or not text.strip():
-                self._send_json(400, {"error": "classify requires payload.text"})
-                return
-            classified = classify_intent(text[:8000])
-            result = {"intent": getattr(classified, "intent", None), "mode": getattr(classified, "mode", None)}
-            if hasattr(classified, "__dict__"):
-                result = {k: v for k, v in classified.__dict__.items() if isinstance(v, (str, int, float, bool, type(None)))}
-        else:
-            self._send_json(400, {"error": "autonomous-triad accepts ping or classify"})
+            self._send_json(200, {
+                "v": 1,
+                "inReplyTo": envelope_id,
+                "from": "autonomous-triad",
+                "to": sender,
+                "ok": True,
+                "result": {
+                    "status": "ok",
+                    "service": "autonomous-triad",
+                    "node": "autonomous-triad",
+                    "host": "lubuntu",
+                    "action": "ping"
+                }
+            })
             return
-        self._send_json(200, {
+
+        if action == "classify":
+            raw_text = str(payload.get("text") or payload.get("prompt") or "").strip()
+            effective_text = raw_text or "status"
+            context = str(payload.get("context") or "")
+            diff = str(payload.get("diff") or "")
+            classification = classify_intent(effective_text, context=context, diff=diff)
+            risk_level, approval_required, risk_reasons = _evaluate_action_risk(classification, effective_text, context, diff)
+            res_dict = {
+                "intent": classification.intent,
+                "mode": getattr(classification, "suggested_mode", None),
+                "confidence": classification.confidence,
+                "reason": classification.reason,
+                "suggested_engine": classification.suggested_engine,
+                "suggested_mode": classification.suggested_mode,
+                "high_stakes": bool(getattr(classification, "high_stakes", True)),
+                "risk_level": risk_level,
+                "approval_required": approval_required,
+                "risk_reasons": risk_reasons,
+            }
+            if hasattr(classification, "__dict__"):
+                for k, v in classification.__dict__.items():
+                    if k not in res_dict and isinstance(v, (str, int, float, bool, type(None))):
+                        res_dict[k] = v
+
+            self._send_json(200, {
+                "v": 1,
+                "inReplyTo": envelope_id,
+                "from": "autonomous-triad",
+                "to": sender,
+                "ok": True,
+                "result": res_dict,
+            })
+            return
+
+        self._send_json(400, {
             "v": 1,
-            "inReplyTo": body.get("id"),
+            "inReplyTo": envelope_id,
             "from": "autonomous-triad",
-            "to": body.get("from"),
-            "ok": True,
-            "result": result,
+            "to": sender,
+            "ok": False,
+            "error": f"Unknown mishmash action: {action}"
         })
+
+    _handle_mishmash_delegate = _handle_delegate
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)

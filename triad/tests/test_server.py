@@ -325,6 +325,269 @@ class TestTriadServer(unittest.TestCase):
         self.assertEqual(body["from"], "autonomous-triad")
         self.assertIn("intent", body["result"])
 
+    def test_mishmash_delegate_classify_and_risk_gating(self):
+        status, _, body = self._post("/mishmash/delegate", {
+            "v": 1,
+            "id": "test-env-0001",
+            "from": "test-client",
+            "to": "autonomous-triad",
+            "capability": "intent",
+            "action": "ping",
+            "payload": {},
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body.get("result", {}).get("status"), "ok")
+
+        status, _, body = self._post("/mishmash/delegate", {
+            "v": 1,
+            "id": "test-env-0002",
+            "from": "test-client",
+            "to": "autonomous-triad",
+            "capability": "intent",
+            "action": "classify",
+            "payload": {"text": "what did i do on Monday?"},
+        })
+        self.assertEqual(status, 200)
+        res = body.get("result", {})
+        self.assertEqual(res.get("intent"), "MEMORY")
+        self.assertEqual(res.get("risk_level"), "low")
+        self.assertFalse(res.get("approval_required"))
+
+        status, _, body = self._post("/mishmash/delegate", {
+            "v": 1,
+            "id": "test-env-0003",
+            "from": "test-client",
+            "to": "autonomous-triad",
+            "capability": "intent",
+            "action": "classify",
+            "payload": {"text": "run database migration for auth tokens"},
+        })
+        self.assertEqual(status, 200)
+        res = body.get("result", {})
+        self.assertTrue(res.get("high_stakes"))
+        self.assertEqual(res.get("risk_level"), "high")
+        self.assertTrue(res.get("approval_required"))
+
+    def test_evaluate_action_risk_unit(self):
+        import types
+        from triad.server import _evaluate_action_risk
+        from triad.intent_engine import classify_intent
+
+        # 1. Destructive command in GENERAL intent must fail closed to high risk
+        cls_general = types.SimpleNamespace(intent="GENERAL", high_stakes=False)
+        risk, approval, reasons = _evaluate_action_risk(cls_general, "rm -rf /")
+        self.assertEqual(risk, "high")
+        self.assertTrue(approval)
+        self.assertIn("destructive_instruction", reasons)
+
+        # 2. Windows PowerShell / cmd destructive commands
+        risk_ps, app_ps, _ = _evaluate_action_risk(cls_general, "Remove-Item -Recurse -Force C:\\Windows")
+        self.assertEqual(risk_ps, "high")
+        self.assertTrue(app_ps)
+
+        risk_del, app_del, _ = _evaluate_action_risk(cls_general, "del /s /q *.dat")
+        self.assertEqual(risk_del, "high")
+        self.assertTrue(app_del)
+
+        # 3. Git clean and force push variations
+        risk_clean, app_clean, _ = _evaluate_action_risk(cls_general, "git clean -fd")
+        self.assertEqual(risk_clean, "high")
+        self.assertTrue(app_clean)
+
+        risk_push, app_push, _ = _evaluate_action_risk(cls_general, "git push origin +main")
+        self.assertEqual(risk_push, "high")
+        self.assertTrue(app_push)
+
+        # 4. DEVICE intent allowlist: read-only queries are low-risk
+        cls_device = types.SimpleNamespace(intent="DEVICE", high_stakes=False)
+        risk, approval, _ = _evaluate_action_risk(cls_device, "read battery status and show screen info")
+        self.assertEqual(risk, "low")
+        self.assertFalse(approval)
+
+        # 5. DEVICE intent active actuation requires approval
+        risk, approval, reasons = _evaluate_action_risk(cls_device, "tap screen to open settings")
+        self.assertEqual(risk, "medium")
+        self.assertTrue(approval)
+        self.assertIn("device_actuation", reasons)
+
+        # 6. Instruction vs material: REVIEW of a diff that has 'delete' stays low-risk read-only
+        cls_review = types.SimpleNamespace(intent="REVIEW", high_stakes=False)
+        risk, approval, _ = _evaluate_action_risk(cls_review, text="review this pull request", diff="--- a/file\n+++ b/file\n-delete_old_records()")
+        self.assertEqual(risk, "low")
+        self.assertFalse(approval)
+
+        # 7. But if review prompt instruction itself asks to delete, it triggers high
+        risk_del_inst, app_del_inst, _ = _evaluate_action_risk(cls_review, text="delete the repository after review")
+        self.assertEqual(risk_del_inst, "high")
+        self.assertTrue(app_del_inst)
+
+        # 8. Real classifier return type compatibility
+        real_cls = classify_intent("what did i do on Monday?")
+        risk, approval, _ = _evaluate_action_risk(real_cls, "what did i do on Monday?")
+        self.assertEqual(risk, "low")
+        self.assertFalse(approval)
+
+        # 9. high_stakes=True overrides every intent
+        cls_high = types.SimpleNamespace(intent="MEMORY", high_stakes=True)
+        risk, approval, reasons = _evaluate_action_risk(cls_high, "recall past work")
+        self.assertEqual(risk, "high")
+        self.assertTrue(approval)
+        self.assertIn("high_stakes_domain", reasons)
+
+        # 10. Oversized input fails closed with oversized_input flag
+        risk_ov, app_ov, reasons_ov = _evaluate_action_risk(cls_general, "a" * 300_000)
+        self.assertEqual(risk_ov, "high")
+        self.assertTrue(app_ov)
+        self.assertIn("oversized_input", reasons_ov)
+
+        # 11. Pathological input timing test (linear token scan completes well within bound)
+        import time
+        start_t = time.perf_counter()
+        _evaluate_action_risk(cls_general, "git clean " * 20_000)
+        elapsed_ms = (time.perf_counter() - start_t) * 1000
+        self.assertLess(elapsed_ms, 2500)
+
+        # 12. DEVICE mixed-verb cases (read-only cannot bypass active actuation)
+        risk_mix, app_mix, _ = _evaluate_action_risk(cls_device, "factory reset the phone and check status")
+        self.assertEqual(risk_mix, "medium")
+        self.assertTrue(app_mix)
+
+        # 13. rm flag order variations
+        risk_rm1, app_rm1, _ = _evaluate_action_risk(cls_general, "rm /tmp/x -rf")
+        self.assertEqual(risk_rm1, "high")
+        self.assertTrue(app_rm1)
+
+        risk_rm2, app_rm2, _ = _evaluate_action_risk(cls_general, "rm --recursive --force /var/data")
+        self.assertEqual(risk_rm2, "high")
+        self.assertTrue(app_rm2)
+
+        # 14. Git remote ref deletion (e.g. :main)
+        risk_del_ref, app_del_ref, _ = _evaluate_action_risk(cls_general, "git push origin :main")
+        self.assertEqual(risk_del_ref, "high")
+        self.assertTrue(app_del_ref)
+
+        # 15. Git global options with value (-C repo)
+        risk_git_c, app_git_c, _ = _evaluate_action_risk(cls_general, "git -C /path/to/repo reset --hard")
+        self.assertEqual(risk_git_c, "high")
+        self.assertTrue(app_git_c)
+
+        # 16. Markdown backtick wrapped commands
+        risk_bt, app_bt, _ = _evaluate_action_risk(cls_general, "run `git reset --hard` now")
+        self.assertEqual(risk_bt, "high")
+        self.assertTrue(app_bt)
+
+        # 17. Windows PowerShell Remove-Item with -r / -Recurse
+        risk_pw, app_pw, _ = _evaluate_action_risk(cls_general, "Remove-Item -r C:\\sandbox")
+        self.assertEqual(risk_pw, "high")
+        self.assertTrue(app_pw)
+
+        # 18. git restore worktree vs staged: only pure staged unstage is non-destructive
+        risk_rest_w, app_rest_w, _ = _evaluate_action_risk(cls_general, "git restore --staged --worktree .")
+        self.assertEqual(risk_rest_w, "high")
+        self.assertTrue(app_rest_w)
+
+        risk_rest_p, app_rest_p, _ = _evaluate_action_risk(cls_general, "git restore file.txt")
+        self.assertEqual(risk_rest_p, "high")
+        self.assertTrue(app_rest_p)
+
+        risk_rest_s, app_rest_s, _ = _evaluate_action_risk(cls_general, "git restore --staged file.txt")
+        self.assertEqual(risk_rest_s, "low")
+        self.assertFalse(app_rest_s)
+
+        # 19. git checkout HEAD <file> vs git checkout <branch>
+        risk_co_head, app_co_head, _ = _evaluate_action_risk(cls_general, "git checkout HEAD file.txt")
+        self.assertEqual(risk_co_head, "high")
+        self.assertTrue(app_co_head)
+
+        risk_co_dash, app_co_dash, _ = _evaluate_action_risk(cls_general, "git checkout -- file.txt")
+        self.assertEqual(risk_co_dash, "high")
+        self.assertTrue(app_co_dash)
+
+        risk_co_br, app_co_br, _ = _evaluate_action_risk(cls_general, "git checkout main")
+        self.assertEqual(risk_co_br, "low")
+        self.assertFalse(app_co_br)
+
+        risk_co_nb, app_co_nb, _ = _evaluate_action_risk(cls_general, "git checkout -b feature/cool")
+        self.assertEqual(risk_co_nb, "low")
+        self.assertFalse(app_co_nb)
+
+        # 20. Device actuation matches underscores and digits
+        risk_tap, app_tap, r_tap = _evaluate_action_risk(cls_device, "check tap_screen")
+        self.assertEqual(risk_tap, "medium")
+        self.assertTrue(app_tap)
+        self.assertIn("device_actuation", r_tap)
+
+        risk_swp, app_swp, r_swp = _evaluate_action_risk(cls_device, "inspect swipe_up")
+        self.assertEqual(risk_swp, "medium")
+        self.assertTrue(app_swp)
+        self.assertIn("device_actuation", r_swp)
+
+        # 21. Missing high_stakes attribute fails closed
+        cls_missing = types.SimpleNamespace(intent="GENERAL")
+        risk_m, app_m, reasons_m = _evaluate_action_risk(cls_missing, "echo safe")
+        self.assertEqual(risk_m, "high")
+        self.assertTrue(app_m)
+        self.assertTrue(any("risk_eval_error" in r for r in reasons_m))
+
+        # 22. REVIEW/GATE context scanning vs diff material isolation
+        cls_rev = types.SimpleNamespace(intent="REVIEW", high_stakes=False)
+        risk_ctx, app_ctx, _ = _evaluate_action_risk(cls_rev, text="review this pull request", context="then run rm -rf /")
+        self.assertEqual(risk_ctx, "high")
+        self.assertTrue(app_ctx)
+
+        risk_diff, app_diff, _ = _evaluate_action_risk(cls_rev, text="review this pull request", diff="--- a/f\n+++ b/f\n-rm -rf /")
+        self.assertEqual(risk_diff, "low")
+        self.assertFalse(app_diff)
+
+        # 23. Quadratic shell input regression: bounded slice ensures linear O(N) scaling
+        t_rm = time.perf_counter()
+        _evaluate_action_risk(cls_general, "rm " * 80_000)
+        elapsed_rm = (time.perf_counter() - t_rm) * 1000
+        self.assertLess(elapsed_rm, 2500)
+
+        t_del = time.perf_counter()
+        _evaluate_action_risk(cls_general, "del " * 60_000)
+        elapsed_del = (time.perf_counter() - t_del) * 1000
+        self.assertLess(elapsed_del, 2500)
+
+        # 24. git push -d short flag for remote deletion
+        risk_push_d, app_push_d, _ = _evaluate_action_risk(cls_general, "git push -d origin old-feature")
+        self.assertEqual(risk_push_d, "high")
+        self.assertTrue(app_push_d)
+
+        # 25. git switch -f and --discard-changes
+        risk_sw_f, app_sw_f, _ = _evaluate_action_risk(cls_general, "git switch -f experiment")
+        self.assertEqual(risk_sw_f, "high")
+        self.assertTrue(app_sw_f)
+
+        risk_sw_d, app_sw_d, _ = _evaluate_action_risk(cls_general, "git switch --discard-changes main")
+        self.assertEqual(risk_sw_d, "high")
+        self.assertTrue(app_sw_d)
+
+        # 26. git checkout --ours / --theirs
+        risk_co_ours, app_co_ours, _ = _evaluate_action_risk(cls_general, "git checkout --ours conflicted.txt")
+        self.assertEqual(risk_co_ours, "high")
+        self.assertTrue(app_co_ours)
+
+        # 27. Line continuation bypass resistance (git reset \\\n--hard)
+        risk_cont, app_cont, _ = _evaluate_action_risk(cls_general, "git reset \\\n--hard")
+        self.assertEqual(risk_cont, "high")
+        self.assertTrue(app_cont)
+
+        # 28. Unicode dash normalization (en-dash \u2013 in rm –rf /)
+        risk_dash, app_dash, _ = _evaluate_action_risk(cls_general, "rm \u2013rf /")
+        self.assertEqual(risk_dash, "high")
+        self.assertTrue(app_dash)
+
+        # 29. REVIEW intent detects destructive added lines (+) in diff
+        risk_diff_add, app_diff_add, reasons_add = _evaluate_action_risk(
+            cls_rev, text="review this PR", diff="--- a/script.sh\n+++ b/script.sh\n+rm -rf /"
+        )
+        self.assertEqual(risk_diff_add, "high")
+        self.assertTrue(app_diff_add)
+        self.assertIn("destructive_payload", reasons_add)
+
 
 class TestResolveRepoPathContainment(unittest.TestCase):
     def test_allowlist_enforced_inside_resolver(self):
