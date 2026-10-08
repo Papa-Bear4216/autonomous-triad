@@ -486,9 +486,54 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
             return None
         return body
 
+    def _is_loopback(self) -> bool:
+        host = self.client_address[0] if self.client_address else ""
+        return host in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def _handle_delegate(self, body: Dict[str, Any]):
+        if body.get("v") != 1 or body.get("to") != "autonomous-triad":
+            self._send_json(400, {"error": "envelope is not addressed to autonomous-triad"})
+            return
+        action = body.get("action")
+        if action == "ping":
+            result = {"node": "autonomous-triad", "host": "lubuntu", "action": "ping"}
+        elif action == "classify":
+            text = body.get("payload", {}).get("text", "") if isinstance(body.get("payload"), dict) else ""
+            if not isinstance(text, str) or not text.strip():
+                self._send_json(400, {"error": "classify requires payload.text"})
+                return
+            classified = classify_intent(text[:8000])
+            result = {"intent": getattr(classified, "intent", None), "mode": getattr(classified, "mode", None)}
+            if hasattr(classified, "__dict__"):
+                result = {k: v for k, v in classified.__dict__.items() if isinstance(v, (str, int, float, bool, type(None)))}
+        else:
+            self._send_json(400, {"error": "autonomous-triad accepts ping or classify"})
+            return
+        self._send_json(200, {
+            "v": 1,
+            "inReplyTo": body.get("id"),
+            "from": "autonomous-triad",
+            "to": body.get("from"),
+            "ok": True,
+            "result": result,
+        })
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        if path == "/mishmash/delegate":
+            if not self._is_loopback():
+                self._send_json(403, {"error": "delegate is only accepted from this PC"})
+                return
+            body = self._read_json_body()
+            if body is None:
+                return
+            try:
+                self._handle_delegate(body)
+            except Exception as e:
+                self._send_json(500, {"error": f"Internal error: {e}"})
+            return
 
         if path not in ("/auto", "/review", "/action/approve", "/action/reject"):
             self._send_json(404, {"error": "Not Found", "path": path})

@@ -310,6 +310,21 @@ class TestTriadServer(unittest.TestCase):
             self.assertNotIn("binary_path", adv)
             self.assertIn("name", adv)
 
+    def test_loopback_delegate_classifies_without_leaving_the_pc(self):
+        status, _headers, body = self._post("/mishmash/delegate", {
+            "v": 1,
+            "id": "0123456789abcdef",
+            "from": "pieces-android-companion-seamless",
+            "to": "autonomous-triad",
+            "capability": "intent",
+            "action": "classify",
+            "payload": {"text": "review this diff"},
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["from"], "autonomous-triad")
+        self.assertIn("intent", body["result"])
+
 
 class TestResolveRepoPathContainment(unittest.TestCase):
     def test_allowlist_enforced_inside_resolver(self):
