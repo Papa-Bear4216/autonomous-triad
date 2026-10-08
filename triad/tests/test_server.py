@@ -17,6 +17,7 @@ import urllib.request
 import urllib.error
 import threading
 import unittest
+from unittest.mock import patch, MagicMock
 from http.server import ThreadingHTTPServer
 
 from triad.server import TriadRequestHandler
@@ -293,10 +294,162 @@ class TestTriadServer(unittest.TestCase):
             self.assertEqual(body.get("status"), "approved")
             self.assertFalse(body.get("patch_applied"))
 
+            # Mixed inputs: proposal_id and patch_file together -> 400
+            status, _, body = self._post("/action/approve", {
+                "proposal_id": "prop_12345",
+                "nonce": "testnonce12345",
+                "patch_file": "some_patch.patch"
+            }, extra_headers=auth_headers)
+            self.assertEqual(status, 400)
+            self.assertIn("cannot provide both", body.get("error", ""))
+
+            # Proposal approve missing nonce -> 400
+            status, _, body = self._post("/action/approve", {
+                "proposal_id": "prop_12345"
+            }, extra_headers=auth_headers)
+            self.assertEqual(status, 400)
+            self.assertIn("nonce", body.get("error", ""))
+
+            # Unreachable upstream -> 502 fail closed (isolated on unused ephemeral port)
+            with patch.dict(os.environ, {"REGISTRY_APP_UPSTREAM": "http://127.0.0.1:59999"}):
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "testnonce12345"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 502)
+                self.assertFalse(body.get("ok"))
+                self.assertEqual(body.get("status"), "release_failed")
+
+            # Upstream HTTPError 403 (invalid nonce) -> 409 mapped release_failed with upstream_status 403
+            import io
+            err_403 = urllib.error.HTTPError("http://127.0.0.1:39403", 403, "Forbidden", {}, io.BytesIO(b"{}"))
+            with patch("triad.server._OPENER.open", side_effect=err_403):
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "bad_nonce"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 409)
+                self.assertFalse(body.get("ok"))
+                self.assertEqual(body.get("status"), "release_failed")
+                self.assertEqual(body.get("upstream_status"), 403)
+
+            # Upstream HTTPError 500 -> 504 release_unknown fail closed
+            err_500 = urllib.error.HTTPError("http://127.0.0.1:39403", 500, "Internal Server Error", {}, io.BytesIO(b"{}"))
+            with patch("triad.server._OPENER.open", side_effect=err_500):
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "server_err_nonce"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 504)
+                self.assertFalse(body.get("ok"))
+                self.assertEqual(body.get("status"), "release_unknown")
+                self.assertEqual(body.get("upstream_status"), 500)
+
+            # Upstream timeout -> 504 release_unknown
+            with patch("triad.server._OPENER.open", side_effect=TimeoutError("timed out")):
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "timeout_nonce"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 504)
+                self.assertFalse(body.get("ok"))
+                self.assertEqual(body.get("status"), "release_unknown")
+
+            # ConnectionResetError after send -> 504 release_unknown
+            with patch("triad.server._OPENER.open", side_effect=ConnectionResetError("connection reset")):
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "reset_nonce"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 504)
+                self.assertFalse(body.get("ok"))
+                self.assertEqual(body.get("status"), "release_unknown")
+
+            # Malformed ID format (nonce with space) -> 400 without calling opener
+            with patch("triad.server._OPENER.open") as mock_opener:
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "bad nonce with space"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 400)
+                mock_opener.assert_not_called()
+
+            # Malformed biometric_attestation (non-string) -> 400 without calling opener
+            with patch("triad.server._OPENER.open") as mock_opener:
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "good_nonce",
+                    "biometric_attestation": 123456
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 400)
+                mock_opener.assert_not_called()
+
+            # Non-loopback REGISTRY_APP_UPSTREAM -> 502 unreachable
+            with patch.dict(os.environ, {"REGISTRY_APP_UPSTREAM": "http://evil-proxy.com:39403"}):
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "good_nonce"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 502)
+                self.assertFalse(body.get("ok"))
+
+            # Upstream 200 with ok: false -> 409 release_rejected
+            mock_rej_resp = MagicMock()
+            mock_rej_resp.read.return_value = json.dumps({"ok": False, "error": "Nonce expired"}).encode("utf-8")
+            mock_rej_resp.__enter__.return_value = mock_rej_resp
+            with patch("triad.server._OPENER.open", return_value=mock_rej_resp):
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "expired_nonce"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 409)
+                self.assertFalse(body.get("ok"))
+                self.assertEqual(body.get("status"), "release_rejected")
+
+            # Upstream success 200 -> 200
+            mock_ok_resp = MagicMock()
+            mock_ok_resp.read.return_value = json.dumps({"ok": True, "result": {"status": "released"}}).encode("utf-8")
+            mock_ok_resp.__enter__.return_value = mock_ok_resp
+            with patch("triad.server._OPENER.open", return_value=mock_ok_resp):
+                status, _, body = self._post("/action/approve", {
+                    "proposal_id": "prop_12345",
+                    "nonce": "good_nonce",
+                    "reason": "Biometric 1-tap confirmation"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 200)
+                self.assertTrue(body.get("ok"))
+                self.assertEqual(body.get("proposal_id"), "prop_12345")
+                self.assertEqual(body.get("status"), "approved")
+
             # Action reject with valid token -> 200
             status, _, body = self._post("/action/reject", {"reason": "Test rejection"}, extra_headers=auth_headers)
             self.assertEqual(status, 200)
             self.assertEqual(body.get("status"), "rejected")
+
+            # Action reject with proposal_id and mocked 200 upstream -> 200
+            mock_purge_resp = MagicMock()
+            mock_purge_resp.read.return_value = json.dumps({"ok": True, "result": {"status": "purged"}}).encode("utf-8")
+            mock_purge_resp.__enter__.return_value = mock_purge_resp
+            with patch("triad.server._OPENER.open", return_value=mock_purge_resp):
+                status, _, body = self._post("/action/reject", {
+                    "proposal_id": "prop_12345",
+                    "reason": "User rejected"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 200)
+                self.assertEqual(body.get("status"), "rejected")
+                self.assertEqual(body.get("proposal_id"), "prop_12345")
+                self.assertTrue(body.get("upstream_notified"))
+
+            # Action reject with upstream failure -> 502 reject_unconfirmed
+            with patch("triad.server._OPENER.open", side_effect=ConnectionRefusedError("connection refused")):
+                status, _, body = self._post("/action/reject", {
+                    "proposal_id": "prop_12345",
+                    "reason": "User rejected"
+                }, extra_headers=auth_headers)
+                self.assertEqual(status, 502)
+                self.assertEqual(body.get("status"), "reject_unconfirmed")
+                self.assertFalse(body.get("upstream_notified"))
+
 
     def test_auto_doctor_sanitizes_advisors(self):
         status, _, body = self._post("/auto", {"prompt": "triad doctor check system health and subscriptions"})
@@ -353,6 +506,7 @@ class TestTriadServer(unittest.TestCase):
         self.assertEqual(res.get("intent"), "MEMORY")
         self.assertEqual(res.get("risk_level"), "low")
         self.assertFalse(res.get("approval_required"))
+        self.assertFalse(res.get("requires_biometric"))
 
         status, _, body = self._post("/mishmash/delegate", {
             "v": 1,
@@ -368,6 +522,101 @@ class TestTriadServer(unittest.TestCase):
         self.assertTrue(res.get("high_stakes"))
         self.assertEqual(res.get("risk_level"), "high")
         self.assertTrue(res.get("approval_required"))
+        self.assertTrue(res.get("requires_biometric"))
+
+        # Test delegate action approve missing args -> 400
+        status, _, body = self._post("/mishmash/delegate", {
+            "v": 1,
+            "id": "test-env-0004",
+            "from": "test-client",
+            "to": "autonomous-triad",
+            "capability": "intent",
+            "action": "approve",
+            "payload": {"proposal_id": "prop_123"},
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(body.get("ok"))
+
+        # Test delegate action approve when SERVER_TOKEN configured without auth -> 401
+        with patch("triad.server.SERVER_TOKEN", "token-xyz"):
+            status, _, body = self._post("/mishmash/delegate", {
+                "v": 1,
+                "id": "test-env-0004b",
+                "from": "test-client",
+                "to": "autonomous-triad",
+                "capability": "intent",
+                "action": "approve",
+                "payload": {"proposal_id": "prop_123", "nonce": "nonce_123"},
+            })
+            self.assertEqual(status, 401)
+            self.assertFalse(body.get("ok"))
+
+        # Test delegate action approve with mocked release -> 200
+        mock_del_resp = MagicMock()
+        mock_del_resp.read.return_value = json.dumps({"ok": True, "result": {"status": "released"}}).encode("utf-8")
+        mock_del_resp.__enter__.return_value = mock_del_resp
+        with patch("triad.server._OPENER.open", return_value=mock_del_resp):
+            status, _, body = self._post("/mishmash/delegate", {
+                "v": 1,
+                "id": "test-env-0005",
+                "from": "test-client",
+                "to": "autonomous-triad",
+                "capability": "intent",
+                "action": "approve",
+                "payload": {"proposal_id": "prop_123", "nonce": "nonce_123"},
+            })
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"))
+            self.assertEqual(body.get("proposal_id"), "prop_123")
+
+        # Test delegate action reject when SERVER_TOKEN configured without auth -> 401
+        with patch("triad.server.SERVER_TOKEN", "token-xyz"):
+            status, _, body = self._post("/mishmash/delegate", {
+                "v": 1,
+                "id": "test-env-0006a",
+                "from": "test-client",
+                "to": "autonomous-triad",
+                "capability": "intent",
+                "action": "reject",
+                "payload": {"proposal_id": "prop_123"},
+            })
+            self.assertEqual(status, 401)
+            self.assertFalse(body.get("ok"))
+
+        # Test delegate action reject with mocked upstream -> 200
+        mock_del_purge = MagicMock()
+        mock_del_purge.read.return_value = json.dumps({"ok": True, "result": {"status": "purged"}}).encode("utf-8")
+        mock_del_purge.__enter__.return_value = mock_del_purge
+        with patch("triad.server._OPENER.open", return_value=mock_del_purge):
+            status, _, body = self._post("/mishmash/delegate", {
+                "v": 1,
+                "id": "test-env-0006",
+                "from": "test-client",
+                "to": "autonomous-triad",
+                "capability": "intent",
+                "action": "reject",
+                "payload": {"proposal_id": "prop_123"},
+            })
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get("ok"))
+            self.assertEqual(body.get("proposal_id"), "prop_123")
+            self.assertTrue(body.get("upstream_notified"))
+
+        # Test delegate action reject with upstream failure -> 502
+        with patch("triad.server._OPENER.open", side_effect=ConnectionRefusedError("connection refused")):
+            status, _, body = self._post("/mishmash/delegate", {
+                "v": 1,
+                "id": "test-env-0007",
+                "from": "test-client",
+                "to": "autonomous-triad",
+                "capability": "intent",
+                "action": "reject",
+                "payload": {"proposal_id": "prop_123"},
+            })
+            self.assertEqual(status, 502)
+            self.assertFalse(body.get("ok"))
+            self.assertEqual(body.get("status"), "reject_unconfirmed")
+            self.assertFalse(body.get("upstream_notified"))
 
     def test_evaluate_action_risk_unit(self):
         import types

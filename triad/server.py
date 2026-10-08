@@ -17,9 +17,14 @@ import hmac
 import hashlib
 import json
 import time
+import socket
 import urllib.parse
+import urllib.request
+import urllib.error
+import logging
 import re
 import unicodedata
+
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -44,6 +49,25 @@ except ImportError:
     from procutil import is_port_open, clean_git_env
     from paths import MEM0_SCRIPT, PORT_HERMES_RELAY, PORT_PIECES_PROXY, PORT_PIECES_OS, PORT_OLLAMA, PORT_TRIAD_SERVER
     from circuit import snapshot_circuits
+
+logger = logging.getLogger("triad.server")
+_ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,128}")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def _upstream_base() -> str:
+    up = os.environ.get("REGISTRY_APP_UPSTREAM", "http://127.0.0.1:39403").rstrip("/")
+    p = urllib.parse.urlparse(up)
+    if p.scheme not in ("http", "https") or p.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("REGISTRY_APP_UPSTREAM must be loopback http(s)")
+    return up
 
 def _safe_int_env(var: str, default: int) -> int:
     try:
@@ -505,6 +529,63 @@ def _evaluate_action_risk(
         return "high", True, [f"risk_eval_error:{type(e).__name__}"]
 
 
+def _registry_call(action: str, payload: Dict[str, Any], timeout: float = 3.0) -> Tuple[str, Any]:
+    """
+    Execute loopback call to registry-app with deterministic deduplication and fail-closed error classification.
+    Returns: (status_type, detail)
+    - ("ok", response_dict)
+    - ("rejected", response_dict)
+    - ("http", http_status_code)
+    - ("unknown", error_str)   # timeout / json decode error / connection reset after send
+    - ("unreachable", error_str)  # connection refused / pre-send network error
+    """
+    try:
+        up = _upstream_base()
+    except ValueError as e:
+        logger.error("Invalid REGISTRY_APP_UPSTREAM configuration: %s", e)
+        return "unreachable", str(e)
+
+    prop_id = str(payload.get("proposalId") or payload.get("proposal_id") or "")
+    nonce_val = str(payload.get("nonce") or "")
+    seed = f"{action}:{prop_id}:{nonce_val}".encode("utf-8")
+    det_id = f"triad-{action[:3]}-{hashlib.sha256(seed).hexdigest()[:16]}"
+    body = json.dumps({
+        "v": 1,
+        "id": det_id,
+        "from": "autonomous-triad",
+        "to": "registry-app",
+        "capability": "staging",
+        "action": action,
+        "payload": payload,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{up}/mishmash/delegate",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with _OPENER.open(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+            data = json.loads(raw)
+        if isinstance(data, dict) and data.get("ok") is True:
+            return "ok", data
+        return "rejected", data
+    except urllib.error.HTTPError as e:
+        code = e.code
+        e.close()
+        return "http", code
+    except urllib.error.URLError as e:
+        r = e.reason
+        if isinstance(r, (ConnectionRefusedError, socket.gaierror)):
+            return "unreachable", str(e)
+        return "unknown", str(e)
+    except ConnectionRefusedError as e:
+        return "unreachable", str(e)
+    except Exception as e:
+        return "unknown", f"{type(e).__name__}: {e}"
+
+
 class TriadRequestHandler(BaseHTTPRequestHandler):
     """Multi-threaded request handler for Triad Ambient HTTP Bridge."""
 
@@ -755,6 +836,10 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
             diff = str(payload.get("diff") or "")
             classification = classify_intent(effective_text, context=context, diff=diff)
             risk_level, approval_required, risk_reasons = _evaluate_action_risk(classification, effective_text, context, diff)
+            # Advisory classification: requires_biometric guides clients to solicit local
+            # biometric authentication before submitting approval for high-risk / device-actuation actions.
+            reasons_set = {str(r) for r in (risk_reasons if isinstance(risk_reasons, (list, tuple, set)) else [risk_reasons])}
+            requires_biometric = (risk_level == "high") or ("device_actuation" in reasons_set)
             res_dict = {
                 "intent": classification.intent,
                 "mode": getattr(classification, "suggested_mode", None),
@@ -765,6 +850,7 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
                 "high_stakes": bool(getattr(classification, "high_stakes", True)),
                 "risk_level": risk_level,
                 "approval_required": approval_required,
+                "requires_biometric": requires_biometric,
                 "risk_reasons": risk_reasons,
             }
             if hasattr(classification, "__dict__"):
@@ -780,6 +866,76 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "result": res_dict,
             })
+            return
+
+        if action == "approve":
+            if SERVER_TOKEN and not self._is_authorized():
+                self._send_json(401, {
+                    "v": 1,
+                    "inReplyTo": envelope_id,
+                    "from": "autonomous-triad",
+                    "to": sender,
+                    "ok": False,
+                    "error": "Unauthorized: sensitive action requires valid TRIAD_SERVER_TOKEN",
+                })
+                return
+            proposal_id = str(payload.get("proposal_id") or payload.get("proposalId") or "").strip()
+            nonce = str(payload.get("nonce") or payload.get("approval_nonce") or payload.get("approvalNonce") or "").strip()
+            reason = str(payload.get("reason") or "Approved via Mobile 1-Tap Bridge").strip()
+            attestation = payload.get("biometric_attestation")
+            if not proposal_id or not nonce:
+                self._send_json(400, {
+                    "v": 1,
+                    "inReplyTo": envelope_id,
+                    "from": "autonomous-triad",
+                    "to": sender,
+                    "ok": False,
+                    "error": "proposal approval requires proposal_id and nonce",
+                })
+                return
+            status_code, resp_data = self._approve_proposal_flow(proposal_id, nonce, reason, attestation)
+            env_resp = {
+                "v": 1,
+                "inReplyTo": envelope_id,
+                "from": "autonomous-triad",
+                "to": sender,
+            }
+            env_resp.update(resp_data)
+            self._send_json(status_code, env_resp)
+            return
+
+        if action == "reject":
+            if SERVER_TOKEN and not self._is_authorized():
+                self._send_json(401, {
+                    "v": 1,
+                    "inReplyTo": envelope_id,
+                    "from": "autonomous-triad",
+                    "to": sender,
+                    "ok": False,
+                    "error": "Unauthorized: sensitive action requires valid TRIAD_SERVER_TOKEN",
+                })
+                return
+            proposal_id = str(payload.get("proposal_id") or payload.get("proposalId") or "").strip()
+            reason = str(payload.get("reason") or "Rejected via Mobile 1-Tap Bridge").strip()
+            if not proposal_id:
+                self._send_json(400, {
+                    "v": 1,
+                    "inReplyTo": envelope_id,
+                    "from": "autonomous-triad",
+                    "to": sender,
+                    "ok": False,
+                    "error": "proposal rejection requires proposal_id",
+                })
+                return
+            status_code, resp_data = self._reject_proposal_flow(proposal_id, reason)
+            env_resp = {
+                "v": 1,
+                "inReplyTo": envelope_id,
+                "from": "autonomous-triad",
+                "to": sender,
+            }
+            env_resp.update(resp_data)
+            self._send_json(status_code, env_resp)
             return
 
         self._send_json(400, {
@@ -836,10 +992,140 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(500, {"error": f"Internal error: {e}"})
 
+    def _approve_proposal_flow(self, proposal_id: str, nonce: str, reason: str, biometric_attestation: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
+        """Validate format, execute upstream release via _registry_call, and construct standardized response."""
+        if not _ID_RE.fullmatch(proposal_id):
+            return 400, {"ok": False, "error": "Invalid proposal_id format (must be 1-128 chars alphanumeric/-/_)"}
+        if not _ID_RE.fullmatch(nonce):
+            return 400, {"ok": False, "error": "Invalid nonce format (must be 1-128 chars alphanumeric/-/_)"}
+        if biometric_attestation is not None:
+            if not isinstance(biometric_attestation, str) or len(biometric_attestation) > 4096:
+                return 400, {"ok": False, "error": "Invalid biometric_attestation (must be string <= 4096 chars)"}
+
+        clean_reason = str(reason or "Approved via Mobile 1-Tap Bridge")[:500]
+
+        call_status, call_detail = _registry_call("release", {
+            "proposalId": proposal_id,
+            "nonce": nonce,
+            "reason": clean_reason,
+            "biometric_attestation": biometric_attestation,
+        }, timeout=3.0)
+
+        if call_status == "ok":
+            return 200, {
+                "ok": True,
+                "status": "approved",
+                "action": "approve",
+                "proposal_id": proposal_id,
+                "reason": clean_reason,
+                "release": call_detail,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        if call_status == "http":
+            if call_detail >= 500:
+                logger.warning("Upstream release server error HTTP %r for proposal %r", call_detail, proposal_id)
+                return 504, {
+                    "ok": False,
+                    "status": "release_unknown",
+                    "proposal_id": proposal_id,
+                    "upstream_status": call_detail,
+                    "error": f"Upstream returned HTTP {call_detail}; release state unconfirmed",
+                }
+            mapped_code = 409 if call_detail in (401, 403, 409, 410) else (call_detail if call_detail == 404 else 502)
+            logger.warning("Upstream release rejected with HTTP %r for proposal %r", call_detail, proposal_id)
+            return mapped_code, {
+                "ok": False,
+                "status": "release_failed",
+                "proposal_id": proposal_id,
+                "upstream_status": call_detail,
+                "error": f"Upstream rejected release with HTTP {call_detail}",
+            }
+        if call_status == "unknown":
+            logger.warning("Upstream release timeout or malformed body for proposal %r: %r", proposal_id, call_detail)
+            return 504, {
+                "ok": False,
+                "status": "release_unknown",
+                "proposal_id": proposal_id,
+                "error": "Upstream timed out or returned malformed response; release state unconfirmed",
+            }
+        if call_status == "rejected":
+            return 409, {
+                "ok": False,
+                "status": "release_rejected",
+                "proposal_id": proposal_id,
+                "release": call_detail,
+                "error": "Upstream release did not indicate success",
+            }
+        # unreachable
+        logger.warning("Upstream release unreachable for proposal %r: %r", proposal_id, call_detail)
+        return 502, {
+            "ok": False,
+            "status": "release_failed",
+            "proposal_id": proposal_id,
+            "error": "Upstream unreachable or unresponsive",
+        }
+
+    def _reject_proposal_flow(self, proposal_id: str, reason: str) -> Tuple[int, Dict[str, Any]]:
+        """Validate format, execute upstream rejection via _registry_call, and construct standardized response."""
+        if not _ID_RE.fullmatch(proposal_id):
+            return 400, {"ok": False, "error": "Invalid proposal_id format (must be 1-128 chars alphanumeric/-/_)"}
+
+        clean_reason = str(reason or "Rejected via Mobile 1-Tap Bridge")[:500]
+
+        call_status, call_detail = _registry_call("reject", {
+            "proposalId": proposal_id,
+            "reason": clean_reason,
+        }, timeout=2.0)
+
+        if call_status == "ok":
+            return 200, {
+                "ok": True,
+                "status": "rejected",
+                "action": "reject",
+                "proposal_id": proposal_id,
+                "upstream_notified": True,
+                "reason": clean_reason,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        if call_status == "unknown":
+            logger.warning("Upstream reject timeout for proposal %r: %r", proposal_id, call_detail)
+            return 504, {
+                "ok": False,
+                "status": "reject_unconfirmed",
+                "proposal_id": proposal_id,
+                "upstream_notified": False,
+                "error": "Upstream timed out during proposal rejection",
+            }
+        logger.warning("Upstream reject failed (%r) for proposal %r: %r", call_status, proposal_id, call_detail)
+        return 502, {
+            "ok": False,
+            "status": "reject_unconfirmed",
+            "proposal_id": proposal_id,
+            "upstream_notified": False,
+            "upstream_status": call_detail if call_status == "http" else None,
+            "error": f"Upstream failed to confirm rejection ({call_status})",
+        }
+
     def _handle_action_approve(self, body: Dict[str, Any]):
+        reason = str(body.get("reason", "Approved via Mobile 1-Tap Bridge"))[:500]
+        proposal_id = str(body.get("proposal_id") or body.get("proposalId") or "").strip()
         patch_file = body.get("patch_file", "")
+
+        if proposal_id and patch_file:
+            self._send_json(400, {"error": "cannot provide both proposal_id and patch_file"})
+            return
+
+        if proposal_id:
+            nonce = str(body.get("nonce") or body.get("approval_nonce") or body.get("approvalNonce") or "").strip()
+            if not nonce:
+                self._send_json(400, {"error": "proposal approval requires nonce"})
+                return
+            attestation = body.get("biometric_attestation")
+            status_code, resp_data = self._approve_proposal_flow(proposal_id, nonce, reason, attestation)
+            self._send_json(status_code, resp_data)
+            return
+
         repo_arg = body.get("repo_path", "")
-        reason = body.get("reason", "Approved via Mobile 1-Tap Bridge")
 
         try:
             repo_dir = _resolve_repo_path(repo_arg)
@@ -941,12 +1227,18 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_action_reject(self, body: Dict[str, Any]):
-        reason = body.get("reason", "Rejected via Mobile 1-Tap Bridge")
+        reason = str(body.get("reason", "Rejected via Mobile 1-Tap Bridge"))[:500]
+        proposal_id = str(body.get("proposal_id") or body.get("proposalId") or "").strip()
+        if proposal_id:
+            status_code, resp_data = self._reject_proposal_flow(proposal_id, reason)
+            self._send_json(status_code, resp_data)
+            return
+
         self._send_json(200, {
             "status": "rejected",
             "action": "reject",
             "reason": reason,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
 
     def _handle_auto(self, body: Dict[str, Any]):
