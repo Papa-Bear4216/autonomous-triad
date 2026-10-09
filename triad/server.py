@@ -999,8 +999,16 @@ class TriadRequestHandler(BaseHTTPRequestHandler):
         if not _ID_RE.fullmatch(nonce):
             return 400, {"ok": False, "error": "Invalid nonce format (must be 1-128 chars alphanumeric/-/_)"}
         if biometric_attestation is not None:
-            if not isinstance(biometric_attestation, str) or len(biometric_attestation) > 4096:
-                return 400, {"ok": False, "error": "Invalid biometric_attestation (must be string <= 4096 chars)"}
+            if not isinstance(biometric_attestation, str) or not biometric_attestation.strip():
+                return 400, {"ok": False, "error": "Invalid biometric_attestation (must be non-empty string <= 4096 UTF-8 bytes)"}
+            if len(biometric_attestation) > 4096:
+                return 400, {"ok": False, "error": "Invalid biometric_attestation (must be non-empty string <= 4096 UTF-8 bytes)"}
+            try:
+                att_bytes = biometric_attestation.encode("utf-8")
+            except UnicodeEncodeError:
+                return 400, {"ok": False, "error": "Invalid biometric_attestation (must be non-empty string <= 4096 UTF-8 bytes)"}
+            if len(att_bytes) > 4096:
+                return 400, {"ok": False, "error": "Invalid biometric_attestation (must be non-empty string <= 4096 UTF-8 bytes)"}
 
         clean_reason = str(reason or "Approved via Mobile 1-Tap Bridge")[:500]
 

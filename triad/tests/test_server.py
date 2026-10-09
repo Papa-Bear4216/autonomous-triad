@@ -374,15 +374,16 @@ class TestTriadServer(unittest.TestCase):
                 self.assertEqual(status, 400)
                 mock_opener.assert_not_called()
 
-            # Malformed biometric_attestation (non-string) -> 400 without calling opener
-            with patch("triad.server._OPENER.open") as mock_opener:
-                status, _, body = self._post("/action/approve", {
-                    "proposal_id": "prop_12345",
-                    "nonce": "good_nonce",
-                    "biometric_attestation": 123456
-                }, extra_headers=auth_headers)
-                self.assertEqual(status, 400)
-                mock_opener.assert_not_called()
+            # Malformed biometric_attestation (non-string, empty, whitespace, lone surrogate, or oversized bytes) -> 400 without calling opener
+            for bad_att in [123456, "", "   ", "x" * 4097, "\ud800", "é" * 2049]:
+                with patch("triad.server._OPENER.open") as mock_opener:
+                    status, _, body = self._post("/action/approve", {
+                        "proposal_id": "prop_12345",
+                        "nonce": "good_nonce",
+                        "biometric_attestation": bad_att
+                    }, extra_headers=auth_headers)
+                    self.assertEqual(status, 400)
+                    mock_opener.assert_not_called()
 
             # Non-loopback REGISTRY_APP_UPSTREAM -> 502 unreachable
             with patch.dict(os.environ, {"REGISTRY_APP_UPSTREAM": "http://evil-proxy.com:39403"}):
